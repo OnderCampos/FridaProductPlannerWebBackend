@@ -250,8 +250,20 @@ def get_user_stories_by_epic(epic_id: str, user_id: str = None) -> ResponseModel
         user_stories = []
         for doc in user_stories_docs:
             story_data = doc.to_dict()
-            story_data["id"] = doc.id
+            # story_data["id"] = doc.id
+            story_id = doc.id 
+
+            subtasks_docs = FIRESTORE_CLIENT.collection("subtasks").where("user_story_id", "==", story_id).get()
+
+            # Sum estimate_hours from subtasks
+            total_subtask_hours = sum(float(s.to_dict().get("estimated_hours", 0)) for s in subtasks_docs)
+
+            story_data["id"] = story_id
+
             _normalize_story_payload(story_data)
+
+            story_data["effortHours"] = story_data.get("effortHours", 0) + total_subtask_hours
+
             user_stories.append(story_data)
         
         # Sort by order field
@@ -270,7 +282,6 @@ def get_user_stories_by_epic(epic_id: str, user_id: str = None) -> ResponseModel
             message=f"Error retrieving user stories: {str(e)}",
             data=None
         )
-
 
 def get_user_stories_by_epic_with_auth(epic_id: str, user_id: str) -> ResponseModel:
     """
