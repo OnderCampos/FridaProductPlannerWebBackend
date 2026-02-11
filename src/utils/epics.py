@@ -123,6 +123,42 @@ def delete_epics_for_project(project_id: str, user_id: str = None) -> ResponseMo
             data=None
         )
 
+def get_epic_by_id(epic_id: str) -> ResponseModel:
+    """
+    Retrieves a specific epic by its ID.
+
+    Args:
+        epic_id (str): The epic ID
+
+    Returns:
+        ResponseModel: Response containing the epic data or an error message
+    """
+    try:
+        epic_ref = FIRESTORE_CLIENT.collection("epics").document(epic_id)
+        epic_doc = epic_ref.get()
+
+        if not epic_doc.exists:
+            return ResponseModel(
+                success=False,
+                message="Epic not found",
+                data=None
+            )
+
+        epic_data = epic_doc.to_dict()
+        epic_data["id"] = epic_id
+
+        return ResponseModel(
+            success=True,
+            message="Epic retrieved successfully",
+            data=epic_data
+        )
+    except Exception as e:
+        logging.error(f"Error retrieving epic {epic_id}: {e}")
+        return ResponseModel(
+            success=False,
+            message=f"Error retrieving epic: {str(e)}",
+            data=None
+        )
 
 def create_epic(project_id: str, user_id: str, name: str, description: str) -> ResponseModel:
     """
@@ -282,43 +318,5 @@ def delete_epic(epic_id: str, user_id: str) -> ResponseModel:
         return ResponseModel(
             success=False,
             message=f"Error deleting epic: {str(e)}",
-            data=None
-        )
-
-
-def get_epic_by_id(epic_id: str) -> ResponseModel:
-    """
-    Retrieves a specific epic by its ID.
-
-    Args:
-        epic_id (str): The epic ID
-
-    Returns:
-        ResponseModel: Response containing the epic data or an error message
-    """
-    try:
-        epic_ref = FIRESTORE_CLIENT.collection("epics").document(epic_id)
-        epic_doc = epic_ref.get()
-
-        if not epic_doc.exists:
-            return ResponseModel(
-                success=False,
-                message="Epic not found",
-                data=None
-            )
-
-        epic_data = epic_doc.to_dict()
-        epic_data["id"] = epic_id
-
-        return ResponseModel(
-            success=True,
-            message="Epic retrieved successfully",
-            data=epic_data
-        )
-    except Exception as e:
-        logging.error(f"Error retrieving epic {epic_id}: {e}")
-        return ResponseModel(
-            success=False,
-            message=f"Error retrieving epic: {str(e)}",
             data=None
         )

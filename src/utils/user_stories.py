@@ -212,7 +212,22 @@ def get_user_story_by_id(story_id: str, user_id: str) -> ResponseModel:
                 message="Unauthorized: You don't own this user story",
                 data=None
             )
-        
+
+        # Search in sprint_items
+        assignment_query = FIRESTORE_CLIENT.collection('sprint_items').where(
+            'item_type', '==', 'story'
+        ).where(
+            'item_id', '==', story_id
+        ).limit(1).get()
+
+        # Extract sprint id
+        story_data["sprint_id"] = None 
+        if assignment_query:
+            assignment_data = assignment_query[0].to_dict()
+            story_data["sprint_id"] = assignment_data.get("sprint_id")
+
+        print(f"DEBUG SPRINT ID: {story_data['sprint_id']}")
+
         return ResponseModel(
             success=True,
             message="User story retrieved successfully",
@@ -378,6 +393,55 @@ def update_user_story(story_id: str, user_id: str, update_data: Dict[str, Any]) 
             data=None
         )
 
+def update_user_story_fields(story_id: str, user_id: str, update_data: Dict[str, Any]) -> ResponseModel:
+    """
+    Updates the fields array of an existing user story.
+    
+    Args:
+        story_id (str): The user story ID
+        user_id (str): The user ID (for ownership verification)
+        update_data (Dict[str, Any]): Data to update in fields array
+        
+    Returns:
+        ResponseModel: Response containing the updated user story
+    """
+    try:
+        user_story_ref = FIRESTORE_CLIENT.collection("user_stories").document(story_id)
+        user_story_doc = user_story_ref.get()
+
+        if not user_story_doc.exists:
+            return ResponseModel(success=False, message="User story not found", data=None)
+
+        user_story_data = user_story_doc.to_dict()
+        if user_story_data.get("user_id") != user_id:
+            return ResponseModel(success=False, message="Unauthorized: You don't own this user story", data=None)
+
+        allowed_fields = {"user_story", "epic", "title", "description", "priority", "storyPoints", "dueDate"}
+        filtered_update = {k: v for k, v in update_data.items() if k in allowed_fields}
+
+        if not filtered_update:
+            return ResponseModel(success=False, message="No valid fields to update", data=None)
+
+        filtered_update["updated_at"] = _current_timestamp_iso()
+
+        # Execute the update
+        user_story_ref.update(filtered_update)
+
+        # Get the result and normalize it
+        updated_doc = user_story_ref.get()
+        final_data = updated_doc.to_dict()
+        final_data["id"] = story_id
+
+        _normalize_story_payload(final_data)
+
+        return ResponseModel(
+            success=True, 
+            message="User story fields updated successfully", 
+            data=final_data
+        )
+    except Exception as e:
+        logging.error(f"Error updating user story fields: {e}")
+        return ResponseModel(success=False, message=f"Error updating user story fields: {str(e)}", data=None)
 
 def delete_user_story(story_id: str, user_id: str) -> ResponseModel:
     """

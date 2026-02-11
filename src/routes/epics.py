@@ -5,8 +5,40 @@ from typing import Optional
 from src.schemas.response import ResponseModel
 from src.utils.auth import validate_user_and_get_data
 from src.utils.user_stories import get_user_stories_by_epic_with_auth
+from src.utils.epics import get_epic_by_id
 
 router = APIRouter()
+
+@router.get(
+    "/{epic_id}/",
+    response_description="Get epic by id"
+)
+async def get_epic_by_id_route(
+    epic_id: str = Path(..., description="The epic ID"),
+    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+) -> ResponseModel:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header is required")
+
+    # Extract token from "Bearer <token>" format
+    try:
+        token_type, token = authorization.split(" ", 1)
+        if token_type.lower() != "bearer":
+            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+    
+    user_data = validate_user_and_get_data(token)
+    print(f"[DEBUG] Getting user stories for epic {epic_id}, user: {user_data.get_user_id()}")
+
+    try:
+        response = get_epic_by_id(epic_id)
+        return JSONResponse(
+            status_code=200 if response.success else 404,
+            content=response.dict(),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @router.get(
     "/{epic_id}/user-stories/",
