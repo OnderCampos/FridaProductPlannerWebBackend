@@ -92,6 +92,9 @@ IMPORTANT - FOCUS ON THE SPECIFIC FUNCTIONALITY:
 2. Use the epic ONLY as context, not as a source for additional user stories
 3. Generate user stories ONLY for this functionality, not for the entire epic
 
+Project Description:
+{project_description}
+
 IMPORTANT - USER ROLES ANALYSIS:
 Use these specific user roles for your user stories:
 {users}

@@ -185,12 +185,23 @@ class AzureChatService:
             try:
                 json_response = json.loads(response)
             except json.JSONDecodeError:
-                try:
-                    # Attempt to load the JSON again within a code block
-                    response = get_code_block(response)
-                    json_response = json.loads(response)
-                except json.JSONDecodeError:
-                    return None
+                cleaned_response = get_code_block(response)
+
+                # try:
+                #     # Attempt to load the JSON again within a code block
+                #     response = get_code_block(response)
+                #     json_response = json.loads(response)
+                # except json.JSONDecodeError:
+                #     return None
+
+                if cleaned_response:
+                    try:
+                        json_response = json.loads(cleaned_response)
+                    except json.JSONDecodeError:
+                        continue # Si sigue fallando, pasamos al siguiente intento del bucle
+                else:
+                    # Si get_code_block devolvió None, no hay nada que parsear
+                    continue
 
             # If no key is specified, validate the entire response
             if key is None:

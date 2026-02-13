@@ -35,11 +35,14 @@ class DeleteProjectRequest(BaseModel):
 class GenerateAnalysisRequest(BaseModel):
     """Request model for generating main functionalities analysis (Step 1)"""
     epic_id: str
-
+    project_description: Optional[str] = None 
+    epic_description: Optional[str] = None
 
 class GenerateUserStoriesRequest(BaseModel):
     """Request model for generating user stories (Step 2)"""
     epic_id: str
+    project_description: Optional[str] = None 
+    epic_description: Optional[str] = None
     functionality: Optional[str] = None
     functionalities: Optional[list] = None
 

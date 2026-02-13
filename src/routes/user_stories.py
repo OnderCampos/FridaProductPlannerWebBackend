@@ -63,6 +63,8 @@ async def generate_analysis_route(
         response = await generate_analysis(
             user_data=user_data,
             epic_id=req.epic_id,
+            project_description=req.project_description,
+            epic_description=req.epic_description
         )
         return JSONResponse(
             status_code=200 if response.success else 400,
@@ -108,6 +110,8 @@ async def generate_user_stories_route(
             epic_id=req.epic_id,
             functionality=req.functionality,
             functionalities=req.functionalities,
+            project_description=req.project_description,
+            epic_description=req.epic_description
         )
         return JSONResponse(
             status_code=200 if response.success else 400,
