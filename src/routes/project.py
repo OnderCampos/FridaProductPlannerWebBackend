@@ -153,7 +153,7 @@ async def create_project_route(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@router.put(
+@router.patch(
     "/{project_id}",
     response_description="Update an existing project.",
 )
@@ -185,7 +185,8 @@ async def update_project_route(
             user_id=user_data.user_id,
             name=req.name if req else None,
             description=req.description if req else None,
-            project_key=req.project_key if req else None
+            project_key=req.project_key if req else None,
+            tech_stack=req.tech_stack if req else None
         )
         return JSONResponse(
             status_code=200 if response.success else 404,

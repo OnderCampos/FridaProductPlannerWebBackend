@@ -78,8 +78,14 @@ def get_all_projects_for_user(user_id: str) -> ResponseModel:
         for doc in projects_docs:
             project_data = doc.to_dict()
             project_data["id"] = doc.id  # Add document ID as project ID
+
+            team_members = get_team_members(doc.id)
+            project_data["teamMembers"] = team_members
+
             all_projects.append(project_data)
-        
+
+        #print(f"PROJECTS: {all_projects}")
+
         return ResponseModel(
             success=True, 
             message="Projects retrieved successfully.", 
@@ -247,7 +253,7 @@ async def create_project(user_data: UserData, name: str, description: str, proje
 
 
 def update_project(project_id: str, user_id: str, name: Optional[str] = None, 
-                  description: Optional[str] = None, project_key: Optional[str] = None) -> ResponseModel:
+    description: Optional[str] = None, project_key: Optional[str] = None, tech_stack: List[str] = None) -> ResponseModel:
     """
     Updates an existing project.
     
@@ -305,6 +311,8 @@ def update_project(project_id: str, user_id: str, name: Optional[str] = None,
             update_data["description"] = description
         if project_key is not None:
             update_data["project_key"] = project_key
+        if tech_stack is not None:
+            update_data["technical_stack"] = tech_stack
         
         if len(update_data) == 1:  # Only updated_at
             return ResponseModel(
@@ -388,7 +396,7 @@ def delete_project(project_id: str, user_id: str) -> ResponseModel:
             data=None
         )
 
-def get_project_members(project_id: str) -> List[Dict[str, Any]]:
+def get_project_members_by_id(project_id: str) -> List[Dict[str, Any]]:
     """
     Retrieves all members associated with a specific project.
     

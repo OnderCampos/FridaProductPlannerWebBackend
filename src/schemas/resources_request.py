@@ -21,10 +21,11 @@ class CreateProjectRequest(BaseModel):
 
 class UpdateProjectRequest(BaseModel):
     """Request model for updating a project"""
-    project_id: str
+    #project_id: str
     name: Optional[str] = None
     description: Optional[str] = None
     project_key: Optional[str] = None
+    tech_stack: Optional[List[str]] = None
 
 
 class DeleteProjectRequest(BaseModel):
