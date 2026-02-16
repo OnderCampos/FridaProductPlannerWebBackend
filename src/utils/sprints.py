@@ -290,12 +290,82 @@ def delete_sprint(
         return ResponseModel(success=False, message=f"Error deleting sprint: {str(e)}", data=None)
 
 
+# def assign_item_to_sprint(
+#     sprint_id: str,
+#     project_id: str,
+#     user_id: str,
+#     item_type: str,
+#     item_id: str,
+# ) -> ResponseModel:
+#     try:
+#         project_response = _get_project_or_error(project_id, user_id)
+#         if not project_response.success:
+#             return project_response
+
+#         sprint_data, _ = _get_sprint_doc(sprint_id)
+#         if not sprint_data:
+#             return ResponseModel(success=False, message="Sprint not found", data=None)
+#         if sprint_data.get("project_id") != project_id:
+#             return ResponseModel(success=False, message="Sprint does not belong to this project", data=None)
+#         if sprint_data.get("user_id") != user_id:
+#             return ResponseModel(success=False, message="Unauthorized: You don't own this sprint", data=None)
+
+#         normalized_type = (item_type or "").strip().lower()
+#         if normalized_type not in {"story", "subtask"}:
+#             return ResponseModel(success=False, message="Invalid item type", data=None)
+
+#         if normalized_type == "story":
+#             story_response = _get_story_for_project(item_id, project_id, user_id)
+#             if not story_response.success:
+#                 return ResponseModel(success=False, message=story_response.message, data=None)
+#         else:
+#             subtask_response = _get_subtask_for_project(item_id, project_id, user_id)
+#             if not subtask_response.success:
+#                 return ResponseModel(success=False, message=subtask_response.message, data=None)
+
+#         existing_assignment = FIRESTORE_CLIENT.collection(SPRINT_ITEMS_COLLECTION).where(
+#             "item_type", "==", normalized_type
+#         ).where(
+#             "item_id", "==", item_id
+#         ).get()
+#         if existing_assignment:
+#             return ResponseModel(success=False, message="Item is already assigned to a sprint", data=None)
+
+#         current_items = FIRESTORE_CLIENT.collection(SPRINT_ITEMS_COLLECTION).where(
+#             "sprint_id", "==", sprint_id
+#         ).get()
+#         max_order = 0
+#         for doc in current_items:
+#             data = doc.to_dict()
+#             max_order = max(max_order, data.get("order", 0))
+
+#         now = _current_timestamp_iso()
+#         assignment_data = {
+#             "project_id": project_id,
+#             "sprint_id": sprint_id,
+#             "user_id": user_id,
+#             "item_type": normalized_type,
+#             "item_id": item_id,
+#             "order": max_order + 1,
+#             "created_at": now,
+#             "updated_at": now,
+#         }
+
+#         doc_ref = FIRESTORE_CLIENT.collection(SPRINT_ITEMS_COLLECTION).add(assignment_data)
+#         assignment_data["id"] = doc_ref[1].id
+
+#         return ResponseModel(success=True, message="Item assigned successfully", data=assignment_data)
+#     except Exception as e:
+#         logging.error(f"Error assigning item to sprint {sprint_id}: {e}")
+#         return ResponseModel(success=False, message=f"Error assigning item: {str(e)}", data=None)
+
 def assign_item_to_sprint(
     sprint_id: str,
     project_id: str,
     user_id: str,
     item_type: str,
     item_id: str,
+    include_subtasks: bool = False,
 ) -> ResponseModel:
     try:
         project_response = _get_project_or_error(project_id, user_id)
@@ -311,35 +381,35 @@ def assign_item_to_sprint(
             return ResponseModel(success=False, message="Unauthorized: You don't own this sprint", data=None)
 
         normalized_type = (item_type or "").strip().lower()
-        if normalized_type not in {"story", "subtask"}:
-            return ResponseModel(success=False, message="Invalid item type", data=None)
 
+        # Handle of the story or subtask 
         if normalized_type == "story":
-            story_response = _get_story_for_project(item_id, project_id, user_id)
-            if not story_response.success:
-                return ResponseModel(success=False, message=story_response.message, data=None)
+            story_res = _get_story_for_project(item_id, project_id, user_id)
+            if not story_res.success: return story_res
         else:
-            subtask_response = _get_subtask_for_project(item_id, project_id, user_id)
-            if not subtask_response.success:
-                return ResponseModel(success=False, message=subtask_response.message, data=None)
+            subtask_res = _get_subtask_for_project(item_id, project_id, user_id)
+            if not subtask_res.success: return subtask_res
 
-        existing_assignment = FIRESTORE_CLIENT.collection(SPRINT_ITEMS_COLLECTION).where(
-            "item_type", "==", normalized_type
+        # Reassign (If already exists in another sprint, move it)
+        existing_assigments = FIRESTORE_CLIENT.collection(SPRINT_ITEMS_COLLECTION).where(
+            'project_id', '==', project_id
         ).where(
-            "item_id", "==", item_id
+            'item_type', '==', normalized_type
+        ).where(
+            'item_id', '==', item_id
         ).get()
-        if existing_assignment:
-            return ResponseModel(success=False, message="Item is already assigned to a sprint", data=None)
 
+        for doc in existing_assigments:
+            doc.reference.delete()
+
+        # Calculate order and create new assign
         current_items = FIRESTORE_CLIENT.collection(SPRINT_ITEMS_COLLECTION).where(
-            "sprint_id", "==", sprint_id
+            'sprint_id', '==', sprint_id
         ).get()
-        max_order = 0
-        for doc in current_items:
-            data = doc.to_dict()
-            max_order = max(max_order, data.get("order", 0))
+        max_order = max([doc.to_dict().get("order", 0) for doc in current_items], default=0)
 
         now = _current_timestamp_iso()
+
         assignment_data = {
             "project_id": project_id,
             "sprint_id": sprint_id,
@@ -352,13 +422,37 @@ def assign_item_to_sprint(
         }
 
         doc_ref = FIRESTORE_CLIENT.collection(SPRINT_ITEMS_COLLECTION).add(assignment_data)
+        # doc_ref[1] is the reference of the documento created
         assignment_data["id"] = doc_ref[1].id
 
-        return ResponseModel(success=True, message="Item assigned successfully", data=assignment_data)
+        if normalized_type == "story" and include_subtasks:
+            # Search all subtasks of the story
+            subtask_res = get_subtasks_by_user_story(item_id, user_id)
+
+            # LOG DE DEPURACIÓN
+            #print(f"DEBUG: Story {item_id} - Encontradas {len(subtask_res.data) if subtask_res.data else 0} subtareas")
+
+            if subtask_res.success and subtask_res.data:
+                for subtask in subtask_res.data:
+                    # Llamada recursiva o directa para asignar cada subtarea al mismo sprint
+                    # Usamos recursividad simple para mantener la lógica de 'order'
+                    assign_item_to_sprint(
+                        sprint_id, project_id, user_id,
+                        "subtask", subtask["id"], include_subtasks=False
+                    )
+
+        return ResponseModel(
+            success=True,
+            message="Item assigned successfully",
+            data=assignment_data
+        )
     except Exception as e:
         logging.error(f"Error assigning item to sprint {sprint_id}: {e}")
-        return ResponseModel(success=False, message=f"Error assigning item: {str(e)}", data=None)
-
+        return ResponseModel(
+            success=False,
+            message=f"Error assigning item: {str(e)}",
+            data=None
+        )
 
 def unassign_item_from_sprint(
     sprint_id: str,

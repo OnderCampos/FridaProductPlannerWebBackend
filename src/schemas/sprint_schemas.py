@@ -19,6 +19,7 @@ class UpdateSprintRequest(BaseModel):
 class SprintItemAssignmentRequest(BaseModel):
     type: str
     id: str
+    include_subtasks: Optional[bool] = False
 
 
 class SprintItemsBulkRequest(BaseModel):

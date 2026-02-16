@@ -17,14 +17,17 @@ from src.utils.user_story_generation import (
     generate_user_stories
 )
 from src.utils.user_story_dependencies import generate_user_story_dependencies
-from src.utils.user_stories import get_user_story_by_id, update_user_story
+from src.utils.user_stories import get_user_story_by_id, update_user_story, update_user_story_fields
 from src.utils.epics import get_epic_by_id
 from src.utils.projects import get_project_by_id
 from src.utils.members import get_member_by_id
 from src.utils.subtask_generation import (
     generate_subtasks_for_user_story,
+    create_subtask_for_user_story,
     get_subtasks_by_user_story,
-    update_subtask_status
+    update_subtask_status,
+    update_subtask_fields,
+    delete_subtasks_by_user_story
 )
 
 router = APIRouter()
@@ -373,6 +376,55 @@ async def update_user_story_assignee_name_route(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@router.patch(
+    "/{story_id}/fields/",
+    response_description="Update fields of a user story",
+)
+async def update_user_story_fields_route(
+    story_id: str = Path(..., description="The user story ID"),
+    request: Request = None,
+    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+) -> ResponseModel:
+    """
+    Updates fields of a specific user story.
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header is required")
+
+    # Extract token from "Bearer <token>" format
+    try:
+        token_type, token = authorization.split(" ", 1)
+        if token_type.lower() != "bearer":
+            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+
+    user_data = validate_user_and_get_data(token)
+    print(f"[DEBUG] User data: {user_data}")
+
+    try:
+        update_data = await request.json()
+        response = update_user_story_fields(story_id, user_data.get_user_id(), update_data)
+
+        if not response.success:
+            status_code = 200
+            if "not found" in response.message.lower():
+                status_code = 404
+            elif "unauthorized" in response.message.lower():
+                status_code = 403
+            else:
+                status_code = 400
+            return JSONResponse(
+                status_code=status_code,
+                content=response.dict(),
+            )
+
+        return JSONResponse(
+            status_code=200,
+            content=response.dict(),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @router.post(
     "/{story_id}/subtasks/",
@@ -418,6 +470,38 @@ async def generate_subtasks_route(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@router.post(
+    "/{story_id}/subtasks-manually/",
+    response_description="Create a subtask manually for a user story",
+)
+async def create_subtask_route(
+    story_id: str = Path(..., description="The user story ID"),
+    request: Request = None,
+    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+) -> ResponseModel:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header is required")
+
+    try:
+        token_type, token = authorization.split(" ", 1)
+        if token_type.lower() != "bearer":
+            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+
+    user_data = validate_user_and_get_data(token)
+    print(f"[DEBUG] User data: {user_data}")
+
+    try:
+        subtask_data = await request.json()
+        response = create_subtask_for_user_story(story_id, user_data.get_user_id(), subtask_data)
+
+        return JSONResponse(
+            status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
+            content=response.dict(),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @router.get(
     "/{story_id}/subtasks/",
@@ -488,8 +572,8 @@ async def update_subtask_status_route(
     
     Request body:
     {
-      "status": "In Progress",
-      "completed_date": null  // Optional, auto-set when status is "Done"
+        "status": "In Progress",
+        "completed_date": null  // Optional, auto-set when status is "Done"
     }
     
     Requires authentication and verifies that the user owns the subtask.
@@ -537,5 +621,83 @@ async def update_subtask_status_route(
         )
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.patch(
+    "/{story_id}/subtasks/{subtask_id}/fields/",
+    response_description="Update fields of a subtask",
+)
+async def update_subtask_fields_route(
+    story_id: str = Path(..., description="The user story ID"),
+    subtask_id: str = Path(..., description="The subtask ID"),
+    request: Request = None,
+    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+) -> ResponseModel:
+    """
+    Updates fields of a specific subtask within a user story.
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header is required")
+
+    # Extract token from "Bearer <token>" format
+    try:
+        token_type, token = authorization.split(" ", 1)
+        if token_type.lower() != "bearer":
+            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+
+    user_data = validate_user_and_get_data(token)
+    print(f"[DEBUG] User data: {user_data}")
+
+    try:
+        update_data = await request.json()
+
+        response = update_subtask_fields(subtask_id, user_data.get_user_id(), update_data)
+
+        if not response.success:
+            raise HTTPException(status_code=400, detail=response.message)
+
+        return JSONResponse(
+            status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
+            content=response.dict(),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.delete(
+    "/{story_id}/subtasks/{subtask_id}/",
+    response_description="Delete a subtask",
+)
+async def delete_subtask_route(
+    story_id: str = Path(..., description="The user story ID"),
+    subtask_id: str = Path(..., description="The subtask ID"),
+    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+) -> ResponseModel:
+    """
+    Deletes a specific subtask within a user story.
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header is required")
+    
+    # Extract token from "Bearer <token>" format
+    try:
+        token_type, token = authorization.split(" ", 1)
+        if token_type.lower() != "bearer":
+            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+    
+    user_data = validate_user_and_get_data(token)
+    print(f"[DEBUG] User data: {user_data}")
+
+    try:
+        print(f"[DEBUG] Deleting subtask {subtask_id}")
+        response = delete_subtasks_by_user_story(subtask_id, user_data.get_user_id())
+        return JSONResponse(
+            status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
+            content=response.dict(),
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

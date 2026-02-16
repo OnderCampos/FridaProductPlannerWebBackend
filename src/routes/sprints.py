@@ -254,6 +254,7 @@ async def assign_sprint_item_route(
             user_id=user_data.get_user_id(),
             item_type=req.type,
             item_id=req.id,
+            include_subtasks=req.include_subtasks
         )
         return JSONResponse(
             status_code=_status_from_response(response, success_code=201),
