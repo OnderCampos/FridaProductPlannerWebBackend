@@ -160,7 +160,7 @@ def get_epic_by_id(epic_id: str) -> ResponseModel:
             data=None
         )
 
-def create_epic(project_id: str, user_id: str, name: str, description: str) -> ResponseModel:
+def create_epic(project_id: str, user_id: str, epic_data: Dict[str, Any]) -> ResponseModel:
     """
     Creates a new epic for a project.
     
@@ -178,8 +178,12 @@ def create_epic(project_id: str, user_id: str, name: str, description: str) -> R
         epic_data = {
             "project_id": project_id,
             "user_id": user_id,
-            "name": name,
-            "description": description,
+            "name": epic_data.get("name"),
+            "description": epic_data.get("description"),
+            "labels": epic_data.get("labels"),
+            "priority": epic_data.get("priority"),
+            "status": epic_data.get("status", "To Do"),
+            "story_points": epic_data.get("storyPoints", 0),
             "created_at": now,
             "updated_at": now,
         }
@@ -203,7 +207,7 @@ def create_epic(project_id: str, user_id: str, name: str, description: str) -> R
         )
 
 
-def update_epic(epic_id: str, user_id: str, name: str = None, description: str = None) -> ResponseModel:
+def update_epic(epic_id: str, user_id: str, epic_update_data: Dict[str, Any]) -> ResponseModel:
     """
     Updates an existing epic.
     
@@ -239,10 +243,12 @@ def update_epic(epic_id: str, user_id: str, name: str = None, description: str =
         
         # Build update data
         update_data = {"updated_at": _current_timestamp_iso()}
-        if name is not None:
-            update_data["name"] = name
-        if description is not None:
-            update_data["description"] = description
+        if  epic_update_data.get("name") is not None:
+            update_data["name"] = epic_update_data.get("name")
+        if epic_update_data.get("description") is not None:
+            update_data["description"] = epic_update_data.get("description")
+        if "labels" in epic_update_data:
+            update_data["labels"] = epic_update_data.get("labels")
         
         if len(update_data) == 1:  # Only updated_at
             return ResponseModel(
@@ -304,13 +310,41 @@ def delete_epic(epic_id: str, user_id: str) -> ResponseModel:
                 message="Unauthorized: You don't own this epic",
                 data=None
             )
-        
-        # Delete the epic
-        epic_ref.delete()
-        
+
+        # Create a batch to execute all deletes together
+        batch = FIRESTORE_CLIENT.batch()
+
+        user_stories_ref = FIRESTORE_CLIENT.collection("user_stories")
+        user_stories_query = user_stories_ref.where('epic_id', '==', epic_id).stream()
+
+        delete_user_stories_count = 0
+        delete_subtasks_count = 0
+
+        for user_story in user_stories_query:
+            user_story_id = user_story.id
+
+            # Search subtasks
+            subtasks_ref = FIRESTORE_CLIENT.collection('subtasks')
+            subtasks_query = subtasks_ref.where('user_story_id', '==', user_story_id).stream()
+
+            for subtask in subtasks_query:
+                # Add subtasks delete to batch
+                batch.delete(subtask.reference)
+                delete_subtasks_count += 1
+
+            # Add user stories delete to batch
+            batch.delete(user_story.reference)
+            delete_user_stories_count += 1
+
+        # Add epic delete to batch
+        batch.delete(epic_ref)
+
+        # Execute batch
+        batch.commit()
+
         return ResponseModel(
             success=True,
-            message="Epic deleted successfully",
+            message=f"Epic deleted successfully ({delete_user_stories_count} user stories deleted, {delete_subtasks_count} subtasks deleted",
             data=None
         )
     except Exception as e:

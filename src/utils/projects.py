@@ -224,6 +224,7 @@ async def create_project(user_data: UserData, name: str, description: str, proje
                         "user_id": user_data.get_user_id(),
                         "name": epic.get("name", ""),
                         "description": epic.get("description", ""),
+                        "labels": epic.get("labels", []),
                         "created_at": now,
                         "updated_at": now,
                     }

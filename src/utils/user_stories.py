@@ -76,12 +76,19 @@ def create_user_story(epic_id: str, user_id: str, user_story_data: Dict[str, Any
             "effort_hours",
             "createdDate",
             "created_date",
+            "story_points",  
+            "storyPoints",
         }
 
         raw_effort = user_story_data.get("effortHours")
         if raw_effort is None:
             raw_effort = user_story_data.get("effort_hours")
         effort_hours = _parse_effort_hours(raw_effort)
+
+        try:
+            story_points = int(user_story_data.get("story_points", 0))
+        except (ValueError, TypeError):
+            story_points = 0
         
         # Prepare structured user story document
         story_document = {
@@ -97,6 +104,7 @@ def create_user_story(epic_id: str, user_id: str, user_story_data: Dict[str, Any
             "createdDate": now,
             "updated_at": now,
             "effortHours": effort_hours,
+            "storyPoints": story_points,
             "fields": []
         }
         
