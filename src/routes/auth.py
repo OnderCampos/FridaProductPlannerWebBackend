@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from fastapi.exceptions import HTTPException
 from fastapi.responses import JSONResponse
 
-from src.utils.auth import authenticate_user_firebase, authenticate_external_user
+from src.utils.auth import authenticate_user_firebase, authenticate_external_user, build_login_user_payload
 
 from src.schemas.auth_request import AuthRequest
 from src.schemas.auth_response import AuthResponse
@@ -18,9 +18,12 @@ router = APIRouter()
 async def authenticate_user(req: AuthRequest) -> AuthResponse:
     try:
         response = authenticate_user_firebase(req.email, req.password, req.version)
+        content = response.dict()
+        if response.success:
+            content["user"] = build_login_user_payload(req.email)
         return JSONResponse(
             status_code=200,
-            content=response.dict(),
+            content=content,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -33,9 +36,12 @@ async def authenticate_external(req: AuthRequest) -> AuthResponse:
     try:
         print(f"External auth")
         response = await authenticate_external_user(req.email, req.password, req.version)
+        content = response.dict()
+        if response.success:
+            content["user"] = build_login_user_payload(req.email)
         return JSONResponse(
             status_code=200,
-            content=response.dict(),
+            content=content,
         )
     except HTTPException as e:
         raise e  # Let FastAPI handle HTTPException (401, etc)

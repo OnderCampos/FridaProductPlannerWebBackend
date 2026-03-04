@@ -12,6 +12,7 @@ from src.services.setup.variables_setup import LLMOPS_API_KEY
 from src.utils.validation_utils import get_code_block
 from src.schemas.response import ResponseModel
 from src.prompts.admin_prompts import TRANSFORM_USER_DATA_PROMPT, TRANSFORM_TEXT_TO_USER_JSON_PROMPT
+from src.utils.users import upsert_user_profile
 
 # Define registration status constants
 REGISTRATION_STATUS = {
@@ -43,6 +44,13 @@ async def update_firebase_user(user_data: dict) -> ResponseModel:
         user_info_data = {k: v for k, v in user_info_data.items() if v is not None}
         if user_info_data:
             user_info_ref.set(user_info_data, merge=True)
+
+        upsert_user_profile(
+            user_id=user_data.get("uid"),
+            email=user_data.get("email"),
+            name=user_data.get("name"),
+            role=user_data.get("role"),
+        )
 
         return ResponseModel(
             success=True, message="User updated successfully", data=user_data.get("uid")
@@ -102,6 +110,13 @@ async def create_firebase_user(user_data) -> ResponseModel:
                 "role": user_data["role"] if "role" in user_data else "",
                 "seniority": user_data["seniority"] if "seniority" in user_data else "",
             }
+        )
+
+        upsert_user_profile(
+            user_id=user.uid,
+            email=email,
+            name=user_data["name"] if "name" in user_data else "",
+            role=user_data["role"] if "role" in user_data else None,
         )
 
         print(f"Created new user: {email}")

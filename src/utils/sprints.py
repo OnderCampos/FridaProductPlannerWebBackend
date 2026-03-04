@@ -5,6 +5,7 @@ import logging
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.schemas.response import ResponseModel
 from src.utils.projects import get_project_for_user
+from src.utils.permissions import get_project_access
 from src.utils.user_stories import get_user_story_by_id, get_user_stories_by_epic
 from src.utils.subtask_generation import get_subtasks_by_user_story
 from src.utils.epics import get_epics_for_project, get_epic_by_id
@@ -24,7 +25,13 @@ def _normalize_sprint_payload(sprint_data: Dict[str, Any]) -> Dict[str, Any]:
     return sprint_data
 
 
-def _get_project_or_error(project_id: str, user_id: str) -> ResponseModel:
+def _get_project_or_error(project_id: str, user_id: str, allow_members: bool = False, user_email: Optional[str] = None) -> ResponseModel:
+    if allow_members:
+        access = get_project_access(project_id, user_id, user_email)
+        if not access.success:
+            return ResponseModel(success=False, message=access.message, data=None)
+        project_data = access.data.get("project") if isinstance(access.data, dict) else access.data
+        return ResponseModel(success=True, message="Project access granted", data=project_data)
     return get_project_for_user(project_id, user_id)
 
 
@@ -39,7 +46,7 @@ def _get_sprint_doc(sprint_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[
     return sprint_data, sprint_ref
 
 
-def _get_subtask_by_id(subtask_id: str, user_id: str) -> ResponseModel:
+def _get_subtask_by_id(subtask_id: str, user_id: str, allow_member: bool = False, user_email: Optional[str] = None) -> ResponseModel:
     try:
         subtask_ref = FIRESTORE_CLIENT.collection("subtasks").document(subtask_id)
         subtask_doc = subtask_ref.get()
@@ -49,8 +56,15 @@ def _get_subtask_by_id(subtask_id: str, user_id: str) -> ResponseModel:
         subtask_data = subtask_doc.to_dict()
         subtask_data["id"] = subtask_doc.id
 
-        if subtask_data.get("user_id") != user_id:
+        if subtask_data.get("user_id") != user_id and not allow_member:
             return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
+        if subtask_data.get("user_id") != user_id and allow_member:
+            story_id = subtask_data.get("user_story_id")
+            if not story_id:
+                return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
+            story_response = get_user_story_by_id(story_id, user_id, allow_member=True, user_email=user_email)
+            if not story_response.success:
+                return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
 
         return ResponseModel(success=True, message="Subtask retrieved successfully", data=subtask_data)
     except Exception as e:
@@ -58,8 +72,8 @@ def _get_subtask_by_id(subtask_id: str, user_id: str) -> ResponseModel:
         return ResponseModel(success=False, message=f"Error retrieving subtask: {str(e)}", data=None)
 
 
-def _get_story_for_project(story_id: str, project_id: str, user_id: str) -> ResponseModel:
-    story_response = get_user_story_by_id(story_id, user_id)
+def _get_story_for_project(story_id: str, project_id: str, user_id: str, allow_member: bool = False, user_email: Optional[str] = None) -> ResponseModel:
+    story_response = get_user_story_by_id(story_id, user_id, allow_member=allow_member, user_email=user_email)
     if not story_response.success:
         return story_response
 
@@ -79,8 +93,8 @@ def _get_story_for_project(story_id: str, project_id: str, user_id: str) -> Resp
     return ResponseModel(success=True, message="User story retrieved successfully", data=story)
 
 
-def _get_subtask_for_project(subtask_id: str, project_id: str, user_id: str) -> ResponseModel:
-    subtask_response = _get_subtask_by_id(subtask_id, user_id)
+def _get_subtask_for_project(subtask_id: str, project_id: str, user_id: str, allow_member: bool = False, user_email: Optional[str] = None) -> ResponseModel:
+    subtask_response = _get_subtask_by_id(subtask_id, user_id, allow_member=allow_member, user_email=user_email)
     if not subtask_response.success:
         return subtask_response
 
@@ -89,16 +103,22 @@ def _get_subtask_for_project(subtask_id: str, project_id: str, user_id: str) -> 
     if not story_id:
         return ResponseModel(success=False, message="Subtask missing user story association", data=None)
 
-    story_response = _get_story_for_project(story_id, project_id, user_id)
+    story_response = _get_story_for_project(story_id, project_id, user_id, allow_member=allow_member, user_email=user_email)
     if not story_response.success:
         return ResponseModel(success=False, message=story_response.message, data=None)
 
     return ResponseModel(success=True, message="Subtask retrieved successfully", data=subtask)
 
 
-def get_sprints_for_project(project_id: str, user_id: str, include_counts: bool = True) -> ResponseModel:
+def get_sprints_for_project(
+    project_id: str,
+    user_id: str,
+    include_counts: bool = True,
+    allow_members: bool = False,
+    user_email: Optional[str] = None,
+) -> ResponseModel:
     try:
-        project_response = _get_project_or_error(project_id, user_id)
+        project_response = _get_project_or_error(project_id, user_id, allow_members=allow_members, user_email=user_email)
         if not project_response.success:
             return project_response
 
@@ -508,9 +528,11 @@ def get_sprint_items(
     sprint_id: str,
     project_id: str,
     user_id: str,
+    allow_members: bool = False,
+    user_email: Optional[str] = None,
 ) -> ResponseModel:
     try:
-        project_response = _get_project_or_error(project_id, user_id)
+        project_response = _get_project_or_error(project_id, user_id, allow_members=allow_members, user_email=user_email)
         if not project_response.success:
             return project_response
 
@@ -540,7 +562,7 @@ def get_sprint_items(
 
             if item_type == "story":
                 if item_id not in story_cache:
-                    story_response = _get_story_for_project(item_id, project_id, user_id)
+                    story_response = _get_story_for_project(item_id, project_id, user_id, allow_member=allow_members, user_email=user_email)
                     if not story_response.success:
                         continue
                     story_cache[item_id] = story_response.data
@@ -559,7 +581,7 @@ def get_sprint_items(
                     "epicName": epic_cache.get(epic_id, "") if epic_id else "",
                 }))
             elif item_type == "subtask":
-                subtask_response = _get_subtask_for_project(item_id, project_id, user_id)
+                subtask_response = _get_subtask_for_project(item_id, project_id, user_id, allow_member=allow_members, user_email=user_email)
                 if not subtask_response.success:
                     continue
                 subtask = subtask_response.data
@@ -567,7 +589,7 @@ def get_sprint_items(
                 story_title = ""
                 if story_id:
                     if story_id not in story_cache:
-                        story_response = _get_story_for_project(story_id, project_id, user_id)
+                        story_response = _get_story_for_project(story_id, project_id, user_id, allow_member=allow_members, user_email=user_email)
                         if story_response.success:
                             story_cache[story_id] = story_response.data
                     story = story_cache.get(story_id)

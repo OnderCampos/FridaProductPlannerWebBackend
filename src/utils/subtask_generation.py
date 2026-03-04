@@ -1,4 +1,4 @@
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import logging
 import json
 from datetime import datetime, timezone
@@ -76,7 +76,12 @@ def save_subtasks_to_firestore(user_story_id: str, user_id: str, subtasks: List[
         )
 
 
-def get_subtasks_by_user_story(user_story_id: str, user_id: str) -> ResponseModel:
+def get_subtasks_by_user_story(
+    user_story_id: str,
+    user_id: str,
+    allow_member: bool = False,
+    user_email: Optional[str] = None,
+) -> ResponseModel:
     """
     Retrieves all subtasks for a user story.
     
@@ -88,7 +93,13 @@ def get_subtasks_by_user_story(user_story_id: str, user_id: str) -> ResponseMode
         ResponseModel: Response containing the subtasks ordered by their order field
     """
     try:
-        subtasks_docs = FIRESTORE_CLIENT.collection("subtasks").where("user_story_id", "==", user_story_id).where("user_id", "==", user_id).get()
+        if allow_member:
+            story_response = get_user_story_by_id(user_story_id, user_id, allow_member=True, user_email=user_email)
+            if not story_response.success:
+                return ResponseModel(success=False, message="Unauthorized: You don't have access to this story", data=None)
+            subtasks_docs = FIRESTORE_CLIENT.collection("subtasks").where("user_story_id", "==", user_story_id).get()
+        else:
+            subtasks_docs = FIRESTORE_CLIENT.collection("subtasks").where("user_story_id", "==", user_story_id).where("user_id", "==", user_id).get()
         
         subtasks = []
         subtask_ids = []

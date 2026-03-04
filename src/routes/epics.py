@@ -6,6 +6,7 @@ from src.schemas.response import ResponseModel
 from src.utils.auth import validate_user_and_get_data
 from src.utils.user_stories import get_user_stories_by_epic_with_auth
 from src.utils.epics import get_epic_by_id
+from src.utils.permissions import get_project_access
 
 router = APIRouter()
 
@@ -33,6 +34,14 @@ async def get_epic_by_id_route(
 
     try:
         response = get_epic_by_id(epic_id)
+        if response.success:
+            project_id = response.data.get("project_id")
+            access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
+            if not access.success:
+                return JSONResponse(
+                    status_code=403 if "unauthorized" in access.message.lower() else 404,
+                    content=access.dict(),
+                )
         return JSONResponse(
             status_code=200 if response.success else 404,
             content=response.dict(),
@@ -74,7 +83,7 @@ async def get_user_stories_by_epic_route(
     print(f"[DEBUG] Getting user stories for epic {epic_id}, user: {user_data.get_user_id()}")
 
     try:
-        response = get_user_stories_by_epic_with_auth(epic_id, user_data.get_user_id())
+        response = get_user_stories_by_epic_with_auth(epic_id, user_data.get_user_id(), user_data.get_email())
         return JSONResponse(
             status_code=200 if response.success else 404,
             content=response.dict(),

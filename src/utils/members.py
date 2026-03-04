@@ -5,6 +5,8 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 from google.cloud import firestore
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
+from src.utils.project_memberships import derive_membership_role, upsert_project_membership, delete_project_membership
+from src.utils.users import upsert_user_profile
 import logging
 
 logger = logging.getLogger(__name__)
@@ -60,6 +62,26 @@ def create_team_member(
         
         # Save to Firestore
         new_member_ref.set(member_data)
+
+        # Ensure user + membership records exist
+        upsert_user_profile(
+            user_id=user_id,
+            email=email,
+            name=name,
+            member_id=member_id,
+        )
+        membership_role = derive_membership_role(role, seniority)
+        membership_user_id = user_id
+        if membership_user_id and email and membership_user_id.lower() == email.lower():
+            membership_user_id = None
+        upsert_project_membership(
+            project_id=project_id,
+            user_id=membership_user_id,
+            email=email,
+            role=membership_role,
+            project_role=role,
+            member_id=member_id,
+        )
         
         logger.info(f"Created team member {member_id} for project {project_id}")
         return member_data
@@ -278,6 +300,25 @@ def update_team_member(
         updated_data = updated_doc.to_dict()
         updated_data.pop("created_at", None)
         updated_data.pop("updated_at", None)
+
+        # Sync membership role
+        membership_role = derive_membership_role(
+            updated_data.get("role"),
+            updated_data.get("seniority"),
+        )
+        membership_user_id = updated_data.get("user_id")
+        membership_email = updated_data.get("email")
+        if membership_user_id and membership_email and membership_user_id.lower() == membership_email.lower():
+            membership_user_id = None
+
+        upsert_project_membership(
+            project_id=project_id,
+            user_id=membership_user_id,
+            email=membership_email,
+            role=membership_role,
+            project_role=updated_data.get("role"),
+            member_id=updated_data.get("id") or member_id,
+        )
         
         logger.info(f"Updated team member {member_id}")
         return updated_data
@@ -314,6 +355,13 @@ def remove_team_member(project_id: str, member_id: str) -> bool:
         
         # Delete the member
         member_ref.delete()
+
+        # Remove membership record
+        delete_project_membership(
+            project_id=project_id,
+            user_id=member_data.get("user_id"),
+            email=member_data.get("email"),
+        )
         
         logger.info(f"Removed team member {member_id} from project {project_id}")
         return True

@@ -27,6 +27,7 @@ from src.utils.projects import (
     delete_project,
     get_project_for_user
 )
+from src.utils.permissions import get_project_access, get_global_user_role
 from src.utils.members import (
     get_project_members as get_team_members,
     create_team_member,
@@ -73,7 +74,7 @@ async def get_project_route(
     print(f"[DEBUG] User data: {user_data}")
     
     try:
-        response = get_project_by_id(project_id, user_data.user_id)
+        response = get_project_by_id(project_id, user_data.user_id, allow_member=True, user_email=user_data.email)
         return JSONResponse(
             status_code=200 if response.success else 404,
             content=response.dict(),
@@ -105,7 +106,11 @@ async def get_projects_route(
     user_data = validate_user_and_get_data(token)
     print(f"[DEBUG] User data: {user_data}")
     try:
-        response = get_all_projects_for_user(user_data.user_id)
+        response = get_all_projects_for_user(
+            user_data.user_id,
+            include_member_projects=True,
+            user_email=user_data.email
+        )
         return JSONResponse(
             status_code=200,
             content=response.dict(),
@@ -139,6 +144,10 @@ async def create_project_route(
     user_data = validate_user_and_get_data(token)
     print(f"[DEBUG] User data: {user_data}")
     
+    role_info = get_global_user_role(user_data)
+    if role_info.get("role") == "member":
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot create projects")
+
     try:
         response = await create_project(
             user_data=user_data,
@@ -179,6 +188,13 @@ async def update_project_route(
     user_data = validate_user_and_get_data(token)
     print(f"[DEBUG] User data: {user_data}")
     
+    access = get_project_access(project_id, user_data.user_id, user_data.email)
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update projects")
+
     try:
         response = update_project(
             project_id=project_id,
@@ -220,6 +236,13 @@ async def delete_project_route(
     user_data = validate_user_and_get_data(token)
     print(f"[DEBUG] User data: {user_data}")
     
+    access = get_project_access(project_id, user_data.user_id, user_data.email)
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot delete projects")
+
     try:
         response = delete_project(
             project_id=project_id,
@@ -259,7 +282,7 @@ async def get_project_epics_route(
     print(f"[DEBUG] User data: {user_data}")
     
     try:
-        response = get_epics_for_project_with_auth(project_id, user_data.user_id)
+        response = get_epics_for_project_with_auth(project_id, user_data.user_id, user_data.email)
         return JSONResponse(
             status_code=200 if response.success else 404,
             content=response.dict(),
@@ -344,13 +367,15 @@ async def add_project_member_route(
     print(f"[DEBUG] User data: {user_data}")
 
     try:
-        project_response = get_project_for_user(project_id, user_data.user_id)
-        if not project_response.success:
-            status_code = 404 if "not found" in project_response.message.lower() else 403
+        access = get_project_access(project_id, user_data.user_id, user_data.email)
+        if not access.success:
+            status_code = 404 if "not found" in access.message.lower() else 403
             return JSONResponse(
                 status_code=status_code,
-                content=project_response.dict(),
+                content=access.dict(),
             )
+        if not access.data.get("is_lead"):
+            raise HTTPException(status_code=403, detail="Forbidden: Team members cannot add members")
 
         if check_member_exists(project_id, req.email):
             raise HTTPException(status_code=409, detail="Member already exists for this project")
@@ -416,13 +441,15 @@ async def update_project_member_route(
         raise HTTPException(status_code=400, detail="At least one field (role, seniority) is required")
 
     try:
-        project_response = get_project_for_user(project_id, user_data.user_id)
-        if not project_response.success:
-            status_code = 404 if "not found" in project_response.message.lower() else 403
+        access = get_project_access(project_id, user_data.user_id, user_data.email)
+        if not access.success:
+            status_code = 404 if "not found" in access.message.lower() else 403
             return JSONResponse(
                 status_code=status_code,
-                content=project_response.dict(),
+                content=access.dict(),
             )
+        if not access.data.get("is_lead"):
+            raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update members")
 
         updated_member = update_team_member(
             project_id=project_id,
@@ -475,13 +502,15 @@ async def remove_project_member_route(
     print(f"[DEBUG] User data: {user_data}")
 
     try:
-        project_response = get_project_for_user(project_id, user_data.user_id)
-        if not project_response.success:
-            status_code = 404 if "not found" in project_response.message.lower() else 403
+        access = get_project_access(project_id, user_data.user_id, user_data.email)
+        if not access.success:
+            status_code = 404 if "not found" in access.message.lower() else 403
             return JSONResponse(
                 status_code=status_code,
-                content=project_response.dict(),
+                content=access.dict(),
             )
+        if not access.data.get("is_lead"):
+            raise HTTPException(status_code=403, detail="Forbidden: Team members cannot remove members")
 
         removed = remove_team_member(project_id, member_id)
         if not removed:

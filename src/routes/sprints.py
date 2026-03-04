@@ -12,6 +12,7 @@ from src.schemas.sprint_schemas import (
     SprintOrderRequest,
 )
 from src.utils.auth import validate_user_and_get_data
+from src.utils.permissions import get_project_access
 from src.utils.sprints import (
     get_sprints_for_project,
     create_sprint,
@@ -68,7 +69,13 @@ async def list_sprints_route(
     user_data = _get_user_data_or_401(authorization)
 
     try:
-        response = get_sprints_for_project(project_id, user_data.get_user_id(), include_counts=True)
+        response = get_sprints_for_project(
+            project_id,
+            user_data.get_user_id(),
+            include_counts=True,
+            allow_members=True,
+            user_email=user_data.get_email(),
+        )
         return JSONResponse(
             status_code=_status_from_response(response),
             content=response.dict(),
@@ -90,6 +97,13 @@ async def create_sprint_route(
     Creates a new sprint for the project.
     """
     user_data = _get_user_data_or_401(authorization)
+
+    access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot create sprints")
 
     try:
         response = create_sprint(
@@ -125,6 +139,13 @@ async def reorder_sprints_route(
     if not req.order:
         raise HTTPException(status_code=400, detail="order is required")
 
+    access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot reorder sprints")
+
     try:
         response = reorder_sprints(
             project_id=project_id,
@@ -157,6 +178,13 @@ async def update_sprint_route(
     if not req or (req.name is None and req.lengthDays is None and req.startDate is None and req.endDate is None):
         raise HTTPException(status_code=400, detail="At least one field is required")
 
+    access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update sprints")
+
     try:
         response = update_sprint(
             sprint_id=sprint_id,
@@ -188,6 +216,13 @@ async def delete_sprint_route(
     Deletes a sprint and unassigns all items from it.
     """
     user_data = _get_user_data_or_401(authorization)
+
+    access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot delete sprints")
 
     try:
         response = delete_sprint(
@@ -223,6 +258,8 @@ async def list_sprint_items_route(
             sprint_id=sprint_id,
             project_id=project_id,
             user_id=user_data.get_user_id(),
+            allow_members=True,
+            user_email=user_data.get_email(),
         )
         return JSONResponse(
             status_code=_status_from_response(response),
@@ -246,6 +283,13 @@ async def assign_sprint_item_route(
     Assigns a user story or subtask to a sprint.
     """
     user_data = _get_user_data_or_401(authorization)
+
+    access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot assign sprint items")
 
     try:
         response = assign_item_to_sprint(
@@ -293,6 +337,13 @@ async def unassign_sprint_item_route(
 
     if not resolved_type or not resolved_id:
         raise HTTPException(status_code=400, detail="type and id are required")
+
+    access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot unassign sprint items")
 
     try:
         response = unassign_item_from_sprint(
@@ -361,6 +412,13 @@ async def bulk_update_sprint_items_route(
     """
     user_data = _get_user_data_or_401(authorization)
 
+    access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update sprint items")
+
     try:
         response = bulk_update_sprint_items(
             sprint_id=sprint_id,
@@ -394,6 +452,13 @@ async def reorder_sprint_items_route(
 
     if not req.order:
         raise HTTPException(status_code=400, detail="order is required")
+
+    access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot reorder sprint items")
 
     try:
         response = reorder_sprint_items(
