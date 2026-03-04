@@ -109,7 +109,7 @@ ATOMIC USER STORY CREATION PROCESS:
 4. For CRUD operations, create a SEPARATE user story for EACH operation (Create, Read, Update, Delete)
 5. Include user stories for error handling and edge cases related to this functionality
 
-For each user story, provide the following information: User Story, Description, Order, Dependencies, {template_field_keys}
+For each user story, provide the following information: User Story, Description, Order, Dependencies, Story Points, {template_field_keys}
 
 STORY CREATION GUIDELINES:
 - Begin user stories with "As a [specific role]" (not generic "user" unless appropriate)
@@ -122,6 +122,7 @@ STORY CREATION GUIDELINES:
 - Consider mobile/responsive adaptations where relevant
 - Assign an order number (1, 2, 3, etc.) based on logical implementation sequence
 - Identify dependencies - which user story IDs must be completed before this one
+- Assign Story Points to estimate the effort and complexity of the user story. You MUST use the Fibonacci sequence (1, 2, 3, 5, 8, 13, 21). Use 1-3 for simple tasks, 5-8 for medium complexity, and 13-21 for highly complex tasks.
 
 CONCRETE EXAMPLES OF GOOD ATOMIC USER STORIES:
 - "As an Administrator, I need a search bar with filters for users by name, role and date created, so that I can quickly find specific users in large datasets"
@@ -142,6 +143,7 @@ Respond with a list of objects in the following format, fill each object complet
             "description": "",
             "user_story_id": "",// A ID generated for each user story with a short reference of the user story eg. "login_feature"
             "order": 1,// Sequential number indicating implementation order (1, 2, 3, etc.)
+            "story_points": 3, // Integer using Fibonacci sequence (1, 2, 3, 5, 8, 13, 21) indicating estimated effort
             "dependencies": [],// Array of user_story_id values that must be completed first (empty array if no dependencies)
             {template_fields_json}
         }},

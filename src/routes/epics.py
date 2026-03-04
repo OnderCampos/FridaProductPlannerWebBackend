@@ -1,12 +1,16 @@
-from fastapi import APIRouter, HTTPException, Header, Path
+from fastapi import APIRouter, HTTPException, Header, Path, Request
 from fastapi.responses import JSONResponse
 from typing import Optional
 
 from src.schemas.response import ResponseModel
 from src.utils.auth import validate_user_and_get_data
 from src.utils.user_stories import get_user_stories_by_epic_with_auth
+
 from src.utils.epics import get_epic_by_id
 from src.utils.permissions import get_project_access
+
+from src.utils.epics import get_epic_by_id, create_epic, update_epic, delete_epic
+
 
 router = APIRouter()
 
