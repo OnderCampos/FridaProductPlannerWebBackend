@@ -7,7 +7,14 @@ from src.schemas.response import ResponseModel
 from src.utils.epic_generation import generate_epics
 from src.utils.epics import get_epics_for_project, delete_epics_for_project
 from src.utils.members import get_project_members as get_team_members, format_team_members_response
+from src.utils.project_memberships import (
+    delete_memberships_for_project,
+    get_memberships_for_user,
+    upsert_project_membership,
+)
+from src.utils.users import upsert_user_profile
 from src.utils.user_stories import get_user_stories_by_epic
+from src.utils.permissions import get_project_access
 from src.schemas.user_data import UserData
 
 
@@ -55,7 +62,7 @@ def get_project_for_user(project_id: str, user_id: str) -> ResponseModel:
         )
 
 
-def get_all_projects_for_user(user_id: str) -> ResponseModel:
+def get_all_projects_for_user(user_id: str, include_member_projects: bool = False, user_email: Optional[str] = None) -> ResponseModel:
     """
     Retrieves all projects for a specific user.
     
@@ -67,22 +74,73 @@ def get_all_projects_for_user(user_id: str) -> ResponseModel:
     """
     try:
         print(f"Fetching projects for user with {user_id}")
-        # Query the 'projects' collection where 'user_id' matches the given uid
-        projects_ref = FIRESTORE_CLIENT.collection("projects").where(
-            "user_id", "==", user_id
-        )
-        projects_docs = projects_ref.get()
-        
-        # Process and return the projects
+        project_ids = set()
         all_projects = []
+
+        # Owned projects
+        projects_ref = FIRESTORE_CLIENT.collection("projects").where("user_id", "==", user_id)
+        projects_docs = projects_ref.get()
         for doc in projects_docs:
             project_data = doc.to_dict()
             project_data["id"] = doc.id  # Add document ID as project ID
+            project_ids.add(doc.id)
 
             team_members = get_team_members(doc.id)
             project_data["teamMembers"] = team_members
 
             all_projects.append(project_data)
+
+        # Member projects
+        if include_member_projects:
+            membership_project_ids = set()
+            memberships = get_memberships_for_user(user_id, user_email)
+            for membership in memberships:
+                project_id = membership.get("project_id")
+                if not project_id or project_id in project_ids:
+                    continue
+                membership_project_ids.add(project_id)
+                project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
+                if not project_doc.exists:
+                    continue
+                project_data = project_doc.to_dict()
+                project_data["id"] = project_doc.id
+                project_ids.add(project_id)
+
+                team_members = get_team_members(project_id)
+                project_data["teamMembers"] = team_members
+
+                all_projects.append(project_data)
+
+            # Backward compatibility: include projects from team_members not yet in memberships.
+            member_docs = []
+            members_ref = FIRESTORE_CLIENT.collection("team_members")
+            try:
+                member_docs = members_ref.where("user_id", "==", user_id).get()
+            except Exception:
+                member_docs = []
+
+            if user_email:
+                try:
+                    member_docs += members_ref.where("email", "==", user_email).get()
+                except Exception:
+                    pass
+
+            for doc in member_docs or []:
+                member_data = doc.to_dict()
+                project_id = member_data.get("project_id")
+                if not project_id or project_id in project_ids:
+                    continue
+                project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
+                if not project_doc.exists:
+                    continue
+                project_data = project_doc.to_dict()
+                project_data["id"] = project_doc.id
+                project_ids.add(project_id)
+
+                team_members = get_team_members(project_id)
+                project_data["teamMembers"] = team_members
+
+                all_projects.append(project_data)
 
         #print(f"PROJECTS: {all_projects}")
 
@@ -100,7 +158,12 @@ def get_all_projects_for_user(user_id: str) -> ResponseModel:
         )
 
 
-def get_project_by_id(project_id: str, user_id: str) -> ResponseModel:
+def get_project_by_id(
+    project_id: str,
+    user_id: str,
+    allow_member: bool = False,
+    user_email: Optional[str] = None,
+) -> ResponseModel:
     """
     Retrieves a specific project by ID, ensuring the user owns it.
     
@@ -112,16 +175,21 @@ def get_project_by_id(project_id: str, user_id: str) -> ResponseModel:
         ResponseModel: Response containing the project data
     """
     try:
-        project_response = get_project_for_user(project_id, user_id)
+        if allow_member:
+            project_response = get_project_access(project_id, user_id, user_email)
+        else:
+            project_response = get_project_for_user(project_id, user_id)
         if not project_response.success:
             return project_response
 
         project_data = project_response.data
+        if allow_member and isinstance(project_data, dict) and "project" in project_data:
+            project_data = project_data.get("project")
 
         # Get epics for the project using utility function
         project_epics = get_epics_for_project(project_id, user_id)
         for epic in project_epics:
-            stories_response = get_user_stories_by_epic(epic["id"], user_id)
+            stories_response = get_user_stories_by_epic(epic["id"], user_id, allow_member=allow_member)
             stories = stories_response.data or []
             for story in stories:
                 if "assigneeId" not in story and "assigned_to" in story:
@@ -187,11 +255,13 @@ async def create_project(user_data: UserData, name: str, description: str, proje
         epics_result = await generate_epics(user_data=user_data, project_name=name, project_description=description)
         
         now = _current_timestamp_iso()
+        owner_email = user_data.get_email()
         project_data = {
             "user_id": user_data.get_user_id(),
             "name": name,
             "description": description,
             "project_key": project_key,
+            "projectLead": owner_email,
             "created_at": now,
             "updated_at": now,
         }
@@ -211,6 +281,21 @@ async def create_project(user_data: UserData, name: str, description: str, proje
         # Get the generated document ID
         project_id = doc_ref[1].id
         project_data["id"] = project_id
+
+        # Ensure owner profile + membership records exist
+        upsert_user_profile(
+            user_id=user_data.get_user_id(),
+            email=owner_email,
+            name=owner_email,
+            role="leader",
+        )
+        upsert_project_membership(
+            project_id=project_id,
+            user_id=user_data.get_user_id(),
+            email=owner_email,
+            role="leader",
+            project_role="owner",
+        )
         
         # Save epics in separate collection if epic generation was successful
         created_epics = []
@@ -383,6 +468,9 @@ def delete_project(project_id: str, user_id: str) -> ResponseModel:
         
         # Delete the project
         project_ref.delete()
+
+        # Cleanup memberships for this project
+        delete_memberships_for_project(project_id)
         
         return ResponseModel(
             success=True,

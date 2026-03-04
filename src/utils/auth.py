@@ -1,5 +1,6 @@
 import json
 import logging
+from typing import Optional
 from fastapi import HTTPException
 import requests
 
@@ -11,6 +12,41 @@ from src.utils.admin_utils import create_firebase_user
 
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
+from src.utils.permissions import get_global_user_role
+from src.utils.users import upsert_user_profile
+
+
+def build_login_user_payload(email: str) -> dict:
+    uid = None
+    display_name = None
+    try:
+        user = auth.get_user_by_email(email)
+        uid = user.uid
+        display_name = user.display_name
+    except Exception as e:
+        logging.error(f"Error retrieving Firebase user for {email}: {e}")
+
+    user_data = UserData(user_id=uid or "", email=email, team_id=None)
+    role_info = get_global_user_role(user_data)
+
+    name = display_name or role_info.get("member_name") or email
+
+    upsert_user_profile(
+        user_id=uid,
+        email=email,
+        name=name,
+        role=role_info.get("role"),
+        member_id=role_info.get("member_id"),
+    )
+
+    return {
+        "id": uid,
+        "email": email,
+        "name": name,
+        "role": role_info.get("role"),
+        "is_team_lead": role_info.get("is_team_lead", False),
+        "member_id": role_info.get("member_id"),
+    }
 
 
 def firebase_authenticate(email: str, password: str) -> ResponseModel:

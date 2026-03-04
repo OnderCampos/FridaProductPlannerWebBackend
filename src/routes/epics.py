@@ -5,7 +5,12 @@ from typing import Optional
 from src.schemas.response import ResponseModel
 from src.utils.auth import validate_user_and_get_data
 from src.utils.user_stories import get_user_stories_by_epic_with_auth
+
+from src.utils.epics import get_epic_by_id
+from src.utils.permissions import get_project_access
+
 from src.utils.epics import get_epic_by_id, create_epic, update_epic, delete_epic
+
 
 router = APIRouter()
 
@@ -33,6 +38,14 @@ async def get_epic_by_id_route(
 
     try:
         response = get_epic_by_id(epic_id)
+        if response.success:
+            project_id = response.data.get("project_id")
+            access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
+            if not access.success:
+                return JSONResponse(
+                    status_code=403 if "unauthorized" in access.message.lower() else 404,
+                    content=access.dict(),
+                )
         return JSONResponse(
             status_code=200 if response.success else 404,
             content=response.dict(),
@@ -74,110 +87,9 @@ async def get_user_stories_by_epic_route(
     print(f"[DEBUG] Getting user stories for epic {epic_id}, user: {user_data.get_user_id()}")
 
     try:
-        response = get_user_stories_by_epic_with_auth(epic_id, user_data.get_user_id())
+        response = get_user_stories_by_epic_with_auth(epic_id, user_data.get_user_id(), user_data.get_email())
         return JSONResponse(
             status_code=200 if response.success else 404,
-            content=response.dict(),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@router.post(
-    "/{project_id}/epic-manually/",
-    response_description="Create a epic manually for a user story",
-)
-async def create_epic_route(
-    project_id: str = Path(..., description="The project ID"),
-    request: Request = None,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
-) -> ResponseModel:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
-    try:
-        epic_data = await request.json()
-
-        response = create_epic(project_id, user_data.get_user_id(), epic_data)
-
-        return JSONResponse(
-            status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
-            content=response.dict(),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@router.patch(
-    "/{project_id}/epic/{epic_id}",
-    response_description="Update a epic",
-)
-async def update_epic_route(
-    project_id: str = Path(..., description="The project ID"),
-    epic_id: str = Path(..., description="The epic ID"),
-    request: Request = None,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
-) -> ResponseModel:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
-    try:
-        epic_data = await request.json()
-
-        response = update_epic(epic_id, user_data.get_user_id(), epic_data)
-
-        return JSONResponse(
-            status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
-            content=response.dict(),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@router.delete(
-    "/{project_id}/epic/{epic_id}",
-    response_description="Delete a epic",
-)
-async def delete_epic_route(
-    project_id: str = Path(..., description="The project ID"),
-    epic_id: str = Path(..., description="The epic ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
-) -> ResponseModel:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
-    try:
-        response = delete_epic(epic_id, user_data.get_user_id())
-
-        return JSONResponse(
-            status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
             content=response.dict(),
         )
     except Exception as e:

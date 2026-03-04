@@ -4,6 +4,7 @@ import logging
 
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.schemas.response import ResponseModel
+from src.utils.permissions import get_project_access, get_project_id_for_epic
 
 
 def _current_timestamp_iso() -> str:
@@ -187,7 +188,7 @@ def create_multiple_user_stories(epic_id: str, user_id: str, user_stories_list: 
         )
 
 
-def get_user_story_by_id(story_id: str, user_id: str) -> ResponseModel:
+def get_user_story_by_id(story_id: str, user_id: str, allow_member: bool = False, user_email: Optional[str] = None) -> ResponseModel:
     """
     Retrieves a single user story by ID with user authentication.
     
@@ -213,13 +214,28 @@ def get_user_story_by_id(story_id: str, user_id: str) -> ResponseModel:
         story_data["id"] = story_doc.id
         _normalize_story_payload(story_data)
         
-        # Verify ownership
+        # Verify ownership or membership
         if story_data.get("user_id") != user_id:
-            return ResponseModel(
-                success=False,
-                message="Unauthorized: You don't own this user story",
-                data=None
-            )
+            if not allow_member:
+                return ResponseModel(
+                    success=False,
+                    message="Unauthorized: You don't own this user story",
+                    data=None
+                )
+            project_id = get_project_id_for_epic(story_data.get("epic_id"))
+            if not project_id:
+                return ResponseModel(
+                    success=False,
+                    message="Unauthorized: You don't have access to this user story",
+                    data=None
+                )
+            access = get_project_access(project_id, user_id, user_email)
+            if not access.success:
+                return ResponseModel(
+                    success=False,
+                    message="Unauthorized: You don't have access to this user story",
+                    data=None
+                )
 
         # Search in sprint_items
         assignment_query = FIRESTORE_CLIENT.collection('sprint_items').where(
@@ -250,7 +266,7 @@ def get_user_story_by_id(story_id: str, user_id: str) -> ResponseModel:
         )
 
 
-def get_user_stories_by_epic(epic_id: str, user_id: str = None) -> ResponseModel:
+def get_user_stories_by_epic(epic_id: str, user_id: str = None, allow_member: bool = False) -> ResponseModel:
     """
     Retrieves all user stories for a specific epic, ordered by their order field.
     
@@ -265,7 +281,7 @@ def get_user_stories_by_epic(epic_id: str, user_id: str = None) -> ResponseModel
         query = FIRESTORE_CLIENT.collection("user_stories").where("epic_id", "==", epic_id)
         
         # Add user filter if provided
-        if user_id:
+        if user_id and not allow_member:
             query = query.where("user_id", "==", user_id)
         
         user_stories_docs = query.get()
@@ -306,7 +322,7 @@ def get_user_stories_by_epic(epic_id: str, user_id: str = None) -> ResponseModel
             data=None
         )
 
-def get_user_stories_by_epic_with_auth(epic_id: str, user_id: str) -> ResponseModel:
+def get_user_stories_by_epic_with_auth(epic_id: str, user_id: str, user_email: Optional[str] = None) -> ResponseModel:
     """
     Retrieves all user stories for a specific epic, ensuring the user owns the epic.
     
@@ -320,7 +336,6 @@ def get_user_stories_by_epic_with_auth(epic_id: str, user_id: str) -> ResponseMo
     try:
         # First verify the user owns the epic (through project ownership)
         from src.utils.epics import get_epic_by_id
-        from src.utils.projects import get_project_by_id
         
         epic_response = get_epic_by_id(epic_id)
         if not epic_response.success:
@@ -331,8 +346,8 @@ def get_user_stories_by_epic_with_auth(epic_id: str, user_id: str) -> ResponseMo
             )
         
         epic = epic_response.data
-        project_response = get_project_by_id(epic["project_id"], user_id)
-        if not project_response.success:
+        access = get_project_access(epic["project_id"], user_id, user_email)
+        if not access.success:
             return ResponseModel(
                 success=False,
                 message="Unauthorized: You don't own this project/epic",
@@ -340,7 +355,7 @@ def get_user_stories_by_epic_with_auth(epic_id: str, user_id: str) -> ResponseMo
             )
         
         # Get user stories for the epic
-        stories_result = get_user_stories_by_epic(epic_id, user_id)
+        stories_result = get_user_stories_by_epic(epic_id, user_id, allow_member=True)
         
         # Stories are already in structured format from Firestore, no transformation needed
         return stories_result

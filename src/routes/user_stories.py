@@ -19,7 +19,7 @@ from src.utils.user_story_generation import (
 from src.utils.user_story_dependencies import generate_user_story_dependencies
 from src.utils.user_stories import get_user_story_by_id, update_user_story, update_user_story_fields
 from src.utils.epics import get_epic_by_id
-from src.utils.projects import get_project_by_id
+from src.utils.permissions import get_project_access
 from src.utils.members import get_member_by_id
 from src.utils.subtask_generation import (
     generate_subtasks_for_user_story,
@@ -31,6 +31,15 @@ from src.utils.subtask_generation import (
 )
 
 router = APIRouter()
+
+
+def _require_project_lead(project_id: str, user_data):
+    access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        raise HTTPException(status_code=status_code, detail=access.message)
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot perform this action")
 
 @router.post(
     "/user-story-generation-step-1/",
@@ -62,6 +71,11 @@ async def generate_analysis_route(
     print(f"[DEBUG] User data: {user_data}")
 
     try:
+        epic_response = get_epic_by_id(req.epic_id)
+        if not epic_response.success:
+            raise HTTPException(status_code=404, detail="Epic not found")
+        _require_project_lead(epic_response.data.get("project_id"), user_data)
+
         print("[DEBUG] Step 1: Generating analysis for user story creation")
         response = await generate_analysis(
             user_data=user_data,
@@ -105,6 +119,11 @@ async def generate_user_stories_route(
     print(f"[DEBUG] User data: {user_data}")
 
     try:
+        epic_response = get_epic_by_id(req.epic_id)
+        if not epic_response.success:
+            raise HTTPException(status_code=404, detail="Epic not found")
+        _require_project_lead(epic_response.data.get("project_id"), user_data)
+
         print("[DEBUG] Step 2: Generating detailed user stories")
         response = await generate_user_stories(
             user_data=user_data,
@@ -153,9 +172,7 @@ async def generate_user_story_dependencies_route(
         if not epic_response.success:
             raise HTTPException(status_code=404, detail="Epic not found")
 
-        project_response = get_project_by_id(epic_response.data.get("project_id"), user_data.get_user_id())
-        if not project_response.success:
-            raise HTTPException(status_code=403, detail="Unauthorized: You don't own this project/epic")
+        _require_project_lead(epic_response.data.get("project_id"), user_data)
 
         response = await generate_user_story_dependencies(
             user_data=user_data,
@@ -200,7 +217,7 @@ async def get_user_story_route(
 
     try:
         print(f"[DEBUG] Retrieving user story with ID: {story_id}")
-        response = get_user_story_by_id(story_id, user_data.get_user_id())
+        response = get_user_story_by_id(story_id, user_data.get_user_id(), allow_member=True, user_email=user_data.get_email())
         return JSONResponse(
             status_code=200 if response.success else 404 if "not found" in response.message.lower() else 403,
             content=response.dict(),
@@ -239,13 +256,24 @@ async def update_user_story_assignee_route(
         raise HTTPException(status_code=400, detail="assigneeId or assignee is required")
 
     try:
-        story_response = get_user_story_by_id(story_id, user_data.get_user_id())
+        story_response = get_user_story_by_id(
+            story_id,
+            user_data.get_user_id(),
+            allow_member=True,
+            user_email=user_data.get_email()
+        )
         if not story_response.success:
             status_code = 404 if "not found" in story_response.message.lower() else 403
             return JSONResponse(
                 status_code=status_code,
                 content=story_response.dict(),
             )
+
+        epic_id = story_response.data.get("epic_id")
+        epic_response = get_epic_by_id(epic_id) if epic_id else None
+        if not epic_response or not epic_response.success:
+            raise HTTPException(status_code=404, detail="Epic not found")
+        _require_project_lead(epic_response.data.get("project_id"), user_data)
 
         update_data = {}
         if req.assigneeId:
@@ -316,13 +344,24 @@ async def update_user_story_assignee_name_route(
         raise HTTPException(status_code=400, detail="assigneeId or assignee is required")
 
     try:
-        story_response = get_user_story_by_id(story_id, user_data.get_user_id())
+        story_response = get_user_story_by_id(
+            story_id,
+            user_data.get_user_id(),
+            allow_member=True,
+            user_email=user_data.get_email()
+        )
         if not story_response.success:
             status_code = 404 if "not found" in story_response.message.lower() else 403
             return JSONResponse(
                 status_code=status_code,
                 content=story_response.dict(),
             )
+
+        epic_id = story_response.data.get("epic_id")
+        epic_response = get_epic_by_id(epic_id) if epic_id else None
+        if not epic_response or not epic_response.success:
+            raise HTTPException(status_code=404, detail="Epic not found")
+        _require_project_lead(epic_response.data.get("project_id"), user_data)
 
         update_data = {}
         if req.assigneeId:
@@ -403,6 +442,25 @@ async def update_user_story_fields_route(
     print(f"[DEBUG] User data: {user_data}")
 
     try:
+        story_response = get_user_story_by_id(
+            story_id,
+            user_data.get_user_id(),
+            allow_member=True,
+            user_email=user_data.get_email()
+        )
+        if not story_response.success:
+            status_code = 404 if "not found" in story_response.message.lower() else 403
+            return JSONResponse(
+                status_code=status_code,
+                content=story_response.dict(),
+            )
+
+        epic_id = story_response.data.get("epic_id")
+        epic_response = get_epic_by_id(epic_id) if epic_id else None
+        if not epic_response or not epic_response.success:
+            raise HTTPException(status_code=404, detail="Epic not found")
+        _require_project_lead(epic_response.data.get("project_id"), user_data)
+
         update_data = await request.json()
         response = update_user_story_fields(story_id, user_data.get_user_id(), update_data)
 
@@ -461,6 +519,25 @@ async def generate_subtasks_route(
     print(f"[DEBUG] User data: {user_data}")
 
     try:
+        story_response = get_user_story_by_id(
+            story_id,
+            user_data.get_user_id(),
+            allow_member=True,
+            user_email=user_data.get_email()
+        )
+        if not story_response.success:
+            status_code = 404 if "not found" in story_response.message.lower() else 403
+            return JSONResponse(
+                status_code=status_code,
+                content=story_response.dict(),
+            )
+
+        epic_id = story_response.data.get("epic_id")
+        epic_response = get_epic_by_id(epic_id) if epic_id else None
+        if not epic_response or not epic_response.success:
+            raise HTTPException(status_code=404, detail="Epic not found")
+        _require_project_lead(epic_response.data.get("project_id"), user_data)
+
         print(f"[DEBUG] Generating subtasks for user story ID: {story_id}")
         response = await generate_subtasks_for_user_story(user_data, story_id)
         return JSONResponse(
@@ -493,6 +570,25 @@ async def create_subtask_route(
     print(f"[DEBUG] User data: {user_data}")
 
     try:
+        story_response = get_user_story_by_id(
+            story_id,
+            user_data.get_user_id(),
+            allow_member=True,
+            user_email=user_data.get_email()
+        )
+        if not story_response.success:
+            status_code = 404 if "not found" in story_response.message.lower() else 403
+            return JSONResponse(
+                status_code=status_code,
+                content=story_response.dict(),
+            )
+
+        epic_id = story_response.data.get("epic_id")
+        epic_response = get_epic_by_id(epic_id) if epic_id else None
+        if not epic_response or not epic_response.success:
+            raise HTTPException(status_code=404, detail="Epic not found")
+        _require_project_lead(epic_response.data.get("project_id"), user_data)
+
         subtask_data = await request.json()
         response = create_subtask_for_user_story(story_id, user_data.get_user_id(), subtask_data)
 
@@ -539,7 +635,12 @@ async def get_subtasks_route(
 
     try:
         print(f"[DEBUG] Retrieving subtasks for user story ID: {story_id}")
-        response = get_subtasks_by_user_story(story_id, user_data.get_user_id())
+        response = get_subtasks_by_user_story(
+            story_id,
+            user_data.get_user_id(),
+            allow_member=True,
+            user_email=user_data.get_email()
+        )
         return JSONResponse(
             status_code=200 if response.success else 400,
             content=response.dict(),
@@ -652,6 +753,25 @@ async def update_subtask_fields_route(
     print(f"[DEBUG] User data: {user_data}")
 
     try:
+        story_response = get_user_story_by_id(
+            story_id,
+            user_data.get_user_id(),
+            allow_member=True,
+            user_email=user_data.get_email()
+        )
+        if not story_response.success:
+            status_code = 404 if "not found" in story_response.message.lower() else 403
+            return JSONResponse(
+                status_code=status_code,
+                content=story_response.dict(),
+            )
+
+        epic_id = story_response.data.get("epic_id")
+        epic_response = get_epic_by_id(epic_id) if epic_id else None
+        if not epic_response or not epic_response.success:
+            raise HTTPException(status_code=404, detail="Epic not found")
+        _require_project_lead(epic_response.data.get("project_id"), user_data)
+
         update_data = await request.json()
 
         response = update_subtask_fields(subtask_id, user_data.get_user_id(), update_data)
@@ -693,6 +813,25 @@ async def delete_subtask_route(
     print(f"[DEBUG] User data: {user_data}")
 
     try:
+        story_response = get_user_story_by_id(
+            story_id,
+            user_data.get_user_id(),
+            allow_member=True,
+            user_email=user_data.get_email()
+        )
+        if not story_response.success:
+            status_code = 404 if "not found" in story_response.message.lower() else 403
+            return JSONResponse(
+                status_code=status_code,
+                content=story_response.dict(),
+            )
+
+        epic_id = story_response.data.get("epic_id")
+        epic_response = get_epic_by_id(epic_id) if epic_id else None
+        if not epic_response or not epic_response.success:
+            raise HTTPException(status_code=404, detail="Epic not found")
+        _require_project_lead(epic_response.data.get("project_id"), user_data)
+
         print(f"[DEBUG] Deleting subtask {subtask_id}")
         response = delete_subtasks_by_user_story(subtask_id, user_data.get_user_id())
         return JSONResponse(

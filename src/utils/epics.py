@@ -1,9 +1,10 @@
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.schemas.response import ResponseModel
+from src.utils.permissions import get_project_access
 
 
 def _current_timestamp_iso() -> str:
@@ -40,7 +41,7 @@ def get_epics_for_project(project_id: str, user_id: str = None) -> List[Dict[str
         return []  # Return empty list if epics can't be retrieved
 
 
-def get_epics_for_project_with_auth(project_id: str, user_id: str) -> ResponseModel:
+def get_epics_for_project_with_auth(project_id: str, user_id: str, user_email: Optional[str] = None) -> ResponseModel:
     """
     Retrieves all epics for a specific project, ensuring the user owns the project.
     
@@ -52,21 +53,11 @@ def get_epics_for_project_with_auth(project_id: str, user_id: str) -> ResponseMo
         ResponseModel: Response containing the project's epics
     """
     try:
-        # First verify the user owns the project
-        project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
-        
-        if not project_doc.exists:
+        access = get_project_access(project_id, user_id, user_email)
+        if not access.success:
             return ResponseModel(
                 success=False,
-                message="Project not found",
-                data=None
-            )
-        
-        project_data = project_doc.to_dict()
-        if project_data.get("user_id") != user_id:
-            return ResponseModel(
-                success=False,
-                message="Unauthorized: You don't own this project",
+                message="Unauthorized: You don't have access to this project",
                 data=None
             )
         
@@ -275,6 +266,53 @@ def update_epic(epic_id: str, user_id: str, epic_update_data: Dict[str, Any]) ->
         return ResponseModel(
             success=False,
             message=f"Error updating epic: {str(e)}",
+            data=None
+        )
+
+
+def update_epic_status(epic_id: str, user_id: str, status: str) -> ResponseModel:
+    """
+    Updates the status of an epic.
+    """
+    try:
+        epic_ref = FIRESTORE_CLIENT.collection("epics").document(epic_id)
+        epic_doc = epic_ref.get()
+
+        if not epic_doc.exists:
+            return ResponseModel(
+                success=False,
+                message="Epic not found",
+                data=None
+            )
+
+        epic_data = epic_doc.to_dict()
+        if epic_data.get("user_id") != user_id:
+            return ResponseModel(
+                success=False,
+                message="Unauthorized: You don't own this epic",
+                data=None
+            )
+
+        update_data = {
+            "status": status,
+            "updated_at": _current_timestamp_iso(),
+        }
+        epic_ref.update(update_data)
+
+        updated_doc = epic_ref.get()
+        updated_data = updated_doc.to_dict()
+        updated_data["id"] = epic_id
+
+        return ResponseModel(
+            success=True,
+            message="Epic status updated successfully",
+            data=updated_data
+        )
+    except Exception as e:
+        logging.error(f"Error updating epic status {epic_id}: {e}")
+        return ResponseModel(
+            success=False,
+            message=f"Error updating epic status: {str(e)}",
             data=None
         )
 
