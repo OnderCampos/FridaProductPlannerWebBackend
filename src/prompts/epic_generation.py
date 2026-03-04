@@ -20,6 +20,7 @@ EPIC CREATION GUIDELINES:
 - Include both functional user interactions and non-functional user experiences as separate epics
 - Use natural, conversational language that can be understood by non-technical stakeholders.
 - Avoid technical jargon or implementation details in the project description and epic descriptions.
+- Generate 1-3 relevant labels for each epic (e.g., "Frontend", "Backend", "Database", "Security", "UX", "API", "Mobile", etc.)
 
 The format of the response should be in the following JSON format:
 {{
@@ -29,7 +30,8 @@ The format of the response should be in the following JSON format:
     "epics": [
         {{
             "name": "",//String
-            "description": "" // String with detailed explanation in natural language about user interactions, roles, views, and workflows
+            "description": "", // String with detailed explanation in natural language about user interactions, roles, views, and workflows
+            "labels": ["Frontend", "UX", "Database"]
         }},
         ...
     ]

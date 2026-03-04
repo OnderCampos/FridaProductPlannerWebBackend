@@ -254,6 +254,7 @@ async def generate_user_stories(
             "user_story_id",
             "order",
             "dependencies",
+            "story_points"
         ] + template_field_keys
 
         print("[DEBUG] Detailed expected keys:", detailed_expected_keys)
@@ -316,6 +317,7 @@ async def generate_user_stories(
                         "updated_at": now,
                         "createdDate": now,
                         "effortHours": story.get("effortHours", story.get("effort_hours", 0)),
+                        "storyPoints": story.get("story_points", 0),
                     }
                     structured_story = transform_user_story_to_structured_format(story_with_meta, template_data)
                     structured_stories.append(structured_story)
