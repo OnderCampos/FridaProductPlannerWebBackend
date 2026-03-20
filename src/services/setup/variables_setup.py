@@ -1,8 +1,8 @@
+import logging
 import os
 from dotenv import load_dotenv
 from langchain_openai import AzureChatOpenAI
 
-load_dotenv(override=True)
 """The API key for the LLMOPS API."""
 LLMOPS_API_KEY = os.getenv("LLMOPS_API_KEY")
 LOGGING_ENDPOINT = os.getenv("LOGGING_ENDPOINT")
@@ -20,7 +20,7 @@ KNOWLEDGE_BASE_URL = os.getenv("KNOWLEDGE_BASE_URL")
 
 CHATBOT_KB_BASE_URL = os.getenv("CHATBOT_KB_BASE_URL")
 
-print("Setting up Azure Chat OpenAI client...")
+logging.getLogger(__name__).info("Setting up Azure Chat OpenAI client...")
 
 gpt40_client = AzureChatOpenAI(
     azure_deployment=os.getenv("AZURE_DEPLOYMENT"),

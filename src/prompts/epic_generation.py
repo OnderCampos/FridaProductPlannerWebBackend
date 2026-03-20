@@ -4,6 +4,12 @@ You are provided with the following text:
     {text}
 your task is to generate a project description and a list of Epics derived from the text provided. For each epic return the name and a description.
 
+Epic definition to enforce:
+- An epic is a high-level feature or objective.
+- It is too large to complete as one task.
+- It must be decomposable into multiple user stories/tasks.
+- Do not output story-sized work items as epics.
+
 The project description must summarize the overall purpose and goals, focusing on how different users interact with the system, the main workflows, and the relationships between different entities in the project.
 The project description MUST identify all user roles involved in the project.
 
@@ -20,6 +26,7 @@ EPIC CREATION GUIDELINES:
 - Include both functional user interactions and non-functional user experiences as separate epics
 - Use natural, conversational language that can be understood by non-technical stakeholders.
 - Avoid technical jargon or implementation details in the project description and epic descriptions.
+- Ensure each epic is broad enough to be split into several user stories/tasks.
 - Generate 1-3 relevant labels for each epic (e.g., "Frontend", "Backend", "Database", "Security", "UX", "API", "Mobile", etc.)
 
 The format of the response should be in the following JSON format:

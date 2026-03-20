@@ -72,7 +72,7 @@ dmypy.json
 
 # IDE / OS noise
 .idea/
-.vscode/
+
 .DS_Store
 Thumbs.db
 

@@ -1,6 +1,7 @@
-from fastapi import APIRouter, HTTPException, Header, Path
+from fastapi import APIRouter, Depends, HTTPException, Path
 from fastapi.responses import JSONResponse
 from typing import Optional
+import logging
 
 from src.schemas.resources_request import (
     CreateTemplateRequest,
@@ -8,9 +9,10 @@ from src.schemas.resources_request import (
 )
 from src.schemas.resources_response import TemplateResponse
 
-from src.utils.auth import validate_user_and_get_data
+from src.schemas.user_data import UserData
+from src.utils.authz.auth import get_current_user
 
-from src.utils.templates import (
+from src.utils.planning.templates import (
     get_all_templates_by_project,
     get_selected_template_by_project,
     create_template,
@@ -20,6 +22,7 @@ from src.utils.templates import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get(
@@ -28,7 +31,7 @@ router = APIRouter()
 )
 async def get_all_templates_route(
     project_id: str = Path(..., description="The project ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> TemplateResponse:
     """
     Retrieves all templates for the authenticated user and project.
@@ -40,26 +43,17 @@ async def get_all_templates_route(
     Returns:
         TemplateResponse: List of all templates for the project
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    
     try:
         response = get_all_templates_by_project(project_id, user_data.get_user_id())
         return JSONResponse(
             status_code=200 if response.success else 404,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to get templates")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get(
@@ -68,7 +62,7 @@ async def get_all_templates_route(
 )
 async def get_selected_template_route(
     project_id: str = Path(..., description="The project ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> TemplateResponse:
     """
     Retrieves the selected template for the authenticated user and project.
@@ -80,26 +74,17 @@ async def get_selected_template_route(
     Returns:
         TemplateResponse: The selected template data
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    
     try:
         response = get_selected_template_by_project(project_id, user_data.user_id)
         return JSONResponse(
             status_code=200 if response.success else 404,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to get selected template")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post(
@@ -109,7 +94,7 @@ async def get_selected_template_route(
 async def create_template_route(
     req: CreateTemplateRequest,
     project_id: str = Path(..., description="The project ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> TemplateResponse:
     """
     Creates a new template for the authenticated user and project.
@@ -122,18 +107,6 @@ async def create_template_route(
     Returns:
         TemplateResponse: The created template data
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    
     try:
         response = create_template(
             project_id=project_id,
@@ -146,8 +119,11 @@ async def create_template_route(
             status_code=201 if response.success else 400,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to create template")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.put(
@@ -158,7 +134,7 @@ async def update_template_route(
     req: UpdateTemplateRequest,
     project_id: str = Path(..., description="The project ID"),
     template_id: str = Path(..., description="The template ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> TemplateResponse:
     """
     Updates an existing template. User must have access to the project.
@@ -172,18 +148,6 @@ async def update_template_route(
     Returns:
         TemplateResponse: The updated template data
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    
     try:
         response = update_template(
             template_id=template_id,
@@ -197,8 +161,11 @@ async def update_template_route(
             status_code=200 if response.success else 404,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to update template")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete(
@@ -208,7 +175,7 @@ async def update_template_route(
 async def delete_template_route(
     project_id: str = Path(..., description="The project ID"),
     template_id: str = Path(..., description="The template ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> TemplateResponse:
     """
     Deletes a template. User must have access to the project.
@@ -221,18 +188,6 @@ async def delete_template_route(
     Returns:
         TemplateResponse: Confirmation of deletion
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    
     try:
         response = delete_template(
             template_id=template_id,
@@ -243,8 +198,11 @@ async def delete_template_route(
             status_code=200 if response.success else 404,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to delete template")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post(
@@ -254,7 +212,7 @@ async def delete_template_route(
 async def set_selected_template_route(
     project_id: str = Path(..., description="The project ID"),
     template_id: str = Path(..., description="The template ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> TemplateResponse:
     """
     Sets a specific template as the selected template for the project.
@@ -267,18 +225,6 @@ async def set_selected_template_route(
     Returns:
         TemplateResponse: Confirmation of selection
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    
     try:
         response = set_selected_template(
             project_id=project_id,
@@ -289,5 +235,9 @@ async def set_selected_template_route(
             status_code=200 if response.success else 404,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to set selected template")
+        raise HTTPException(status_code=500, detail="Internal server error")
+

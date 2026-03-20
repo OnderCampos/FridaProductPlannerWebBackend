@@ -1,18 +1,19 @@
-from dataclasses import dataclass
 from typing import Any, Optional
 
+from pydantic import BaseModel
 
-@dataclass
-class ResponseModel:
-    """Generic response model for API responses"""
+
+class ResponseModel(BaseModel):
+    """Generic response model for API responses."""
+
     success: bool
     message: str
     data: Optional[Any] = None
 
-    def dict(self):
-        """Convert to dictionary for JSON serialization"""
-        return {
-            "success": self.success,
-            "message": self.message,
-            "data": self.data
-        }
+    def dict(self, *args, **kwargs):
+        """Compatibility wrapper for Pydantic v1/v2 callers."""
+        if hasattr(super(), "model_dump"):
+            return super().model_dump(*args, **kwargs)
+        return super().dict(*args, **kwargs)
+
+    model_config = {"arbitrary_types_allowed": True}

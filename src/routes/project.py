@@ -1,13 +1,16 @@
-from fastapi import APIRouter, HTTPException, Path, Header
+from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from typing import Optional
+import logging
 
 from src.schemas.resources_request import (
     GetProjectsRequest,
     GetProjectRequest,
     CreateProjectRequest,
+    CreateProjectFromFigmaRequest,
     UpdateProjectRequest,
-    DeleteProjectRequest
+    DeleteProjectRequest,
+    ProjectClarificationRequest,
 )
 from src.schemas.response import ResponseModel
 from src.schemas.resources_response import (
@@ -15,20 +18,39 @@ from src.schemas.resources_response import (
     GetProjectResponse,
     ProjectResponse
 )
-from src.schemas.member_schemas import TeamMemberCreateRequest, TeamMemberUpdate
+from src.schemas.member_schemas import ProjectInvitationRequest, TeamMemberCreateRequest, TeamMemberUpdate
 
-from src.utils.auth import validate_user_and_get_data
+from src.schemas.user_data import UserData
+from src.utils.authz.auth import get_current_user
 
-from src.utils.projects import (
+from src.utils.planning.projects import (
     get_all_projects_for_user,
     get_project_by_id,
-    create_project,
     update_project,
     delete_project,
-    get_project_for_user
+    get_project_for_user,
 )
-from src.utils.permissions import get_project_access, get_global_user_role
-from src.utils.members import (
+
+from src.utils.ai.project_creation_qa.clarification import submit_answers
+
+from src.services.workflows.project_creation.common import ProjectRecordCreationError
+from src.services.workflows.project_creation.orchestrator import (
+    ProjectCreationOrchestrator,
+    ProjectOrchestrationError,
+)
+from src.services.workflows.project_creation.project_creation_by_document.initialization import (
+    DocumentTextError,
+)
+from src.services.workflows.project_creation.finalization import (
+    EpicGenerationFailedError,
+    ProjectFinalizationError,
+    ProjectNotFoundError,
+    ProjectNotReadyError,
+)
+
+
+from src.utils.authz.permissions import get_project_access, get_global_user_role
+from src.utils.planning.members import (
     get_project_members as get_team_members,
     create_team_member,
     update_team_member,
@@ -37,9 +59,30 @@ from src.utils.members import (
     format_team_members_response,
     format_team_member_response
 )
-from src.utils.epics import get_epics_for_project_with_auth
+from src.utils.planning.epics import get_epics_for_project_with_auth, get_epics_for_project
+from src.utils.planning.user_stories import get_user_stories_by_epic
+from src.utils.planning.invitations import (
+    create_invitation,
+    get_project_invitations,
+    get_invitation_by_id,
+    cancel_invitation,
+    resend_invitation,
+    check_pending_invitation,
+    check_and_expire_invitations,
+)
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _normalize_invitation_payload(invitation: dict) -> dict:
+    payload = dict(invitation or {})
+    payload["projectId"] = payload.get("projectId") or payload.get("project_id")
+    payload["invitedBy"] = payload.get("invitedBy") or payload.get("invited_by")
+    payload["invitedDate"] = payload.get("invitedDate") or payload.get("invited_date")
+    payload["expiresDate"] = payload.get("expiresDate") or payload.get("expires_date")
+    payload["responseDate"] = payload.get("responseDate") or payload.get("response_date")
+    return payload
 
 @router.get(
     "/{project_id}",
@@ -47,7 +90,7 @@ router = APIRouter()
 )
 async def get_project_route(
     project_id: str = Path(..., description="The project ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> GetProjectResponse:
     """
     Retrieves a single project by ID. Requires authentication and user must own the project.
@@ -59,52 +102,28 @@ async def get_project_route(
     Returns:
         GetProjectResponse: The project data
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-    
     try:
         response = get_project_by_id(project_id, user_data.user_id, allow_member=True, user_email=user_data.email)
         return JSONResponse(
             status_code=200 if response.success else 404,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to get project")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.get(
     "/",
     response_description="Get all projects for the user.",
 )
 async def get_projects_route(
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> GetProjectsResponse:
     """
     Retrieves all projects for the authenticated user.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
     try:
         response = get_all_projects_for_user(
             user_data.user_id,
@@ -115,8 +134,11 @@ async def get_projects_route(
             status_code=200,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to list projects")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.post(
     "/",
@@ -124,43 +146,36 @@ async def get_projects_route(
 )
 async def create_project_route(
     req: CreateProjectRequest,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ProjectResponse:
     """
     Creates a new project with name, description, and user-provided project key.
     """
-    print(f"[DEBUG] Creating project route with request: {req}")
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-    
     role_info = get_global_user_role(user_data)
     if role_info.get("role") == "member":
         raise HTTPException(status_code=403, detail="Forbidden: Team members cannot create projects")
 
     try:
-        response = await create_project(
+        data = await ProjectCreationOrchestrator("qa").initialize_project(
             user_data=user_data,
             name=req.name,
             description=req.description,
             project_key=req.project_key,
         )
-        return JSONResponse(
-            status_code=201 if response.success else 400,
-            content=response.dict(),
+        response = ResponseModel(
+            success=True,
+            message="Project created. Clarification started.",
+            data=data.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        return JSONResponse(status_code=201, content=response.dict())
+    except (ProjectOrchestrationError, ProjectRecordCreationError) as exc:
+        response = ResponseModel(success=False, message=str(exc), data=None)
+        return JSONResponse(status_code=400, content=response.dict())
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to create project")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.patch(
     "/{project_id}",
@@ -169,25 +184,11 @@ async def create_project_route(
 async def update_project_route(
     project_id: str = Path(..., description="The project ID"),
     req: UpdateProjectRequest = None,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ProjectResponse:
     """
     Updates an existing project. User must own the project.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-    
     access = get_project_access(project_id, user_data.user_id, user_data.email)
     if not access.success:
         status_code = 404 if "not found" in access.message.lower() else 403
@@ -208,8 +209,11 @@ async def update_project_route(
             status_code=200 if response.success else 404,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to update project")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.delete(
     "/{project_id}",
@@ -217,25 +221,11 @@ async def update_project_route(
 )
 async def delete_project_route(
     project_id: str = Path(..., description="The project ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ProjectResponse:
     """
     Deletes a project. User must own the project.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-    
     access = get_project_access(project_id, user_data.user_id, user_data.email)
     if not access.success:
         status_code = 404 if "not found" in access.message.lower() else 403
@@ -252,8 +242,11 @@ async def delete_project_route(
             status_code=200 if response.success else 404,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to delete project")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get(
@@ -262,33 +255,22 @@ async def delete_project_route(
 )
 async def get_project_epics_route(
     project_id: str = Path(..., description="The project ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ):
     """
     Retrieves all epics for a specific project. User must own the project.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-    
     try:
         response = get_epics_for_project_with_auth(project_id, user_data.user_id, user_data.email)
         return JSONResponse(
             status_code=200 if response.success else 404,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to get project epics")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.get(
     "/{project_id}/members",
@@ -299,25 +281,11 @@ async def get_project_members_route(
     status: Optional[str] = None,
     role: Optional[str] = None,
     seniority: Optional[str] = None,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ):
     """
     Retrieves detailed project info including members. User must own the project.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-    
     try:
         project_response = get_project_for_user(project_id, user_data.user_id)
         if not project_response.success:
@@ -337,8 +305,11 @@ async def get_project_members_route(
             status_code=200,
             content=response.dict()
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to get project members")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post(
@@ -348,24 +319,11 @@ async def get_project_members_route(
 async def add_project_member_route(
     project_id: str = Path(..., description="The project ID"),
     req: TeamMemberCreateRequest = None,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ):
     """
     Adds a member directly to a project without invitations.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     try:
         access = get_project_access(project_id, user_data.user_id, user_data.email)
         if not access.success:
@@ -407,8 +365,542 @@ async def add_project_member_route(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("Failed to add project member")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ====================================
+# Project Generation by Q&A endpoints
+# ====================================
+
+"""
+ Workflow:
+    1. `POST /project/creation/qa` with project metadata.
+    2. `POST /project/{project_id}/clarification/answer` repeatedly until spec is ready.
+    3. `POST /project/{project_id}/spec/accept` to finalize and generate epics.
+"""
+
+@router.post(
+    "/creation/qa",
+    response_description="Start Q&A-based project creation.",
+)
+async def create_project_from_qa_route(
+    req: CreateProjectRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ProjectResponse:
+    """
+    Start project creation using the Q&A workflow.
+
+    This endpoint creates a project draft from `name`, `project_key`, and 
+    `description`, then returns the project creation response used to continue the
+    clarification flow.
+    """
+    role_info = get_global_user_role(user_data)
+    if role_info.get("role") == "member":
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot create projects")
+
+    try:
+        data = await ProjectCreationOrchestrator("qa").initialize_project(
+            user_data=user_data,
+            name=req.name,
+            description=req.description,
+            project_key=req.project_key,
+        )
+        response = ResponseModel(
+            success=True,
+            message="Project created. Clarification started.",
+            data=data.dict(),
+        )
+        return JSONResponse(status_code=201, content=response.dict())
+    except (ProjectOrchestrationError, ProjectRecordCreationError) as exc:
+        response = ResponseModel(success=False, message=str(exc), data=None)
+        return JSONResponse(status_code=400, content=response.dict())
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to create project")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    
+
+@router.post(
+    "/{project_id}/clarification/answer",
+    response_description="Submit clarification answers and fetch next questions or spec.",
+)
+async def submit_project_clarification_route(
+    project_id: str = Path(..., description="The project ID"),
+    req: ProjectClarificationRequest = None,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not req.answers:
+        raise HTTPException(status_code=400, detail="answers are required")
+
+    try:
+        access = get_project_access(project_id, user_data.user_id, user_data.email)
+        if not access.success:
+            status_code = 404 if "not found" in access.message.lower() else 403
+            return JSONResponse(status_code=status_code, content=access.dict())
+        if not access.data.get("is_lead"):
+            raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update projects")
+
+        response = await submit_answers(
+            user_data=user_data,
+            project_id=project_id,
+            answers=[answer.dict() for answer in req.answers],
+        )
+        return JSONResponse(
+            status_code=200 if response.success else 400,
+            content=response.dict(),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to submit project clarification")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    
+
+
+# =========================================
+# Project Generation by File Upload GOOd ONe 
+# =========================================
+"""
+Steps:
+1) POST /project/creation/file with name, project_key, description (optional), and a PDF/DOCX file
+2) Review spec text/url returned (status=spec_ready)
+3) POST /project/{project_id}/spec/accept to finalize and generate epics
+"""
+
+@router.post(
+    "/creation/file",
+    response_description="Start file-based project creation (PDF/DOCX).",
+)
+async def create_project_from_file_route(
+    name: str = Form(...),
+    project_key: str = Form(...),
+    description: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    user_data: UserData = Depends(get_current_user),
+) -> ProjectResponse:
+    """
+    First step
+    Start project creation from an uploaded PDF/DOCX file.
+
+    Flow:
+    1) Accept multipart form-data with `name`, `project_key`, optional `description`, and `file`.
+    2) Extract text from the file and build a source payload.
+    3) Delegate to the file-based AI creation flow.
+
+    Returns:
+        ProjectResponse: Creation response with clarification/spec state.
+    """
+    role_info = get_global_user_role(user_data)
+    if role_info.get("role") == "member":
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot create projects")
+
+    if not file:
+        raise HTTPException(status_code=400, detail="file is required")
+
+    try:
+        file_bytes = await file.read()
+    except Exception:
+        logger.exception("Failed to read uploaded file")
+        raise HTTPException(status_code=400, detail="Failed to read uploaded file")
+
+    try:
+        data = await ProjectCreationOrchestrator("file").initialize_project(
+            user_data=user_data,
+            name=name,
+            description=description or "",
+            project_key=project_key,
+            file_bytes=file_bytes,
+            filename=file.filename,
+            content_type=file.content_type,
+        )
+        response = ResponseModel(
+            success=True,
+            message="Project created. File extraction started.",
+            data=data.dict(),
+        )
+        return JSONResponse(status_code=201, content=response.dict())
+    except (DocumentTextError, ProjectOrchestrationError, ProjectRecordCreationError) as exc:
+        response = ResponseModel(success=False, message=str(exc), data=None)
+        return JSONResponse(status_code=400, content=response.dict())
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to create project from file")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    
+
+@router.post(
+    "/{project_id}/spec/accept",
+    response_description="Accept specification document and finalize project.",
+)
+async def accept_project_spec_route(
+    project_id: str = Path(..., description="The project ID"),
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    """
+    Accepts the generated specification document for a project and finalizes the project.
+
+    This endpoint is the final step in the file/Figma-based project creation flows:
+    once a project is in a "spec_ready" state, the project lead can accept the spec to
+    trigger downstream generation (e.g., epics) via `finalize_project_from_spec`.
+
+    Authorization:
+        - Requires authentication.
+        - Only the project lead (`is_lead`) may accept/finalize the spec.
+
+    Args:
+        project_id (str): Target project ID.
+        user_data (UserData): Authenticated user context (injected by `get_current_user`).
+
+    Returns:
+        ResponseModel: Serialized response payload wrapped in a JSON response.
+            - 200 when the project was finalized successfully.
+            - 400 when finalization fails (e.g., invalid spec state).
+            - 403 when the user is authenticated but not allowed.
+            - 404 when the project is not found (as reported by access check).
+
+    Raises:
+        HTTPException: For authorization failures, invalid input, or internal errors.
+    """
+    try:
+        access = get_project_access(project_id, user_data.user_id, user_data.email)
+        if not access.success:
+            status_code = 404 if "not found" in access.message.lower() else 403
+            return JSONResponse(status_code=status_code, content=access.dict())
+        if not access.data.get("is_lead"):
+            raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update projects")
+
+        try:
+            data = await ProjectCreationOrchestrator().complete(
+                user_data=user_data,
+                project_id=project_id,
+            )
+        except ProjectNotFoundError as exc:
+            response = ResponseModel(success=False, message=str(exc), data=None)
+            return JSONResponse(status_code=404, content=response.dict())
+        except ProjectNotReadyError as exc:
+            response = ResponseModel(success=False, message=str(exc), data=None)
+            return JSONResponse(status_code=400, content=response.dict())
+        except EpicGenerationFailedError as exc:
+            response = ResponseModel(success=False, message=str(exc), data=None)
+            return JSONResponse(status_code=400, content=response.dict())
+        except ProjectFinalizationError as exc:
+            response = ResponseModel(success=False, message=str(exc), data=None)
+            return JSONResponse(status_code=400, content=response.dict())
+
+        response = ResponseModel(success=True, message="Project finalized successfully", data=data.dict())
+        return JSONResponse(status_code=200, content=response.dict())
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to accept project spec")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ======================================
+# Project Generation by Figma endpoints
+# ======================================
+
+@router.post(
+    "/creation/figma",
+    response_description="Start Figma-based project creation.",
+)
+async def create_project_from_figma_route(
+    req: CreateProjectFromFigmaRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ProjectResponse:
+    """
+    Steps:
+    1) POST /project/creation/figma with name, project_key, figma_url (optional notes)
+    2) Review spec text/url returned (status=spec_ready)
+    3) POST /project/{project_id}/spec/accept to finalize and generate epics
+    """
+    role_info = get_global_user_role(user_data)
+    if role_info.get("role") == "member":
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot create projects")
+
+    figma_payload = {
+        "url": req.figma_url,
+        "notes": req.figma_notes,
+    }
+
+    try:
+        data = await ProjectCreationOrchestrator("figma").initialize_project(
+            user_data=user_data,
+            name=req.name,
+            project_key=req.project_key,
+            description=req.description or "",
+            figma_payload=figma_payload,
+        )
+        response = ResponseModel(
+            success=True,
+            message="Project created. Figma link processed.",
+            data=data.dict(),
+        )
+        return JSONResponse(status_code=201, content=response.dict())
+    except (ProjectOrchestrationError, ProjectRecordCreationError) as exc:
+        response = ResponseModel(success=False, message=str(exc), data=None)
+        return JSONResponse(status_code=400, content=response.dict())
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to create project from figma")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get(
+    "/{project_id}/stats-timeline/",
+    response_description="Get timeline-ready stats payload for a project.",
+)
+async def get_project_stats_timeline_route(
+    project_id: str = Path(..., description="The project ID"),
+    user_data: UserData = Depends(get_current_user),
+):
+    access = get_project_access(project_id, user_data.user_id, user_data.email)
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+
+    try:
+        epics = get_epics_for_project(project_id, user_data.user_id) or []
+        payload_epics = []
+
+        for epic in epics:
+            epic_id = epic.get("id")
+            stories_response = get_user_stories_by_epic(epic_id, user_data.user_id, allow_member=True)
+            stories = stories_response.data if stories_response and stories_response.success else []
+
+            normalized_stories = []
+            for story in stories or []:
+                effort_hours = story.get("effortHours")
+                if effort_hours is None:
+                    effort_hours = story.get("effort_hours")
+                normalized_stories.append({
+                    "id": story.get("id"),
+                    "user_story_id": story.get("user_story_id"),
+                    "status": story.get("status") or "To Do",
+                    "createdDate": story.get("createdDate") or story.get("created_at"),
+                    "startDate": story.get("startDate") or story.get("start_date"),
+                    "dueDate": story.get("dueDate") or story.get("due_date"),
+                    "effortHours": effort_hours,
+                    "effort_hours": effort_hours,
+                })
+
+            payload_epics.append({
+                "id": epic_id,
+                "name": epic.get("name"),
+                "status": epic.get("status") or "To Do",
+                "userStories": normalized_stories,
+            })
+
+        response = ResponseModel(
+            success=True,
+            message="Stats timeline fetched successfully",
+            data={
+                "projectId": project_id,
+                "epics": payload_epics,
+            },
+        )
+        return JSONResponse(status_code=200, content=response.dict())
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to get project stats timeline")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post(
+    "/{project_id}/members/invite",
+    response_description="Invite a new member to a project.",
+)
+async def invite_project_member_route(
+    req: ProjectInvitationRequest,
+    project_id: str = Path(..., description="The project ID"),
+    user_data: UserData = Depends(get_current_user),
+):
+    access = get_project_access(project_id, user_data.user_id, user_data.email)
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot invite members")
+
+    name = req.name
+    email = req.email
+    role = req.role
+    seniority = req.seniority
+
+    try:
+        if check_member_exists(project_id, email):
+            raise HTTPException(status_code=409, detail="Member already exists for this project")
+        if check_pending_invitation(project_id, email):
+            raise HTTPException(status_code=409, detail="A pending invitation already exists for this email")
+
+        invitation = create_invitation(
+            project_id=project_id,
+            invited_by=user_data.user_id,
+            invited_by_name=user_data.get_user_name(),
+            name=name,
+            email=email,
+            role=role,
+            seniority=seniority,
+        )
+        invitation = _normalize_invitation_payload(invitation)
+
+        return JSONResponse(
+            status_code=201,
+            content=ResponseModel(
+                success=True,
+                message="Invitation sent successfully",
+                data=invitation,
+            ).dict(),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to invite project member")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get(
+    "/{project_id}/invitations",
+    response_description="List project invitations.",
+)
+async def get_project_invitations_route(
+    project_id: str = Path(..., description="The project ID"),
+    status: Optional[str] = None,
+    user_data: UserData = Depends(get_current_user),
+):
+    access = get_project_access(project_id, user_data.user_id, user_data.email)
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot view invitations")
+
+    try:
+        check_and_expire_invitations(project_id)
+        invitations = get_project_invitations(project_id, status=status)
+        invitations = [_normalize_invitation_payload(invitation) for invitation in invitations]
+        return JSONResponse(
+            status_code=200,
+            content=ResponseModel(
+                success=True,
+                message="Invitations fetched successfully",
+                data=invitations,
+            ).dict(),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to get project invitations")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.delete(
+    "/{project_id}/invitations/{invitation_id}",
+    response_description="Cancel a project invitation.",
+)
+async def cancel_project_invitation_route(
+    project_id: str = Path(..., description="The project ID"),
+    invitation_id: str = Path(..., description="Invitation ID"),
+    user_data: UserData = Depends(get_current_user),
+):
+    access = get_project_access(project_id, user_data.user_id, user_data.email)
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot cancel invitations")
+
+    invitation = get_invitation_by_id(invitation_id)
+    if not invitation or invitation.get("project_id") != project_id:
+        return JSONResponse(
+            status_code=404,
+            content=ResponseModel(success=False, message="Invitation not found", data=None).dict(),
+        )
+
+    try:
+        cancelled = cancel_invitation(invitation_id)
+        if not cancelled:
+            return JSONResponse(
+                status_code=400,
+                content=ResponseModel(
+                    success=False,
+                    message="Invitation cannot be cancelled",
+                    data=None,
+                ).dict(),
+            )
+        return JSONResponse(
+            status_code=200,
+            content=ResponseModel(
+                success=True,
+                message="Invitation cancelled successfully",
+                data=None,
+            ).dict(),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to cancel project invitation")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post(
+    "/{project_id}/invitations/{invitation_id}/resend",
+    response_description="Resend a project invitation.",
+)
+async def resend_project_invitation_route(
+    project_id: str = Path(..., description="The project ID"),
+    invitation_id: str = Path(..., description="Invitation ID"),
+    user_data: UserData = Depends(get_current_user),
+):
+    access = get_project_access(project_id, user_data.user_id, user_data.email)
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot resend invitations")
+
+    invitation = get_invitation_by_id(invitation_id)
+    if not invitation or invitation.get("project_id") != project_id:
+        return JSONResponse(
+            status_code=404,
+            content=ResponseModel(success=False, message="Invitation not found", data=None).dict(),
+        )
+
+    try:
+        resent = resend_invitation(invitation_id)
+        if not resent:
+            return JSONResponse(
+                status_code=400,
+                content=ResponseModel(
+                    success=False,
+                    message="Invitation cannot be resent",
+                    data=None,
+                ).dict(),
+            )
+
+        updated_invitation, plain_token = resent
+        payload = _normalize_invitation_payload(updated_invitation)
+        payload["invitation_token"] = plain_token
+
+        return JSONResponse(
+            status_code=200,
+            content=ResponseModel(
+                success=True,
+                message="Invitation resent successfully",
+                data=payload,
+            ).dict(),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to resend project invitation")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.patch(
@@ -419,24 +911,11 @@ async def update_project_member_route(
     project_id: str = Path(..., description="The project ID"),
     member_id: str = Path(..., description="The member ID"),
     req: TeamMemberUpdate = None,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ):
     """
     Updates role or seniority for a project member.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     if not req or (req.role is None and req.seniority is None):
         raise HTTPException(status_code=400, detail="At least one field (role, seniority) is required")
 
@@ -472,8 +951,9 @@ async def update_project_member_route(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("Failed to update project member")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete(
@@ -483,24 +963,11 @@ async def update_project_member_route(
 async def remove_project_member_route(
     project_id: str = Path(..., description="The project ID"),
     member_id: str = Path(..., description="The member ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ):
     """
     Removes a member from a project.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     try:
         access = get_project_access(project_id, user_data.user_id, user_data.email)
         if not access.success:
@@ -527,5 +994,6 @@ async def remove_project_member_route(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("Failed to remove project member")
+        raise HTTPException(status_code=500, detail="Internal server error")

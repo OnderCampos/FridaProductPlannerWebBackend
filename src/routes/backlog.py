@@ -1,24 +1,28 @@
-from fastapi import APIRouter, HTTPException, Header, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from typing import Optional
 from datetime import datetime, timezone
+import logging
 
+from src.schemas.resources_request import BacklogStatusUpdateRequest
 from src.schemas.response import ResponseModel
-from src.utils.auth import validate_user_and_get_data
-from src.utils.projects import get_all_projects_for_user
-from src.utils.epics import get_epics_for_project
-from src.utils.user_stories import get_user_stories_by_epic
-from src.utils.subtask_generation import get_subtasks_by_user_story
-from src.utils.members import get_project_members
-from src.utils.assignees import (
+from src.schemas.user_data import UserData
+from src.utils.authz.auth import get_current_user
+from src.utils.planning.projects import get_all_projects_for_user
+from src.utils.planning.epics import get_epics_for_project
+from src.utils.planning.user_stories import get_user_stories_by_epic
+from src.utils.planning.subtask_generation import get_subtasks_by_user_story
+from src.utils.planning.members import get_project_members
+from src.utils.planning.assignees import (
     build_member_lookup_from_members,
     assignee_matches,
     normalize_assignee_fields,
 )
-from src.utils.permissions import get_project_access
+from src.utils.authz.permissions import get_project_access
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _normalize_key(value: Optional[str]) -> str:
@@ -51,6 +55,10 @@ def _normalize_status(value: Optional[str]) -> Optional[str]:
         return "To Do"
     if normalized in {"in progress", "in_progress", "inprogress"}:
         return "In Progress"
+    if normalized in {"in review", "in_review", "inreview"}:
+        return "In Review"
+    if normalized == "stopped":
+        return "Stopped"
     if normalized == "done":
         return "Done"
     return None
@@ -76,25 +84,12 @@ def _current_timestamp_iso() -> str:
 async def get_backlog_route(
     assignee_email: Optional[str] = Query(None, alias="assignee_email", description="Assignee email"),
     assigneeEmail: Optional[str] = Query(None, description="Assignee email"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication"),
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Retrieves epics, stories, and subtasks for all projects owned by the user.
     Optionally filters by assignee email.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     resolved_email = assignee_email or assigneeEmail
 
     try:
@@ -237,8 +232,11 @@ async def get_backlog_route(
             },
         )
         return JSONResponse(status_code=200, content=response.dict())
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to load backlog")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.patch(
@@ -246,33 +244,15 @@ async def get_backlog_route(
     response_description="Update backlog item status",
 )
 async def update_backlog_item_status(
-    request: Request,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication"),
+    req: BacklogStatusUpdateRequest,
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Updates status for an epic, story, or subtask.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
-    item_type = body.get("item_type")
-    item_id = body.get("item_id")
-    raw_status = body.get("status")
+    item_type = req.item_type
+    item_id = req.item_id
+    raw_status = req.status
     status = _normalize_status(raw_status)
 
     if not item_type or not item_id:
@@ -300,7 +280,7 @@ async def update_backlog_item_status(
             status_code=400,
             content=ResponseModel(
                 success=False,
-                message="Invalid status. Expected: To Do, In Progress, Done.",
+                message="Invalid status. Expected: To Do, In Progress, In Review, Stopped, Done.",
                 data=None,
             ).dict(),
         )
@@ -399,3 +379,4 @@ async def update_backlog_item_status(
             data={"updated": True},
         ).dict(),
     )
+

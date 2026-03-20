@@ -12,7 +12,7 @@ from src.schemas.member_schemas import (
     MembersListResponse
 )
 from src.schemas.response import ResponseModel
-from src.utils.members import (
+from src.utils.planning.members import (
     get_project_members,
     get_member_by_id,
     get_member_details,

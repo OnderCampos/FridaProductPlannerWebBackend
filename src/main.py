@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from src.routes import auth, project, templates, user_stories, epics, members, invitations, sprints, backlog
+from src.routes import auth, project, templates, user_stories, epics, members, invitations, sprints, backlog, assistant
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
@@ -20,7 +20,6 @@ app.add_middleware(
 )
 
 app.include_router(auth.router, prefix="/authenticate", tags=["authenticate"])
-app.include_router(project.router, prefix="/project", tags=["project"])
 app.include_router(project.router, prefix="/projects", tags=["project"])
 app.include_router(templates.router, prefix="/projects", tags=["templates"])
 app.include_router(sprints.router, prefix="/projects", tags=["sprints"])
@@ -29,6 +28,7 @@ app.include_router(epics.router, prefix="/epics", tags=["epics"])
 app.include_router(members.router, prefix="/members", tags=["members"])
 app.include_router(invitations.router, prefix="/invitations", tags=["invitations"])
 app.include_router(backlog.router, tags=["backlog"])
+app.include_router(assistant.router, prefix="/assistant", tags=["assistant"])
 
 
 

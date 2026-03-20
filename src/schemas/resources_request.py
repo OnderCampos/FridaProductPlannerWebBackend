@@ -19,6 +19,15 @@ class CreateProjectRequest(BaseModel):
     project_key: str
 
 
+class CreateProjectFromFigmaRequest(BaseModel):
+    """Request model for creating a project from a Figma link"""
+    name: str
+    project_key: str
+    description: Optional[str] = None
+    figma_url: str
+    figma_notes: Optional[str] = None
+
+
 class UpdateProjectRequest(BaseModel):
     """Request model for updating a project"""
     #project_id: str
@@ -43,6 +52,15 @@ class GenerateUserStoriesRequest(BaseModel):
     epic_id: str
     functionality: Optional[str] = None
     functionalities: Optional[list] = None
+
+
+class ProjectClarificationAnswer(BaseModel):
+    question: str
+    answer: str
+
+
+class ProjectClarificationRequest(BaseModel):
+    answers: List[ProjectClarificationAnswer]
 
 
 class CreateTemplateRequest(BaseModel):
@@ -82,3 +100,36 @@ class GenerateUserStoryDependenciesRequest(BaseModel):
     """Request model for generating dependencies between user stories"""
     epic_id: str
     user_stories: List[UserStoryDependencyItem]
+
+
+class EpicCreateRequest(BaseModel):
+    """Request model for creating an epic"""
+    name: str
+    description: str
+    labels: Optional[list] = None
+    roles: Optional[List[str]] = None
+    technologies: Optional[List[str]] = None
+    keywords: Optional[List[str]] = None
+    priority: Optional[str] = None
+    status: Optional[str] = None
+    storyPoints: Optional[float] = None
+
+
+class EpicUpdateRequest(BaseModel):
+    """Request model for updating an epic"""
+    name: Optional[str] = None
+    description: Optional[str] = None
+    labels: Optional[list] = None
+    roles: Optional[List[str]] = None
+    technologies: Optional[List[str]] = None
+    keywords: Optional[List[str]] = None
+    priority: Optional[str] = None
+    status: Optional[str] = None
+    storyPoints: Optional[float] = None
+
+
+class BacklogStatusUpdateRequest(BaseModel):
+    """Request model for updating backlog item status"""
+    item_type: str
+    item_id: str
+    status: str
