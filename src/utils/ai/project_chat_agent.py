@@ -16,6 +16,7 @@ from langchain_core.tools import StructuredTool
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
 from src.services.setup.variables_setup import gpt40_mini_client
+from src.services.setup.language_setup import get_default_llm_language, normalize_language
 from src.utils.planning.epics import (
     get_epic_by_id,
     get_epics_for_project_with_auth,
@@ -574,6 +575,7 @@ def run_project_chat_agent(
     message: str,
     project_id: str,
     history: Optional[List[Dict[str, Any]]] = None,
+    language: Optional[str] = None,
 ) -> ResponseModel:
     if LANGGRAPH_IMPORT_ERROR is not None:
         return ResponseModel(
@@ -2027,6 +2029,7 @@ def run_project_chat_agent(
         f"Chat scope is locked to project {focused_project_id}. "
         "Do not access, compare, or reference any other project."
     )
+    effective_language = normalize_language(language, default=get_default_llm_language())
     system_prompt = (
         "You are Product Planner Assistant. Use tool calls for factual data. "
         "Do not invent project, sprint, epic, story, member, status, or date details. "
@@ -2038,7 +2041,7 @@ def run_project_chat_agent(
         "Only ask for clarification when tool output indicates multiple matches. "
         "If data is missing, say so explicitly. "
         "When the user asks for metrics, compute them from tool output. "
-        "Keep responses concise and structured.\n"
+        f"Respond in {effective_language}. Keep responses concise and structured.\n"
         f"{scoped_hint}\n"
         "Current project context:\n"
         + "\n".join(project_catalog)
@@ -2078,6 +2081,7 @@ def run_project_chat_agent(
         message="Assistant response generated",
         data={
             "answer": final_answer,
+            "language": effective_language,
             "referenced_projects": referenced,
             "pending_actions": pending_actions,
         },

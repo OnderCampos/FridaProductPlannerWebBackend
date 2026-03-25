@@ -14,6 +14,7 @@ from src.intelligence.agents.document_extraction.document_user_story_extraction_
 from src.intelligence.agents.epic_generation.epic_agent import PROJECT_SUMMARY_AGENT
 from src.intelligence.agents.json_executor import execute_json_agent, parse_json_response
 from src.schemas.user_data import UserData
+from src.services.setup.language_setup import get_default_llm_language, normalize_language
 
 try:
     from langgraph.graph import END, START, StateGraph
@@ -62,7 +63,7 @@ def _split_text(text: str, size: int) -> List[str]:
 def _prepare_text_node(state: DocumentExtractionState) -> Dict[str, Any]:
     project_name = state.get("project_name", "")
     document_text = state.get("document_text", "")
-    language = state.get("language", "English")
+    language = normalize_language(state.get("language"), default=get_default_llm_language())
     user_data = state.get("user_data")
 
     combined_text = f"Project Name: {project_name}\n\n{document_text}".strip()
@@ -101,10 +102,34 @@ def _normalize_list(value: Any) -> List[str]:
     return normalized
 
 
+def _normalize_bullets(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+
+    items: List[str] = []
+    for raw_line in text.splitlines():
+        line = str(raw_line).strip()
+        if not line:
+            continue
+        for prefix in ("- ", "* ", "• ", "â€¢ "):
+            if line.startswith(prefix):
+                line = line[len(prefix) :].strip()
+                break
+        if line and line[0].isdigit():
+            if len(line) >= 3 and line[1] in {".", ")"} and line[2] == " ":
+                line = line[3:].strip()
+        if line:
+            items.append(line)
+    return items
+
+
 def _description_node(state: DocumentExtractionState) -> Dict[str, Any]:
     user_data = state.get("user_data")
     prepared_text = state.get("prepared_text", "")
-    language = state.get("language", "English")
+    language = normalize_language(state.get("language"), default=get_default_llm_language())
 
     raw = execute_json_agent(
         agent=DOCUMENT_DESCRIPTION_AGENT,
@@ -160,7 +185,7 @@ def _normalize_epics(raw_epics: Any) -> List[Dict[str, Any]]:
 def _epics_node(state: DocumentExtractionState) -> Dict[str, Any]:
     user_data = state.get("user_data")
     prepared_text = state.get("prepared_text", "")
-    language = state.get("language", "English")
+    language = normalize_language(state.get("language"), default=get_default_llm_language())
     project_description = state.get("project_description", "")
 
     raw_epics = execute_json_agent(
@@ -216,6 +241,16 @@ def _normalize_user_stories(raw_stories: Any, epic_names: List[str]) -> List[Dic
             dependencies = []
         dependencies = [str(dep).strip() for dep in dependencies if str(dep).strip()]
 
+        acceptance_criteria = _normalize_bullets(
+            item.get("acceptanceCriteria") or item.get("acceptance_criteria")
+        )
+        if not acceptance_criteria:
+            acceptance_criteria = ["Not provided."]
+
+        out_of_scope = _normalize_bullets(item.get("outOfScope") or item.get("out_of_scope"))
+        if not out_of_scope:
+            out_of_scope = ["N/A"]
+
         effort_hours = item.get("effortHours")
         try:
             effort_hours = float(effort_hours) if effort_hours is not None else 0
@@ -232,6 +267,8 @@ def _normalize_user_stories(raw_stories: Any, epic_names: List[str]) -> List[Dic
                 "epic": epic_name,
                 "user_story": user_story,
                 "description": description,
+                "acceptanceCriteria": acceptance_criteria,
+                "outOfScope": out_of_scope,
                 "user_story_id": story_id,
                 "order": order,
                 "dependencies": dependencies,
@@ -245,7 +282,7 @@ def _normalize_user_stories(raw_stories: Any, epic_names: List[str]) -> List[Dic
 def _user_stories_node(state: DocumentExtractionState) -> Dict[str, Any]:
     user_data = state.get("user_data")
     prepared_text = state.get("prepared_text", "")
-    language = state.get("language", "English")
+    language = normalize_language(state.get("language"), default=get_default_llm_language())
     epics = state.get("epics") or []
     epic_names = [str(epic.get("name") or "").strip() for epic in epics if epic.get("name")]
 
@@ -303,13 +340,14 @@ def run_document_extraction_graph(
     user_data: Optional[UserData],
     project_name: str,
     document_text: str,
-    language: str = "English",
+    language: Optional[str] = None,
 ) -> DocumentExtractionState:
+    effective_language = normalize_language(language, default=get_default_llm_language())
     initial_state: DocumentExtractionState = {
         "user_data": user_data,
         "project_name": project_name or "",
         "document_text": document_text or "",
-        "language": language or "English",
+        "language": effective_language,
     }
 
     if StateGraph is None or START is None or END is None:

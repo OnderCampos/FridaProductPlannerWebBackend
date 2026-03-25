@@ -2,15 +2,21 @@ from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File, F
 from fastapi.responses import JSONResponse
 from typing import Optional
 import logging
+import re
+import secrets
+import string
 
 from src.schemas.resources_request import (
     GetProjectsRequest,
     GetProjectRequest,
     CreateProjectRequest,
+    CreateProjectFromDescriptionRequest,
     CreateProjectFromFigmaRequest,
     UpdateProjectRequest,
     DeleteProjectRequest,
     ProjectClarificationRequest,
+    StartProjectClarificationRequest,
+    GenerateProjectSpecFromFigmaRequest,
 )
 from src.schemas.response import ResponseModel
 from src.schemas.resources_response import (
@@ -31,15 +37,21 @@ from src.utils.planning.projects import (
     get_project_for_user,
 )
 
-from src.utils.ai.project_creation_qa.clarification import submit_answers
+from src.utils.ai.project_creation_qa.clarification import start_clarification, submit_answers
 
-from src.services.workflows.project_creation.common import ProjectRecordCreationError
+from src.services.workflows.project_creation.common import (
+    create_project_record,
+    ProjectKeyConflictError,
+    ProjectRecordCreationError,
+)
 from src.services.workflows.project_creation.orchestrator import (
     ProjectCreationOrchestrator,
     ProjectOrchestrationError,
 )
 from src.services.workflows.project_creation.project_creation_by_document.initialization import (
     DocumentTextError,
+    extract_text_from_bytes,
+    start_file_extraction,
 )
 from src.services.workflows.project_creation.finalization import (
     EpicGenerationFailedError,
@@ -47,6 +59,7 @@ from src.services.workflows.project_creation.finalization import (
     ProjectNotFoundError,
     ProjectNotReadyError,
 )
+from src.utils.ai.project_creation_source_spec import generate_spec_from_source
 
 
 from src.utils.authz.permissions import get_project_access, get_global_user_role
@@ -73,6 +86,37 @@ from src.utils.planning.invitations import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _derive_project_name(description: str) -> str:
+    cleaned = " ".join((description or "").strip().split())
+    if not cleaned:
+        return "New Project"
+
+    first_sentence = re.split(r"[.!?]", cleaned, maxsplit=1)[0].strip()
+    name = first_sentence or cleaned
+    if len(name) > 60:
+        name = f"{name[:57].rstrip()}..."
+    return name
+
+
+def _sanitize_project_key(value: str) -> str:
+    return "".join(ch for ch in (value or "").upper() if ch.isalnum())
+
+
+def _derive_project_key_base(name: str, description: str) -> str:
+    candidates = re.findall(r"[A-Za-z0-9]+", (name or ""))
+    if not candidates:
+        candidates = re.findall(r"[A-Za-z0-9]+", (description or ""))
+
+    acronym = "".join(word[0].upper() for word in candidates if word)
+    acronym = (acronym + "PRJ")[:3]
+    return _sanitize_project_key(acronym)
+
+
+def _random_project_key_suffix(length: int = 3) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(max(1, length)))
 
 
 def _normalize_invitation_payload(invitation: dict) -> dict:
@@ -145,27 +189,70 @@ async def get_projects_route(
     response_description="Create a new project.",
 )
 async def create_project_route(
-    req: CreateProjectRequest,
+    req: CreateProjectFromDescriptionRequest,
     user_data: UserData = Depends(get_current_user),
 ) -> ProjectResponse:
     """
-    Creates a new project with name, description, and user-provided project key.
+    Creates a new project from a description.
+
+    The client can optionally provide `name` and/or `project_key`; if omitted, the backend
+    will generate reasonable defaults.
     """
     role_info = get_global_user_role(user_data)
     if role_info.get("role") == "member":
         raise HTTPException(status_code=403, detail="Forbidden: Team members cannot create projects")
 
     try:
-        data = await ProjectCreationOrchestrator("qa").initialize_project(
-            user_data=user_data,
-            name=req.name,
-            description=req.description,
-            project_key=req.project_key,
-        )
+        description = (req.description or "").strip()
+        if not description:
+            raise HTTPException(status_code=400, detail="description is required")
+
+        name = (req.name or "").strip() or _derive_project_name(description)
+        requested_key = _sanitize_project_key(req.project_key or "")
+
+        if requested_key:
+            project_record = create_project_record(
+                user_data=user_data,
+                name=name,
+                description=description,
+                project_key=requested_key,
+                creation_status="created",
+                creation_source="manual",
+            )
+        else:
+            base_key = _derive_project_key_base(name, description)
+            project_record = None
+            last_exc: Optional[Exception] = None
+            candidates = [base_key]
+            candidates.extend(f"{base_key[:2]}{_random_project_key_suffix(1)}" for _ in range(25))
+            candidates.extend(_random_project_key_suffix(3) for _ in range(25))
+
+            for candidate in candidates:
+                try:
+                    project_record = create_project_record(
+                        user_data=user_data,
+                        name=name,
+                        description=description,
+                        project_key=candidate,
+                        creation_status="created",
+                        creation_source="manual",
+                    )
+                    last_exc = None
+                    break
+                except ProjectKeyConflictError as exc:
+                    last_exc = exc
+
+            if project_record is None:
+                raise ProjectRecordCreationError(str(last_exc or "Failed to generate unique project key"))
+
+        data = {
+            "project": project_record.project.dict(),
+            "clarification": None,
+        }
         response = ResponseModel(
             success=True,
-            message="Project created. Clarification started.",
-            data=data.dict(),
+            message="Project created.",
+            data=data,
         )
         return JSONResponse(status_code=201, content=response.dict())
     except (ProjectOrchestrationError, ProjectRecordCreationError) as exc:
@@ -421,7 +508,63 @@ async def create_project_from_qa_route(
     except Exception:
         logger.exception("Failed to create project")
         raise HTTPException(status_code=500, detail="Internal server error")
-    
+     
+
+@router.post(
+    "/{project_id}/clarification/start",
+    response_description="Start clarification for an existing project.",
+)
+async def start_project_clarification_route(
+    project_id: str = Path(..., description="The project ID"),
+    req: StartProjectClarificationRequest = None,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    """
+    Starts the Q&A clarification flow for an existing project.
+
+    This is intended for batch epic generation from the Epics page (Q&A mode).
+    """
+    try:
+        access = get_project_access(project_id, user_data.user_id, user_data.email)
+        if not access.success:
+            status_code = 404 if "not found" in access.message.lower() else 403
+            return JSONResponse(status_code=status_code, content=access.dict())
+        if not access.data.get("is_lead"):
+            raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update projects")
+
+        project = access.data.get("project") or {}
+        status = str(project.get("creation_status") or "").strip().lower()
+        if status == "finalized":
+            return JSONResponse(
+                status_code=409,
+                content=ResponseModel(success=False, message="Project is already finalized", data=None).dict(),
+            )
+
+        description = ""
+        if req and req.description is not None:
+            description = str(req.description or "")
+        if not description.strip():
+            description = str(project.get("description") or "")
+
+        description = description.strip()
+        if not description:
+            raise HTTPException(status_code=400, detail="description is required")
+
+        response = await start_clarification(
+            user_data=user_data,
+            project_id=project_id,
+            description=description,
+        )
+        return JSONResponse(
+            status_code=200 if response.success else 400,
+            content=response.dict(),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to start project clarification")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 
 @router.post(
     "/{project_id}/clarification/answer",
@@ -457,7 +600,7 @@ async def submit_project_clarification_route(
     except Exception:
         logger.exception("Failed to submit project clarification")
         raise HTTPException(status_code=500, detail="Internal server error")
-    
+     
 
 
 # =========================================
@@ -530,7 +673,90 @@ async def create_project_from_file_route(
     except Exception:
         logger.exception("Failed to create project from file")
         raise HTTPException(status_code=500, detail="Internal server error")
-    
+     
+
+@router.post(
+    "/{project_id}/spec/source/file",
+    response_description="Generate a specification from a document for an existing project.",
+)
+async def generate_project_spec_from_file_route(
+    project_id: str = Path(..., description="The project ID"),
+    description: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    """
+    Generates a spec from an uploaded PDF/DOCX file for an existing project.
+
+    Intended for batch epic creation from the Epics page (Document mode).
+    """
+    try:
+        access = get_project_access(project_id, user_data.user_id, user_data.email)
+        if not access.success:
+            status_code = 404 if "not found" in access.message.lower() else 403
+            return JSONResponse(status_code=status_code, content=access.dict())
+        if not access.data.get("is_lead"):
+            raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update projects")
+
+        project = access.data.get("project") or {}
+        status = str(project.get("creation_status") or "").strip().lower()
+        if status == "finalized":
+            return JSONResponse(
+                status_code=409,
+                content=ResponseModel(success=False, message="Project is already finalized", data=None).dict(),
+            )
+
+        if not file:
+            raise HTTPException(status_code=400, detail="file is required")
+
+        try:
+            file_bytes = await file.read()
+        except Exception:
+            logger.exception("Failed to read uploaded file")
+            raise HTTPException(status_code=400, detail="Failed to read uploaded file")
+
+        document_text = extract_text_from_bytes(
+            file_bytes,
+            filename=file.filename,
+            content_type=file.content_type,
+        )
+        if not document_text:
+            raise DocumentTextError("Uploaded file contains no readable text")
+
+        source_payload = {
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "size_bytes": len(file_bytes),
+            "text_excerpt": document_text[:2000],
+        }
+
+        project_name = str(project.get("name") or "").strip() or "Project"
+        effective_description = (description or project.get("description") or "").strip()
+
+        clarification = await start_file_extraction(
+            user_data=user_data,
+            project_id=project_id,
+            project_name=project_name,
+            description=effective_description,
+            document_text=document_text,
+            source_payload=source_payload,
+        )
+
+        response = ResponseModel(
+            success=True,
+            message="Specification generated",
+            data=clarification.dict(),
+        )
+        return JSONResponse(status_code=200, content=response.dict())
+    except DocumentTextError as exc:
+        response = ResponseModel(success=False, message=str(exc), data=None)
+        return JSONResponse(status_code=400, content=response.dict())
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to generate project spec from file")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 
 @router.post(
     "/{project_id}/spec/accept",
@@ -603,6 +829,63 @@ async def accept_project_spec_route(
 # ======================================
 # Project Generation by Figma endpoints
 # ======================================
+
+@router.post(
+    "/{project_id}/spec/source/figma",
+    response_description="Generate a specification from a Figma link for an existing project.",
+)
+async def generate_project_spec_from_figma_route(
+    project_id: str = Path(..., description="The project ID"),
+    req: GenerateProjectSpecFromFigmaRequest = None,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    """
+    Generates a spec from a Figma URL/notes for an existing project.
+
+    Intended for batch epic creation from the Epics page (Figma mode).
+    """
+    if not req or not (req.figma_url or "").strip():
+        raise HTTPException(status_code=400, detail="figma_url is required")
+
+    try:
+        access = get_project_access(project_id, user_data.user_id, user_data.email)
+        if not access.success:
+            status_code = 404 if "not found" in access.message.lower() else 403
+            return JSONResponse(status_code=status_code, content=access.dict())
+        if not access.data.get("is_lead"):
+            raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update projects")
+
+        project = access.data.get("project") or {}
+        status = str(project.get("creation_status") or "").strip().lower()
+        if status == "finalized":
+            return JSONResponse(
+                status_code=409,
+                content=ResponseModel(success=False, message="Project is already finalized", data=None).dict(),
+            )
+
+        figma_payload = {
+            "url": (req.figma_url or "").strip(),
+            "notes": req.figma_notes,
+        }
+
+        effective_description = (req.description or project.get("description") or "").strip()
+        response = await generate_spec_from_source(
+            user_data=user_data,
+            project_id=project_id,
+            description=effective_description,
+            source_type="figma",
+            source_payload=figma_payload,
+        )
+        return JSONResponse(
+            status_code=200 if response.success else 400,
+            content=response.dict(),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to generate project spec from figma")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 
 @router.post(
     "/creation/figma",

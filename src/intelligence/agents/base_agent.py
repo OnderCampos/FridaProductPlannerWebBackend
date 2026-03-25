@@ -10,6 +10,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import AzureChatOpenAI
 
 from src.services.setup.variables_setup import LLMOPS_API_KEY
+from src.services.setup.language_setup import build_llm_language_system_prompt, get_default_llm_language, normalize_language
 from src.utils.ai.llm_graph import invoke_model_with_graph
 from src.utils.ai.llmops_utils import log_to_llmops
 from src.utils.core.logging import add_request_log
@@ -328,6 +329,19 @@ class Agent:
         messages: List[Any] = []
         if self.__system_message:
             messages.append(self.__system_message)
+
+        language_override = None
+        if isinstance(prompt_kwargs.get("language"), str) and prompt_kwargs["language"].strip():
+            language_override = prompt_kwargs["language"]
+        elif isinstance(execution_context.get("language"), str) and execution_context["language"].strip():
+            language_override = execution_context["language"]
+        elif isinstance(execution_context.get("llm_language"), str) and execution_context["llm_language"].strip():
+            language_override = execution_context["llm_language"]
+
+        effective_language = normalize_language(language_override, default=get_default_llm_language())
+        language_system_prompt = build_llm_language_system_prompt(effective_language)
+        if language_system_prompt:
+            messages.append(SystemMessage(content=language_system_prompt))
 
         self.__validate_args(**prompt_kwargs)
         if not self.__task:

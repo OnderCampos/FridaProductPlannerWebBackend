@@ -20,6 +20,7 @@ from src.intelligence.agents.json_executor import execute_json_agent
 from src.schemas.user_data import UserData
 from src.services.azure_services import AzureChatService
 from src.services.setup.variables_setup import LLMOPS_API_KEY
+from src.services.setup.language_setup import get_default_llm_language, normalize_language
 from src.utils.ai.knowledge_base_utils import get_knowledge_base_id_for_user
 from src.utils.core.validation_utils import has_expected_epic_structure
 
@@ -101,7 +102,7 @@ def _normalize_scope_analysis(payload: Any) -> Dict[str, Any]:
 def _prepare_input_node(state: EpicGraphState) -> Dict[str, Any]:
     project_name = state.get("project_name", "")
     project_description = state.get("project_description", "")
-    language = state.get("language", "English")
+    language = normalize_language(state.get("language"), default=get_default_llm_language())
     user_data = state.get("user_data")
 
     combined_text = f"Project Name: {project_name}\n\nProject Description: {project_description}"
@@ -129,7 +130,7 @@ def _prepare_input_node(state: EpicGraphState) -> Dict[str, Any]:
 def _scope_analysis_node(state: EpicGraphState) -> Dict[str, Any]:
     user_data = state.get("user_data")
     text_for_analysis = state.get("text_for_analysis", "")
-    language = state.get("language", "English")
+    language = normalize_language(state.get("language"), default=get_default_llm_language())
 
     try:
         raw_analysis = execute_json_agent(
@@ -198,7 +199,7 @@ def _brainstorm_roles_node(state: EpicGraphState) -> Dict[str, Any]:
     user_data = state.get("user_data")
     project_name = state.get("project_name", "")
     project_description = state.get("project_description", "")
-    language = state.get("language", "English")
+    language = normalize_language(state.get("language"), default=get_default_llm_language())
     kb_context = state.get("kb_context", "")
     scope_analysis = state.get("scope_analysis") or {}
 
@@ -254,7 +255,7 @@ def _brainstorm_roles_node(state: EpicGraphState) -> Dict[str, Any]:
 
 def _synthesis_node(state: EpicGraphState) -> Dict[str, Any]:
     user_data = state.get("user_data")
-    language = state.get("language", "English")
+    language = normalize_language(state.get("language"), default=get_default_llm_language())
     project_name = state.get("project_name", "")
     project_description = state.get("project_description", "")
     scope_analysis = state.get("scope_analysis") or {}
@@ -317,14 +318,15 @@ def run_epic_generation_graph(
     user_data: Optional[UserData],
     project_name: str,
     project_description: str,
-    language: str = "English",
+    language: Optional[str] = None,
     use_knowledge_base: bool = False,
 ) -> EpicGraphState:
+    effective_language = normalize_language(language, default=get_default_llm_language())
     initial_state: EpicGraphState = {
         "user_data": user_data,
         "project_name": project_name or "",
         "project_description": project_description or "",
-        "language": language or "English",
+        "language": effective_language,
         "use_knowledge_base": bool(use_knowledge_base),
         "kb_context": "",
         "used_knowledge_base": False,

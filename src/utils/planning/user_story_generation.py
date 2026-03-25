@@ -1,3 +1,4 @@
+import json
 from typing import Dict, List, Optional, Any
 import logging
 
@@ -8,6 +9,7 @@ from src.intelligence.agents.user_story_generation.analysis_agent import (
 )
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
+from src.services.azure_services import AzureChatService
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
 from src.utils.planning.user_stories import create_multiple_user_stories, _current_timestamp_iso
@@ -30,6 +32,9 @@ def transform_user_story_to_structured_format(story_data: Dict[str, Any], templa
         "user_story",
         "description",
         "user_story_id",
+        "acceptanceCriteria",
+        "outOfScope",
+        "document",
         "id",
         "epic_id",
         "user_id",
@@ -59,6 +64,9 @@ def transform_user_story_to_structured_format(story_data: Dict[str, Any], templa
         "order": story_data.get("order", 0),
         "dependencies": story_data.get("dependencies", []),
         "effortHours": story_data.get("effortHours", story_data.get("effort_hours", 0)),
+        "acceptanceCriteria": story_data.get("acceptanceCriteria", []),
+        "outOfScope": story_data.get("outOfScope", []),
+        "document": story_data.get("document", {}),
         "fields": []
     }
     
@@ -85,6 +93,119 @@ def transform_user_story_to_structured_format(story_data: Dict[str, Any], templa
             structured_story["fields"].append(field_obj)
     
     return structured_story
+
+
+def _normalize_string_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+
+    items: List[str] = []
+    for raw_line in text.splitlines():
+        line = str(raw_line).strip()
+        if not line:
+            continue
+        for prefix in ("- ", "* ", "• "):
+            if line.startswith(prefix):
+                line = line[len(prefix) :].strip()
+                break
+        if line and line[0].isdigit():
+            if len(line) >= 3 and line[1] in {".", ")"} and line[2] == " ":
+                line = line[3:].strip()
+        if line:
+            items.append(line)
+    return items
+
+
+async def _enrich_acceptance_and_scope(
+    *,
+    user_data: UserData,
+    epic: Dict[str, Any],
+    project: Dict[str, Any],
+    stories: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not stories:
+        return stories
+
+    payload = []
+    for story in stories:
+        if not isinstance(story, dict):
+            continue
+        payload.append(
+            {
+                "user_story_id": str(story.get("user_story_id") or "").strip(),
+                "user_story": str(story.get("user_story") or "").strip(),
+                "description": str(story.get("description") or "").strip(),
+            }
+        )
+
+    prompt = f"""
+You are a senior QA/product analyst.
+For EACH user story below, generate:
+1) acceptanceCriteria: 3-6 short, testable bullet points
+2) outOfScope: 1-4 bullet points (use ["N/A"] if truly none)
+
+Project context:
+{str(project.get("description") or "").strip()}
+
+Epic context:
+{json.dumps(epic, ensure_ascii=False)}
+
+User stories (in order):
+{json.dumps(payload, ensure_ascii=False)}
+
+Return ONLY valid JSON with EXACTLY {len(payload)} items in the same order:
+{{
+  "items": [
+    {{
+      "acceptanceCriteria": ["..."],
+      "outOfScope": ["..."]
+    }}
+  ]
+  }}
+""".strip()
+
+    parsed: Any = None
+    try:
+        azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
+        raw = await azure.simple_completion(prompt)
+        parsed = parse_json_response(raw)
+    except Exception as exc:
+        logging.warning("Failed to enrich acceptanceCriteria/outOfScope: %s", exc)
+        parsed = {}
+
+    items = parsed.get("items") if isinstance(parsed, dict) else None
+    if not isinstance(items, list) or len(items) != len(payload):
+        enriched: List[Dict[str, Any]] = []
+        for story in stories:
+            next_story = dict(story) if isinstance(story, dict) else story
+            if isinstance(next_story, dict):
+                next_story["acceptanceCriteria"] = next_story.get("acceptanceCriteria") or ["Not provided."]
+                next_story["outOfScope"] = next_story.get("outOfScope") or ["N/A"]
+            enriched.append(next_story)
+        return enriched
+
+    enriched: List[Dict[str, Any]] = []
+    for story, extra in zip(stories, items):
+        next_story = dict(story) if isinstance(story, dict) else story
+        if not isinstance(next_story, dict) or not isinstance(extra, dict):
+            enriched.append(next_story)
+            continue
+
+        acceptance = _normalize_string_list(extra.get("acceptanceCriteria"))
+        if len(acceptance) < 1:
+            acceptance = ["Not provided."]
+        out_scope = _normalize_string_list(extra.get("outOfScope"))
+        if len(out_scope) < 1:
+            out_scope = ["N/A"]
+
+        next_story["acceptanceCriteria"] = acceptance
+        next_story["outOfScope"] = out_scope
+        enriched.append(next_story)
+
+    return enriched
 
 
 async def generate_analysis(
@@ -206,6 +327,16 @@ async def generate_user_stories(
         template_data = graph_state.get("template_data") or {}
 
         if response:
+            epic = graph_state.get("epic") or {}
+            project = graph_state.get("project") or {}
+            if isinstance(epic, dict) and isinstance(project, dict):
+                response = await _enrich_acceptance_and_scope(
+                    user_data=user_data,
+                    epic=epic,
+                    project=project,
+                    stories=response,
+                )
+
             print("[DEBUG] User stories generated successfully via graph")
             print(f"[DEBUG] Generated user stories response: {response}")
 

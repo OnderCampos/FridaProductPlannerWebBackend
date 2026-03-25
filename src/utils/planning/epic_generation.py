@@ -1,8 +1,10 @@
 import logging
+from typing import Optional
 
 from src.intelligence.graphs.epic_graph import run_epic_generation_graph
 from src.schemas.function_result import FunctionResult
 from src.schemas.user_data import UserData
+from src.services.setup.language_setup import get_default_llm_language, normalize_language
 from src.utils.core.validation_utils import has_expected_epic_structure
 
 
@@ -10,7 +12,7 @@ async def generate_epics(
     user_data: UserData = None,
     project_name: str = "", 
     project_description: str = "",
-    language: str = "English",
+    language: Optional[str] = None,
     use_knowledge_base: bool = False
 ) -> FunctionResult:
     """
@@ -27,13 +29,14 @@ async def generate_epics(
         FunctionResult: A standardized response containing generated epics or error information
     """
     print(f"[DEBUG] Starting epic generation for project: {project_name}")
+    effective_language = normalize_language(language, default=get_default_llm_language())
     
     try:
         graph_state = run_epic_generation_graph(
             user_data=user_data,
             project_name=project_name,
             project_description=project_description,
-            language=language,
+            language=effective_language,
             use_knowledge_base=use_knowledge_base,
         )
 
@@ -45,7 +48,7 @@ async def generate_epics(
                 error=str(graph_error),
                 metadata={
                     "project_name": project_name,
-                    "language": language,
+                    "language": effective_language,
                 },
             )
 
@@ -64,7 +67,7 @@ async def generate_epics(
                 metadata={
                     "project_name": project_name,
                     "used_knowledge_base": used_knowledge_base,
-                    "language": language,
+                    "language": effective_language,
                 },
             )
 
@@ -74,7 +77,7 @@ async def generate_epics(
             error="No data extracted from LLM response",
             metadata={
                 "project_name": project_name,
-                "language": language
+                "language": effective_language
             }
         )
         
@@ -85,7 +88,7 @@ async def generate_epics(
             error=str(e),
             metadata={
                 "project_name": project_name,
-                "language": language
+                "language": effective_language
             }
         )
 

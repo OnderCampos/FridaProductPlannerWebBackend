@@ -1,14 +1,26 @@
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Request
-from fastapi.responses import JSONResponse
-from typing import Optional
+import os
+from io import BytesIO
+from urllib.parse import quote
+
+from fastapi import APIRouter, Depends, File, HTTPException, Path, Request, UploadFile
+from fastapi.responses import JSONResponse, StreamingResponse
+from typing import List, Optional
+import secrets
 
 from src.schemas.resources_request import (
     GenerateAnalysisRequest,
     GenerateUserStoriesRequest,
     GetUserStoriesByEpicRequest,
     UpdateUserStoryAssigneeRequest,
-    GenerateUserStoryDependenciesRequest
+    GenerateUserStoryDependenciesRequest,
+    CreateUserStoryManualRequest,
+    StartUserStoryQaRequest,
+    UserStoryQaAnswersRequest,
+    AcceptUserStoryQaRequest,
+    ExpandUserStoriesRequest,
+    StartUserStoryDocumentRequest,
+    UserStoryDocumentAnswersRequest,
 )
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
@@ -18,8 +30,16 @@ from src.utils.planning.user_story_generation import (
     generate_user_stories
 )
 from src.utils.planning.user_story_dependencies import generate_user_story_dependencies
-from src.utils.planning.user_stories import get_user_story_by_id, update_user_story, update_user_story_fields
+from src.utils.planning.user_stories import (
+    create_multiple_user_stories,
+    create_user_story,
+    get_user_stories_by_epic,
+    get_user_story_by_id,
+    update_user_story,
+    update_user_story_fields,
+)
 from src.utils.planning.epics import get_epic_by_id
+from src.utils.planning.projects import get_project_by_id
 from src.utils.authz.permissions import get_project_access
 from src.utils.planning.members import get_member_by_id
 from src.utils.planning.subtask_generation import (
@@ -31,7 +51,31 @@ from src.utils.planning.subtask_generation import (
     delete_subtasks_by_user_story
 )
 
+from src.utils.ai.user_story_creation_qa import (
+    delete_user_story_draft,
+    get_user_story_draft,
+    start_user_story_qa,
+    submit_user_story_qa_answers,
+)
+from src.utils.ai.user_story_expansion import expand_user_stories
+from src.utils.documents.user_story_document import (
+    DOCX_MEDIA_TYPE,
+    build_user_story_document_download_response,
+    build_user_story_document_download_response_with_wireframes,
+    build_user_story_document_format_test_bytes,
+    start_user_story_document_draft,
+    submit_user_story_document_answers,
+    upload_user_story_document_wireframe_images,
+)
+
 router = APIRouter()
+
+
+def _ensure_user_story_id(value: Optional[str]) -> str:
+    raw = str(value or "").strip()
+    if raw:
+        return raw
+    return f"US-{secrets.token_hex(3).upper()}"
 
 
 def _require_project_lead(project_id: str, user_data):
@@ -234,6 +278,349 @@ async def generate_user_story_dependencies_route(
         raise
     except Exception:
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post(
+    "/manual/",
+    response_description="Create a user story manually for an epic.",
+)
+async def create_user_story_manual_route(
+    req: CreateUserStoryManualRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not (req.epic_id or "").strip():
+        raise HTTPException(status_code=400, detail="epic_id is required")
+    if not (req.user_story or "").strip():
+        raise HTTPException(status_code=400, detail="user_story is required")
+    if not (req.description or "").strip():
+        raise HTTPException(status_code=400, detail="description is required")
+
+    epic_response = get_epic_by_id(req.epic_id)
+    if not epic_response.success:
+        raise HTTPException(status_code=404, detail="Epic not found")
+    project_id = epic_response.data.get("project_id")
+    _require_project_lead(project_id, user_data)
+
+    payload = req.model_dump(exclude={"epic_id"})
+    payload["epic"] = epic_response.data.get("name") or epic_response.data.get("epic") or ""
+    payload["user_story_id"] = _ensure_user_story_id(payload.get("user_story_id"))
+    payload["dependencies"] = payload.get("dependencies") or []
+
+    response = create_user_story(req.epic_id, user_data.get_user_id(), payload)
+    return JSONResponse(
+        status_code=201 if response.success else 400,
+        content=response.dict(),
+    )
+
+
+@router.post(
+    "/qa/start/",
+    response_description="Start Q&A flow to create a single user story.",
+)
+async def start_user_story_qa_route(
+    req: StartUserStoryQaRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not (req.epic_id or "").strip():
+        raise HTTPException(status_code=400, detail="epic_id is required")
+
+    epic_response = get_epic_by_id(req.epic_id)
+    if not epic_response.success:
+        raise HTTPException(status_code=404, detail="Epic not found")
+    project_id = epic_response.data.get("project_id")
+    _require_project_lead(project_id, user_data)
+
+    project_response = get_project_by_id(project_id, user_data.get_user_id(), allow_member=True, user_email=user_data.get_email())
+    project_description = ""
+    if project_response and project_response.success and project_response.data:
+        project_description = str(project_response.data.get("description") or "")
+
+    existing = get_user_stories_by_epic(req.epic_id, user_data.get_user_id(), allow_member=True)
+    existing_stories = existing.data if existing and existing.success and isinstance(existing.data, list) else []
+
+    response = await start_user_story_qa(
+        user_data=user_data,
+        epic_id=req.epic_id,
+        project_description=project_description,
+        epic_name=str(epic_response.data.get("name") or ""),
+        epic_description=str(epic_response.data.get("description") or ""),
+        goal=str(req.goal or ""),
+        existing_stories=existing_stories,
+    )
+    return JSONResponse(status_code=200 if response.success else 400, content=response.dict())
+
+
+@router.post(
+    "/qa/answer/",
+    response_description="Submit answers for a user story Q&A draft.",
+)
+async def submit_user_story_qa_answers_route(
+    req: UserStoryQaAnswersRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not (req.draft_id or "").strip():
+        raise HTTPException(status_code=400, detail="draft_id is required")
+
+    draft_response = get_user_story_draft(req.draft_id)
+    if not draft_response.success:
+        return JSONResponse(status_code=404, content=draft_response.dict())
+
+    epic_id = str((draft_response.data or {}).get("epic_id") or "").strip()
+    if not epic_id:
+        raise HTTPException(status_code=400, detail="Draft is missing epic_id")
+
+    epic_response = get_epic_by_id(epic_id)
+    if not epic_response.success:
+        raise HTTPException(status_code=404, detail="Epic not found")
+    project_id = epic_response.data.get("project_id")
+    _require_project_lead(project_id, user_data)
+
+    existing = get_user_stories_by_epic(epic_id, user_data.get_user_id(), allow_member=True)
+    existing_stories = existing.data if existing and existing.success and isinstance(existing.data, list) else []
+
+    answers_payload = [ans.model_dump() for ans in (req.answers or [])]
+    response = await submit_user_story_qa_answers(
+        user_data=user_data,
+        draft_id=req.draft_id,
+        answers=answers_payload,
+        existing_stories=existing_stories,
+    )
+    return JSONResponse(status_code=200 if response.success else 400, content=response.dict())
+
+
+@router.post(
+    "/qa/accept/",
+    response_description="Accept a user story draft and create the story.",
+)
+async def accept_user_story_qa_route(
+    req: AcceptUserStoryQaRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not (req.draft_id or "").strip():
+        raise HTTPException(status_code=400, detail="draft_id is required")
+
+    draft_response = get_user_story_draft(req.draft_id)
+    if not draft_response.success:
+        return JSONResponse(status_code=404, content=draft_response.dict())
+
+    draft_data = draft_response.data or {}
+    status = str(draft_data.get("status") or "")
+    if status != "story_ready":
+        return JSONResponse(
+            status_code=409,
+            content=ResponseModel(success=False, message="Draft is not ready to accept", data=None).dict(),
+        )
+
+    epic_id = str(draft_data.get("epic_id") or "").strip()
+    if not epic_id:
+        raise HTTPException(status_code=400, detail="Draft is missing epic_id")
+
+    epic_response = get_epic_by_id(epic_id)
+    if not epic_response.success:
+        raise HTTPException(status_code=404, detail="Epic not found")
+    project_id = epic_response.data.get("project_id")
+    _require_project_lead(project_id, user_data)
+
+    story_draft = draft_data.get("story_draft") or {}
+    if not isinstance(story_draft, dict):
+        story_draft = {}
+
+    payload = {
+        "epic": str(draft_data.get("epic_name") or epic_response.data.get("name") or ""),
+        "user_story": str(story_draft.get("user_story") or "").strip(),
+        "description": str(story_draft.get("description") or "").strip(),
+        "user_story_id": _ensure_user_story_id(story_draft.get("user_story_id")),
+        "order": story_draft.get("order", 0),
+        "dependencies": story_draft.get("dependencies") or [],
+        "effortHours": story_draft.get("effortHours", 0),
+        "story_points": story_draft.get("story_points", 0),
+    }
+    if isinstance(story_draft.get("acceptanceCriteria"), list):
+        payload["acceptanceCriteria"] = story_draft.get("acceptanceCriteria")
+    if isinstance(story_draft.get("outOfScope"), list):
+        payload["outOfScope"] = story_draft.get("outOfScope")
+    if isinstance(story_draft.get("document"), dict):
+        payload["document"] = story_draft.get("document")
+    if not payload["user_story"] or not payload["description"]:
+        return JSONResponse(
+            status_code=400,
+            content=ResponseModel(success=False, message="Draft is missing required fields", data=None).dict(),
+        )
+
+    response = create_user_story(epic_id, user_data.get_user_id(), payload)
+    if response.success:
+        delete_user_story_draft(req.draft_id)
+        return JSONResponse(status_code=201, content=response.dict())
+    return JSONResponse(status_code=400, content=response.dict())
+
+
+@router.post(
+    "/document/start/",
+    response_description="Start document generation for a user story (may ask clarification questions).",
+)
+async def start_user_story_document_route(
+    req: StartUserStoryDocumentRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not (req.story_id or "").strip():
+        raise HTTPException(status_code=400, detail="story_id is required")
+
+    response = await start_user_story_document_draft(user_data=user_data, story_id=req.story_id)
+    return JSONResponse(status_code=200 if response.success else 400, content=response.dict())
+
+
+@router.post(
+    "/document/answer/",
+    response_description="Submit document clarification answers for a user story document draft.",
+)
+async def submit_user_story_document_answers_route(
+    req: UserStoryDocumentAnswersRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not (req.draft_id or "").strip():
+        raise HTTPException(status_code=400, detail="draft_id is required")
+
+    answers_payload = [ans.model_dump() for ans in (req.answers or [])]
+    response = await submit_user_story_document_answers(
+        user_data=user_data,
+        draft_id=req.draft_id,
+        answers=answers_payload,
+    )
+    return JSONResponse(status_code=200 if response.success else 400, content=response.dict())
+
+
+@router.post(
+    "/document/upload/{draft_id}/wireframe/",
+    response_description="Upload wireframe/mockup images for a user story document draft.",
+)
+async def upload_user_story_document_wireframe_route(
+    draft_id: str = Path(..., description="The user story document draft ID"),
+    files: List[UploadFile] = File(..., description="One or more image files (PNG/JPG)."),
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not (draft_id or "").strip():
+        raise HTTPException(status_code=400, detail="draft_id is required")
+    response = await upload_user_story_document_wireframe_images(user_data=user_data, draft_id=draft_id, files=files)
+    return JSONResponse(status_code=200 if response.success else 400, content=response.dict())
+
+
+@router.get(
+    "/document/download/{draft_id}/",
+    response_description="Download a generated Word document (DOCX) for a user story draft.",
+)
+async def download_user_story_document_route(
+    draft_id: str = Path(..., description="The user story document draft ID"),
+    user_data: UserData = Depends(get_current_user),
+):
+    if not (draft_id or "").strip():
+        raise HTTPException(status_code=400, detail="draft_id is required")
+    return await build_user_story_document_download_response(user_data=user_data, draft_id=draft_id)
+
+
+@router.post(
+    "/document/download/{draft_id}/wireframe/",
+    response_description="Download a generated Word document (DOCX) embedding wireframe images from this request (no storage).",
+)
+async def download_user_story_document_with_wireframes_route(
+    draft_id: str = Path(..., description="The user story document draft ID"),
+    files: List[UploadFile] = File(..., description="One or more image files (PNG/JPG)."),
+    user_data: UserData = Depends(get_current_user),
+):
+    if not (draft_id or "").strip():
+        raise HTTPException(status_code=400, detail="draft_id is required")
+    return await build_user_story_document_download_response_with_wireframes(
+        user_data=user_data,
+        draft_id=draft_id,
+        files=files,
+    )
+
+
+def _docx_format_test_enabled() -> bool:
+    value = str(os.getenv("ENABLE_DOCX_FORMAT_TEST") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+@router.get(
+    "/document/test/",
+    response_description="Download a fast format-test DOCX (feature-flagged).",
+)
+async def download_user_story_document_format_test_route(
+    user_data: UserData = Depends(get_current_user),
+):
+    if not _docx_format_test_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    doc_bytes, filename = build_user_story_document_format_test_bytes()
+    encoded = quote(filename)
+    return StreamingResponse(
+        BytesIO(doc_bytes),
+        media_type=DOCX_MEDIA_TYPE,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded}"},
+    )
+
+
+@router.post(
+    "/expand/",
+    response_description="Expand user stories for an epic using AI (agentic).",
+)
+async def expand_user_stories_route(
+    req: ExpandUserStoriesRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not (req.epic_id or "").strip():
+        raise HTTPException(status_code=400, detail="epic_id is required")
+
+    epic_response = get_epic_by_id(req.epic_id)
+    if not epic_response.success:
+        raise HTTPException(status_code=404, detail="Epic not found")
+    project_id = epic_response.data.get("project_id")
+    _require_project_lead(project_id, user_data)
+
+    project_response = get_project_by_id(project_id, user_data.get_user_id(), allow_member=True, user_email=user_data.get_email())
+    project_description = ""
+    if project_response and project_response.success and project_response.data:
+        project_description = str(project_response.data.get("description") or "")
+
+    existing = get_user_stories_by_epic(req.epic_id, user_data.get_user_id(), allow_member=True)
+    existing_stories = existing.data if existing and existing.success and isinstance(existing.data, list) else []
+
+    expanded_response = await expand_user_stories(
+        user_data=user_data,
+        project_description=project_description,
+        epic_name=str(epic_response.data.get("name") or ""),
+        epic_description=str(epic_response.data.get("description") or ""),
+        existing_stories=existing_stories,
+        instruction=str(req.instruction or ""),
+        max_new_stories=int(req.max_new_stories or 5),
+    )
+    if not expanded_response.success:
+        return JSONResponse(status_code=400, content=expanded_response.dict())
+
+    expanded_payload = expanded_response.data if isinstance(expanded_response.data, dict) else {}
+    new_stories = expanded_payload.get("user_stories") if isinstance(expanded_payload, dict) else None
+    if not isinstance(new_stories, list) or not new_stories:
+        return JSONResponse(
+            status_code=200,
+            content=ResponseModel(success=True, message="No new user stories generated", data={"user_stories": [], "generated_count": 0}).dict(),
+        )
+
+    save_result = create_multiple_user_stories(
+        req.epic_id,
+        user_data.get_user_id(),
+        new_stories,
+        template_data=None,
+    )
+    if not save_result.success:
+        return JSONResponse(status_code=400, content=save_result.dict())
+
+    return JSONResponse(
+        status_code=200,
+        content=ResponseModel(
+            success=True,
+            message=save_result.message,
+            data={"user_stories": save_result.data, "generated_count": len(save_result.data or [])},
+        ).dict(),
+    )
 
 
 @router.get(

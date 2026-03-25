@@ -17,6 +17,8 @@ Return ONLY valid JSON in this exact structure:
       "epic": string,
       "user_story": string,
       "description": string,
+      "acceptanceCriteria": [string],
+      "outOfScope": [string],
       "user_story_id": string,
       "order": number,
       "dependencies": [string],
@@ -30,6 +32,8 @@ Rules:
 - "epic" must match one of the provided epic names exactly.
 - "user_story" must follow the format: "As a [role], I need [capability], so that [value]."
 - "description" should add concrete details about the story.
+- "acceptanceCriteria" must be 3-6 short, testable bullet points.
+- "outOfScope" must be 1-4 bullet points (use ["N/A"] if truly none).
 - "user_story_id" should be a short, stable identifier (snake_case).
 - "order" should be an integer sequence starting at 1 within each epic.
 - "dependencies" should list user_story_id values; use an empty array if none.

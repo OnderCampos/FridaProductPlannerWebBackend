@@ -181,5 +181,6 @@ Fields from the template:
 
 The value of all fields MUST be a string, even if the field description indicates otherwise.
 For list-formatted fields, provide the list as a string in markdown format.
-The response should be in English language, but respect the object keys.
+Write all natural-language text values in the target language configured by the system.
+Keep the object keys as-is, and keep `user_story_id` as a short reference in English.
 """

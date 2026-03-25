@@ -20,6 +20,7 @@ from src.services.setup.variables_setup import (
     LLMOPS_API_KEY,
     MODEL,
 )
+from src.services.setup.language_setup import build_llm_language_system_prompt, get_default_llm_language
 from src.utils.knowledge_bases import schemas, general
 from src.utils.knowledge_bases.embeddings import SofttekOpenAIEmbeddings
 from src.schemas.function_response import FunctionResponse
@@ -127,6 +128,7 @@ class AzureChatService:
         self.team_id = user_data.get_team_id()
         self.user_email = user_data.get_email()
         self.knowledge_base_id = knowledge_base_id
+        self.response_language = get_default_llm_language()
 
     def create_text_message(self, text: str):
         """
@@ -233,6 +235,15 @@ class AzureChatService:
         """
 
         global_start = perf_counter_ns()
+
+        language_prompt = build_llm_language_system_prompt(self.response_language)
+        if language_prompt:
+            language_message = SystemMessage(content=language_prompt)
+            insert_at = 0
+            while insert_at < len(messages_list) and isinstance(messages_list[insert_at], SystemMessage):
+                insert_at += 1
+            messages_list = list(messages_list)
+            messages_list.insert(insert_at, language_message)
 
         # Invoke the chat service
         logger = logging.getLogger(__name__)

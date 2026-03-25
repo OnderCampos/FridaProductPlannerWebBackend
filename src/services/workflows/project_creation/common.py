@@ -12,12 +12,23 @@ def current_timestamp_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+PROJECT_KEY_LENGTH = 3
+
+
+def normalize_project_key(value: str) -> str:
+    return "".join(ch for ch in (value or "").strip().upper() if ch.isalnum())
+
+
 class ProjectRecordCreationError(RuntimeError):
     """Base error for project record creation failures."""
 
 
 class ProjectKeyRequiredError(ProjectRecordCreationError):
     """Raised when `project_key` is missing/blank."""
+
+
+class ProjectKeyInvalidError(ProjectRecordCreationError):
+    """Raised when `project_key` is not valid."""
 
 
 class ProjectKeyConflictError(ProjectRecordCreationError):
@@ -45,6 +56,14 @@ def create_project_record(
     """
     if not project_key:
         raise ProjectKeyRequiredError("project_key is required.")
+
+    normalized_key = normalize_project_key(project_key)
+    if len(normalized_key) != PROJECT_KEY_LENGTH:
+        raise ProjectKeyInvalidError(
+            f"project_key must be exactly {PROJECT_KEY_LENGTH} alphanumeric characters."
+        )
+
+    project_key = normalized_key
 
     existing_projects = FIRESTORE_CLIENT.collection("projects").where(
         "user_id", "==", user_data.get_user_id()

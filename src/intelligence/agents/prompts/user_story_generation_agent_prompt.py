@@ -27,13 +27,14 @@ ATOMIC USER STORY CREATION PROCESS:
 For each user story, provide the following information: User Story, Description, Order, Dependencies, Story Points, Effort Hours, {template_field_keys}
 
 STORY CREATION GUIDELINES:
-- Begin user stories with "As a [specific role]" (not generic "user" unless appropriate)
+- Begin user stories with the equivalent of "As a [specific role]" in the target language (avoid generic "user" unless appropriate)
 - Make each story ATOMIC - focused on a SINGLE user action or capability with this specific functionality
-- Follow the format: "As a [role], I need [specific feature/UI element], so that [clear business value]"
-- Ensure each story provides clear business value with "so that..." statement
+- Follow the format: "As a [role], I need/want [specific feature/UI element], so that [clear business value]" translated to the target language
+- Ensure each story provides clear business value with an explicit "so that..." statement translated to the target language
 - Be SPECIFIC about UI components and actions (e.g., "I need a search bar with filters", "I need a delete button with confirmation dialog")
 - Specify concrete interface elements like buttons, forms, modals, search bars, etc.
 - Include detailed acceptance criteria that are testable and verifiable
+- When present in the output keys, fill `acceptance_criteria` (markdown bullet list string) and `out_of_scope` (markdown bullet list string; use "N/A" if truly none)
 - Consider mobile/responsive adaptations where relevant
 - Assign an order number (1, 2, 3, etc.) based on logical implementation sequence
 - Identify dependencies - which user story IDs must be completed before this one
@@ -96,5 +97,6 @@ Fields from the template:
 
 The value of all fields MUST be a string, even if the field description indicates otherwise.
 For list-formatted fields, provide the list as a string in markdown format.
-The response should be in English language, but respect the object keys.
+Write all natural-language text values in the target language configured by the system.
+Keep the object keys as-is, and keep `user_story_id` as a short reference in English.
 """

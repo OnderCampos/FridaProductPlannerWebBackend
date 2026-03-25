@@ -98,6 +98,29 @@ def _load_context_node(state: UserStoryGraphState) -> Dict[str, Any]:
             template_fields_json = ""
             fields_description = ""
 
+    # Always request acceptance criteria and out-of-scope in the generation graph, even if the
+    # selected template does not explicitly include them.
+    always_fields = [
+        (
+            "Acceptance Criteria",
+            "acceptance_criteria",
+            "3-6 short, testable bullet points (as a markdown list string).",
+        ),
+        (
+            "Out of Scope",
+            "out_of_scope",
+            "1-4 bullet points (use 'N/A' if truly none; markdown list string).",
+        ),
+    ]
+    existing_keys = {str(k or "").strip() for k in template_field_keys if str(k or "").strip()}
+    for name, key, description in always_fields:
+        if key in existing_keys:
+            continue
+        template_field_keys.append(key)
+        template_fields_json = (template_fields_json or "") + f'            "{key}": "",\n'
+        fields_description = (fields_description or "").rstrip() + f"\n- {name} ({key}): {description}"
+        existing_keys.add(key)
+
     detailed_expected_keys = [
         "epic",
         "user_story",

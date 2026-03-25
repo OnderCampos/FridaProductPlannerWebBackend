@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from typing import Any, Dict, Optional
 
@@ -72,9 +72,14 @@ def _resolve_action_project_id(action_data: Dict[str, Any]) -> Optional[str]:
 )
 async def assistant_chat_route(
     req: AssistantChatRequest,
+    request: Request,
     user_data: UserData = Depends(get_current_user),
 ):
     project_id = (req.project_id or "").strip()
+    llm_language = (
+        (request.headers.get("X-LLM-Response-Language") or "")
+        or (request.headers.get("X-LLM-Language") or "")
+    ).strip() or None
 
     access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
     if not access.success:
@@ -96,6 +101,7 @@ async def assistant_chat_route(
         message=req.message,
         project_id=project_id,
         history=history_for_agent,
+        language=llm_language,
     )
 
     if not response.success:

@@ -56,6 +56,30 @@ def _slugify(value: str) -> str:
     return "_".join(part for part in cleaned.split("_") if part)
 
 
+def _normalize_bullets(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+
+    items: List[str] = []
+    for raw_line in text.splitlines():
+        line = str(raw_line).strip()
+        if not line:
+            continue
+        for prefix in ("- ", "* ", "• ", "â€¢ "):
+            if line.startswith(prefix):
+                line = line[len(prefix) :].strip()
+                break
+        if line and line[0].isdigit():
+            if len(line) >= 3 and line[1] in {".", ")"} and line[2] == " ":
+                line = line[3:].strip()
+        if line:
+            items.append(line)
+    return items
+
+
 def _should_create_user_stories(creation_source: str) -> bool:
     source = (creation_source or "").strip().lower()
     return source not in {"document", "file", "qa"}
@@ -154,6 +178,16 @@ def _normalize_extracted_stories(
             dependencies = []
         dependencies = [str(dep).strip() for dep in dependencies if str(dep).strip()]
 
+        acceptance_criteria = _normalize_bullets(
+            item.get("acceptanceCriteria") or item.get("acceptance_criteria")
+        )
+        if not acceptance_criteria:
+            acceptance_criteria = ["Not provided."]
+
+        out_of_scope = _normalize_bullets(item.get("outOfScope") or item.get("out_of_scope"))
+        if not out_of_scope:
+            out_of_scope = ["N/A"]
+
         effort_hours = item.get("effortHours")
         try:
             effort_hours = float(effort_hours) if effort_hours is not None else 0
@@ -170,6 +204,8 @@ def _normalize_extracted_stories(
                 "epic": epic_name,
                 "user_story": user_story,
                 "description": description,
+                "acceptanceCriteria": acceptance_criteria,
+                "outOfScope": out_of_scope,
                 "user_story_id": story_id,
                 "order": order,
                 "dependencies": dependencies,

@@ -17,6 +17,7 @@ from src.utils.authz.project_memberships import (
 from src.utils.planning.user_stories import get_user_stories_by_epic
 from src.utils.authz.permissions import get_project_access
 from src.schemas.user_data import UserData
+from src.services.workflows.project_creation.common import PROJECT_KEY_LENGTH, normalize_project_key
 
 
 def _current_timestamp_iso() -> str:
@@ -262,6 +263,16 @@ def update_project(project_id: str, user_id: str, name: Optional[str] = None,
             )
         
         project_data = project_doc.to_dict()
+
+        if project_key is not None:
+            normalized_key = normalize_project_key(project_key)
+            if len(normalized_key) != PROJECT_KEY_LENGTH:
+                return ResponseModel(
+                    success=False,
+                    message=f"project_key must be exactly {PROJECT_KEY_LENGTH} alphanumeric characters",
+                    data=None,
+                )
+            project_key = normalized_key
         
         # Check if user owns the project
         if project_data.get("user_id") != user_id:

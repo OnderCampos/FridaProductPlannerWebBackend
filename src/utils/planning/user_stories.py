@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import re
 from typing import List, Dict, Any, Optional
 import logging
 
@@ -10,6 +11,87 @@ from src.utils.authz.permissions import get_project_access, get_project_id_for_e
 def _current_timestamp_iso() -> str:
     """Generate current timestamp in ISO format"""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_field_key(value: Any) -> str:
+    key = str(value or "").strip().lower()
+    if not key:
+        return ""
+    key = key.replace(" ", "_")
+    key = re.sub(r"[^a-z0-9_]+", "_", key)
+    key = re.sub(r"_+", "_", key).strip("_")
+    return key
+
+
+def _find_story_field_value(fields: Any, candidate_keys: List[str]) -> Optional[Any]:
+    if not isinstance(fields, list):
+        return None
+    normalized_candidates = {_normalize_field_key(k) for k in candidate_keys if str(k or "").strip()}
+    if not normalized_candidates:
+        return None
+    for item in fields:
+        if not isinstance(item, dict):
+            continue
+        raw_key = item.get("key") or item.get("name")
+        normalized_key = _normalize_field_key(raw_key)
+        if normalized_key in normalized_candidates:
+            return item.get("value")
+    return None
+
+
+def _extract_markdown_section_list(text: str, headings: List[str]) -> List[str]:
+    """
+    Best-effort extraction of bullet items under a heading inside a free-form description.
+    Example supported formats:
+      Acceptance Criteria:
+      - item
+      - item
+    """
+    if not text:
+        return []
+
+    heading_set = {str(h or "").strip().lower() for h in headings if str(h or "").strip()}
+    if not heading_set:
+        return []
+
+    lines = [str(line) for line in str(text).splitlines()]
+    start_index: Optional[int] = None
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        normalized = line.lower().rstrip(":").strip()
+        if normalized in heading_set:
+            start_index = index + 1
+            break
+
+    if start_index is None:
+        return []
+
+    collected: List[str] = []
+    for raw_line in lines[start_index:]:
+        line = str(raw_line).strip()
+        if not line:
+            if collected:
+                break
+            continue
+
+        normalized = line.lower().rstrip(":").strip()
+        if normalized in heading_set:
+            break
+        if normalized in {
+            "out of scope",
+            "out_of_scope",
+            "acceptance criteria",
+            "acceptance_criteria",
+            "dependencies",
+            "description",
+        }:
+            break
+
+        collected.append(line)
+
+    return _normalize_string_list("\n".join(collected))
 
 
 def _normalize_story_payload(story_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -26,8 +108,48 @@ def _normalize_story_payload(story_data: Dict[str, Any]) -> Dict[str, Any]:
     if effort_hours is None:
         effort_hours = 0
 
+    # Normalize acceptance/out-of-scope fields for backward compatibility:
+    # - some flows store them as strings in `document` or inside `fields`
+    # - some older stories omitted them entirely
+    document = story_data.get("document") if isinstance(story_data.get("document"), dict) else {}
+    fields = story_data.get("fields")
+
+    acceptance_source = (
+        story_data.get("acceptanceCriteria")
+        or story_data.get("acceptance_criteria")
+        or document.get("acceptance_criteria")
+        or document.get("acceptanceCriteria")
+        or _find_story_field_value(fields, ["acceptanceCriteria", "acceptance_criteria", "acceptance criteria"])
+    )
+    acceptance = _normalize_string_list(acceptance_source)
+    if not acceptance:
+        acceptance = _extract_markdown_section_list(
+            str(story_data.get("description") or ""),
+            ["acceptance criteria", "acceptance_criteria"],
+        )
+    if not acceptance:
+        acceptance = ["Not provided."]
+
+    out_scope_source = (
+        story_data.get("outOfScope")
+        or story_data.get("out_of_scope")
+        or document.get("out_of_scope")
+        or document.get("outOfScope")
+        or _find_story_field_value(fields, ["outOfScope", "out_of_scope", "out of scope"])
+    )
+    out_scope = _normalize_string_list(out_scope_source)
+    if not out_scope:
+        out_scope = _extract_markdown_section_list(
+            str(story_data.get("description") or ""),
+            ["out of scope", "out_of_scope"],
+        )
+    if not out_scope:
+        out_scope = ["N/A"]
+
     story_data["createdDate"] = created_date
     story_data["effortHours"] = effort_hours
+    story_data["acceptanceCriteria"] = acceptance
+    story_data["outOfScope"] = out_scope
     return story_data
 
 
@@ -47,6 +169,31 @@ def _parse_order_value(raw_order: Optional[Any]) -> float:
         return float(raw_order)
     except (TypeError, ValueError):
         return 0
+
+
+def _normalize_string_list(value: Optional[Any]) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+
+    items: List[str] = []
+    for raw_line in text.splitlines():
+        line = str(raw_line).strip()
+        if not line:
+            continue
+        for prefix in ("- ", "* ", "• "):
+            if line.startswith(prefix):
+                line = line[len(prefix) :].strip()
+                break
+        if line and line[0].isdigit():
+            # Remove common numbering formats like "1. " or "1) "
+            if len(line) >= 3 and line[1] in {".", ")"} and line[2] == " ":
+                line = line[3:].strip()
+        if line:
+            items.append(line)
+    return items
 
 
 def create_user_story(epic_id: str, user_id: str, user_story_data: Dict[str, Any], template_data: Dict[str, Any] = None) -> ResponseModel:
@@ -79,6 +226,11 @@ def create_user_story(epic_id: str, user_id: str, user_story_data: Dict[str, Any
             "created_date",
             "story_points",  
             "storyPoints",
+            "document",
+            "acceptanceCriteria",
+            "acceptance_criteria",
+            "outOfScope",
+            "out_of_scope",
         }
 
         raw_effort = user_story_data.get("effortHours")
@@ -101,6 +253,13 @@ def create_user_story(epic_id: str, user_id: str, user_story_data: Dict[str, Any
             "user_story_id": user_story_data.get("user_story_id", ""),
             "order": user_story_data.get("order", 0),
             "dependencies": user_story_data.get("dependencies", []),
+            "document": user_story_data.get("document") if isinstance(user_story_data.get("document"), dict) else {},
+            "acceptanceCriteria": _normalize_string_list(
+                user_story_data.get("acceptanceCriteria") or user_story_data.get("acceptance_criteria")
+            ),
+            "outOfScope": _normalize_string_list(
+                user_story_data.get("outOfScope") or user_story_data.get("out_of_scope")
+            ),
             "created_at": now,
             "createdDate": now,
             "updated_at": now,

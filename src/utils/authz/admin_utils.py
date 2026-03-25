@@ -12,6 +12,7 @@ from src.services.setup.variables_setup import LLMOPS_API_KEY
 from src.utils.core.validation_utils import get_code_block
 from src.schemas.response import ResponseModel
 from src.prompts.admin_prompts import TRANSFORM_USER_DATA_PROMPT, TRANSFORM_TEXT_TO_USER_JSON_PROMPT
+from src.services.setup.language_setup import get_default_llm_language
 from src.utils.authz.users import upsert_user_profile
 
 # Define registration status constants
@@ -91,7 +92,7 @@ async def create_firebase_user(user_data) -> ResponseModel:
                 "gherkin": True,
                 "jira_domain": "",
                 "jira_domains": "",
-                "language": "English",
+                "language": get_default_llm_language(),
                 "out_of_scope": True,
                 "test_cases": True,
                 "user_id": user.uid,
