@@ -18,6 +18,7 @@ from src.schemas.resources_request import (
     StartProjectClarificationRequest,
     GenerateProjectSpecFromFigmaRequest,
 )
+from src.schemas.jira_import import ImportProjectFromJiraRequest, ListJiraProjectsRequest
 from src.schemas.response import ResponseModel
 from src.schemas.resources_response import (
     GetProjectsResponse,
@@ -48,6 +49,10 @@ from src.services.workflows.project_creation.orchestrator import (
     ProjectCreationOrchestrator,
     ProjectOrchestrationError,
 )
+from src.services.workflows.project_import.orchestrator import (
+    ProjectImportOrchestrator,
+    ProjectImportOrchestrationError,
+)
 from src.services.workflows.project_creation.project_creation_by_document.initialization import (
     DocumentTextError,
     extract_text_from_bytes,
@@ -58,6 +63,12 @@ from src.services.workflows.project_creation.finalization import (
     ProjectFinalizationError,
     ProjectNotFoundError,
     ProjectNotReadyError,
+)
+from src.services.workflows.project_import.project_import_from_jira.initialization import (
+    JiraApiError,
+    JiraAuthenticationError,
+    JiraImportError,
+    list_jira_projects,
 )
 from src.utils.ai.project_creation_source_spec import generate_spec_from_source
 
@@ -507,6 +518,101 @@ async def create_project_from_qa_route(
         raise
     except Exception:
         logger.exception("Failed to create project")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ====================================
+# Project Import from Jira endpoints
+# ====================================
+
+
+@router.post(
+    "/creation/jira/projects",
+    response_description="List Jira projects available to the given credentials.",
+)
+async def list_jira_projects_route(
+    req: ListJiraProjectsRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    """
+    Fetches Jira projects for the UI flow.
+
+    The user must be a project leader to use this endpoint.
+    """
+    role_info = get_global_user_role(user_data)
+    if role_info.get("role") == "member":
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot create projects")
+
+    try:
+        projects = await list_jira_projects(
+            jira_base_url=req.jira_base_url,
+            jira_email=req.jira_email,
+            jira_api_token=req.jira_api_token,
+        )
+        response = ResponseModel(
+            success=True,
+            message="Jira projects retrieved.",
+            data=projects,
+        )
+        return JSONResponse(status_code=200, content=response.dict())
+    except JiraAuthenticationError as exc:
+        response = ResponseModel(success=False, message=str(exc), data=None)
+        return JSONResponse(status_code=401, content=response.dict())
+    except (JiraImportError, JiraApiError) as exc:
+        response = ResponseModel(success=False, message=str(exc), data=None)
+        return JSONResponse(status_code=400, content=response.dict())
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to list Jira projects")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post(
+    "/creation/jira",
+    response_description="Import a Jira project and create epics/user stories.",
+)
+async def import_project_from_jira_route(
+    req: ImportProjectFromJiraRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ProjectResponse:
+    """
+    Imports Epics + User Stories from Jira into a new Product Planner project.
+
+    The user must be a project leader to start an import.
+    """
+    role_info = get_global_user_role(user_data)
+    if role_info.get("role") == "member":
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot create projects")
+
+    try:
+        data = await ProjectImportOrchestrator("jira").import_project(
+            user_data=user_data,
+            name=req.name,
+            description=req.description,
+            project_key=req.project_key,
+            jira_base_url=req.jira_base_url,
+            jira_email=req.jira_email,
+            jira_api_token=req.jira_api_token,
+            jira_project_key=req.jira_project_key,
+            issue_types=req.issue_types,
+        )
+        response = ResponseModel(
+            success=True,
+            message="Project imported from Jira.",
+            data=data.dict(),
+        )
+        return JSONResponse(status_code=201, content=response.dict())
+    except JiraAuthenticationError as exc:
+        response = ResponseModel(success=False, message=str(exc), data=None)
+        return JSONResponse(status_code=401, content=response.dict())
+    except (JiraImportError, JiraApiError, ProjectImportOrchestrationError, ProjectRecordCreationError) as exc:
+        response = ResponseModel(success=False, message=str(exc), data=None)
+        return JSONResponse(status_code=400, content=response.dict())
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to import project from Jira")
         raise HTTPException(status_code=500, detail="Internal server error")
      
 
