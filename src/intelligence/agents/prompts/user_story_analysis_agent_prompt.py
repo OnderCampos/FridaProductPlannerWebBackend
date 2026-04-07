@@ -7,7 +7,7 @@ The project description is as follows:
 {project_description}
 
 STEP 1 - USER IDENTIFICATION (HIGHEST PRIORITY):
-First and foremost, you MUST identify ALL types of users that will interact with the functionality in this epic.
+First and foremost, you MUST identify only the MOST IMPORTANT user types that directly interact with the functionality in this epic.
 
 For each user type:
 - Provide a clear name/role (e.g., Administrator, Customer, Content Creator)
@@ -75,6 +75,10 @@ IMPORTANT GUIDELINES:
 
 IMPORTANT:
 - User identification is THE MOST CRITICAL first step - you MUST begin with comprehensive user analysis
+- Keep only the roles that are most relevant for user stories and end users of the system.
+- Prioritize end users and core admin/operational roles who perform actions in the product.
+- Exclude broad audience segments, market categories, company-size labels, and indirect stakeholders unless they have distinct system workflows.
+- Prefer 2-4 important roles for the epic unless the epic clearly requires more.
 - Always respond with the format inside a code block
 - Focus solely on user roles and application-level functionality. Avoid any mention of technical roles (e.g., Developer) or implementation details.
 - Be specific and detailed in all descriptions

@@ -319,6 +319,19 @@ class AzureChatService:
     async def simple_completion(self, prompt: str):
         return self.chat_completion([HumanMessage(content=prompt)])
 
+    async def simple_completion_with_images(self, prompt: str, images: List[str]):
+        image_messages = [
+            ImageMessage(image_data=image).to_dict()
+            for image in (images or [])
+            if str(image or "").strip()
+        ]
+        if not image_messages:
+            return await self.simple_completion(prompt)
+        return self.chat_completion(
+            [HumanMessage(content=[TextMessage(text=prompt).to_dict()] + image_messages)],
+            use_images=True,
+        )
+
     async def simple_kb_completion(self, prompt: str) -> FunctionResponse:
 
         if not self.knowledge_base_id:

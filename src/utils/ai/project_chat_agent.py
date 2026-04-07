@@ -257,7 +257,13 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
         if item_type == "epic":
             operation = update_epic_status(item_id, user_id, status)
         elif item_type == "story":
-            operation = update_user_story(item_id, user_id, {"status": status})
+            operation = update_user_story(
+                item_id,
+                user_id,
+                {"status": status},
+                user_email=user_email,
+                user_name=user_data.get_user_name(),
+            )
         else:
             operation = update_subtask_status(item_id, user_id, status)
 
@@ -310,7 +316,13 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
             key: value for key, value in filtered_fields.items() if key != "status"
         }
         if non_status_fields:
-            fields_response = update_user_story_fields(story_id, user_id, non_status_fields)
+            fields_response = update_user_story_fields(
+                story_id,
+                user_id,
+                non_status_fields,
+                user_email=user_email,
+                user_name=user_data.get_user_name(),
+            )
             if not fields_response.success:
                 return _action_result(action_type, action_id, fields_response)
             latest_result = fields_response
@@ -319,7 +331,13 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
             normalized_status = _normalize_item_status(filtered_fields.get("status"))
             if normalized_status is None:
                 return ResponseModel(success=False, message="Invalid status value", data=None)
-            status_response = update_user_story(story_id, user_id, {"status": normalized_status})
+            status_response = update_user_story(
+                story_id,
+                user_id,
+                {"status": normalized_status},
+                user_email=user_email,
+                user_name=user_data.get_user_name(),
+            )
             if not status_response.success:
                 return _action_result(action_type, action_id, status_response)
             latest_result = status_response
@@ -378,7 +396,13 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
         elif assignee:
             update_data["assignee"] = assignee
 
-        operation = update_user_story(story_id, user_id, update_data)
+        operation = update_user_story(
+            story_id,
+            user_id,
+            update_data,
+            user_email=user_email,
+            user_name=user_data.get_user_name(),
+        )
         return _action_result(action_type, action_id, operation)
 
     if action_type == "move_story_to_epic":
@@ -421,7 +445,13 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
         if not access.success:
             return access
 
-        operation = update_user_story(story_id, user_id, {"epic_id": target_epic_id})
+        operation = update_user_story(
+            story_id,
+            user_id,
+            {"epic_id": target_epic_id},
+            user_email=user_email,
+            user_name=user_data.get_user_name(),
+        )
         return _action_result(action_type, action_id, operation)
 
     if action_type == "update_epic":

@@ -45,6 +45,13 @@ Required output JSON schema:
 Rules:
 - Output valid JSON only, no markdown.
 - Be specific and concrete for target_users_roles because role-specific agents will be created from this.
+- `target_users_roles.role_name` must be a normalized application persona, not a market segment or audience category.
+- Prefer short persona labels such as "End User", "Administrator", "Manager", "Seller", "Buyer", "Operator", "Support Agent", "Instructor", or "Student" when appropriate.
+- Convert phrases like "eCommerce sellers", "small businesses", "large-scale operations", or "makerspaces" into the functional role they perform in the system.
+- Only keep distinct role names when they actually imply different permissions, workflows, or responsibilities.
+- Keep only the most important personas that directly interact with the system and are needed for epic and user-story generation.
+- Prioritize end users and core administrative/operational roles.
+- Prefer 2-5 important roles unless the product clearly has more distinct in-system roles.
 - Keep items short and implementation-relevant.
 - Capture role and workflow details that help define epics at the correct level (not story-level).
 - Do not include extra top-level keys.

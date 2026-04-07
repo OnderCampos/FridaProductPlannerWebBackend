@@ -38,6 +38,11 @@ class GenerateProjectSpecFromFigmaRequest(BaseModel):
     description: Optional[str] = None
 
 
+class AcceptProjectSpecificationRequest(BaseModel):
+    """Request model for accepting a generated project specification."""
+    spec_text: Optional[str] = None
+
+
 class CreateProjectFromFigmaRequest(BaseModel):
     """Request model for creating a project from a Figma link"""
     name: str

@@ -20,8 +20,10 @@ from src.services.workflows.project_creation.common import (
     ProjectRecordCreationError,
     create_project_record,
 )
+from src.utils.planning.projects import get_project_by_id
 from src.utils.planning.epics import create_epic
 from src.utils.planning.user_stories import create_user_story
+from src.utils.planning.user_story_generation import enrich_user_story_details
 
 
 logger = logging.getLogger(__name__)
@@ -551,6 +553,42 @@ def _extract_jira_components(fields: Dict[str, Any]) -> List[str]:
     return names
 
 
+def _seconds_to_hours(value: Any) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if seconds <= 0:
+        return 0.0
+    return round(seconds / 3600, 2)
+
+
+def _extract_jira_effort_hours(fields: Dict[str, Any]) -> float:
+    direct_candidates = [
+        fields.get("timeoriginalestimate"),
+        fields.get("timeestimate"),
+        fields.get("aggregatetimeoriginalestimate"),
+        fields.get("aggregatetimeestimate"),
+    ]
+    for candidate in direct_candidates:
+        hours = _seconds_to_hours(candidate)
+        if hours > 0:
+            return hours
+
+    timetracking = fields.get("timetracking")
+    if isinstance(timetracking, dict):
+        nested_candidates = [
+            timetracking.get("originalEstimateSeconds"),
+            timetracking.get("remainingEstimateSeconds"),
+        ]
+        for candidate in nested_candidates:
+            hours = _seconds_to_hours(candidate)
+            if hours > 0:
+                return hours
+
+    return 0.0
+
+
 def _derive_story_group(components: List[str], labels: List[str]) -> Tuple[str, str]:
     if components:
         return "component", components[0]
@@ -877,6 +915,14 @@ async def import_project_from_jira(
             raise ProjectRecordCreationError(str(last_exc or "Failed to generate unique project key"))
 
     project_id = project_record.project_id
+    project_context = get_project_by_id(
+        project_id,
+        user_data.get_user_id(),
+        allow_member=True,
+        user_email=user_data.get_email(),
+    )
+    project_data = project_context.data if project_context and project_context.success and isinstance(project_context.data, dict) else {}
+
     await _persist_jira_import_metadata(
         project_id=project_id,
         jira_project_key=jira_project_key,
@@ -1059,15 +1105,16 @@ async def import_project_from_jira(
     unlinked_batch: List[Dict[str, Any]] = []
     unlinked_by_key: Dict[str, Dict[str, Any]] = {}
 
-    def _create_user_story_in_epic(*, epic_id: str, epic_name: str, story: Dict[str, Any]) -> None:
+    async def _create_user_story_in_epic(*, epic_id: str, epic_name: str, story: Dict[str, Any]) -> None:
         nonlocal imported_stories
 
         jira_key = str(story.get("key") or "").strip()
         summary = str(story.get("summary") or "").strip()
         description_text = str(story.get("description") or "").strip()
         order = int(story.get("order") or 0)
+        effort_hours = _extract_jira_effort_hours(story.get("fields") if isinstance(story.get("fields"), dict) else {})
 
-        story_payload = {
+        story_payload: Dict[str, Any] = {
             "epic": epic_name,
             "user_story": summary or jira_key or "User story",
             "description": description_text,
@@ -1075,7 +1122,17 @@ async def import_project_from_jira(
             "order": order,
             "dependencies": [],
             "jira_base_url": credentials.base_url,
+            "effortHours": effort_hours,
         }
+
+        enriched_stories = await enrich_user_story_details(
+            user_data=user_data,
+            epic={"id": epic_id, "name": epic_name, "description": ""},
+            project=project_data,
+            stories=[story_payload],
+        )
+        if enriched_stories and isinstance(enriched_stories[0], dict):
+            story_payload = enriched_stories[0]
 
         created_story = create_user_story(epic_id, user_data.get_user_id(), story_payload)
         if not created_story.success:
@@ -1144,7 +1201,7 @@ async def import_project_from_jira(
         imported_epics += 1
         return epic_id, resolved_name
 
-    def _flush_unlinked_batch() -> None:
+    async def _flush_unlinked_batch() -> None:
         if not unlinked_batch:
             return
 
@@ -1202,7 +1259,7 @@ async def import_project_from_jira(
                                 group_type=group_type,
                                 group_value=group_value,
                             )
-                        _create_user_story_in_epic(
+                        await _create_user_story_in_epic(
                             epic_id=fallback_epic_id,
                             epic_name=fallback_epic_name,
                             story=story,
@@ -1213,7 +1270,7 @@ async def import_project_from_jira(
                     story = unlinked_by_key.get(str(story_key))
                     if not story:
                         continue
-                    _create_user_story_in_epic(epic_id=epic_id, epic_name=resolved_epic_name, story=story)
+                    await _create_user_story_in_epic(epic_id=epic_id, epic_name=resolved_epic_name, story=story)
         else:
             logger.warning(
                 "Jira import: grouping agent unavailable/invalid; using heuristic grouping for %s stories.",
@@ -1230,7 +1287,7 @@ async def import_project_from_jira(
                 else:
                     group_type, group_value = _derive_story_group(story_components, story_labels)
                     epic_id, epic_name = _ensure_group_epic(group_type=group_type, group_value=group_value)
-                _create_user_story_in_epic(epic_id=epic_id, epic_name=epic_name, story=story)
+                await _create_user_story_in_epic(epic_id=epic_id, epic_name=epic_name, story=story)
 
         unlinked_batch.clear()
         unlinked_by_key.clear()
@@ -1275,12 +1332,13 @@ async def import_project_from_jira(
                     "description": description_text,
                     "labels": story_labels,
                     "components": story_components,
+                    "fields": fields,
                     "order": current_order,
                 }
                 unlinked_batch.append(story_record)
                 unlinked_by_key[jira_key] = story_record
                 if len(unlinked_batch) >= grouping_batch_size:
-                    _flush_unlinked_batch()
+                    await _flush_unlinked_batch()
                 continue
 
             matched = _find_matching_epic(components=story_components, labels=story_labels, summary=summary)
@@ -1290,18 +1348,19 @@ async def import_project_from_jira(
                 group_type, group_value = _derive_story_group(story_components, story_labels)
                 epic_id, epic_name = _ensure_group_epic(group_type=group_type, group_value=group_value)
 
-        _create_user_story_in_epic(
+        await _create_user_story_in_epic(
             epic_id=epic_id,
             epic_name=epic_name,
             story={
                 "key": jira_key,
                 "summary": summary,
                 "description": description_text,
+                "fields": fields,
                 "order": current_order,
             },
         )
 
-    _flush_unlinked_batch()
+    await _flush_unlinked_batch()
 
     stats = {
         "imported_epics": imported_epics,

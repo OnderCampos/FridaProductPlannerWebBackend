@@ -146,5 +146,15 @@ class ProjectCreationOrchestrator:
             figma_payload=figma_payload,
         )
 
-    async def complete(self, *, user_data: UserData, project_id: str) -> FinalizeProjectCreationData:
-        return await finalize_project_creation(user_data=user_data, project_id=project_id)
+    async def complete(
+        self,
+        *,
+        user_data: UserData,
+        project_id: str,
+        spec_text_override: Optional[str] = None,
+    ) -> FinalizeProjectCreationData:
+        return await finalize_project_creation(
+            user_data=user_data,
+            project_id=project_id,
+            spec_text_override=spec_text_override,
+        )

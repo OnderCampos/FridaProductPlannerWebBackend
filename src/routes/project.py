@@ -11,6 +11,7 @@ from src.schemas.resources_request import (
     GetProjectRequest,
     CreateProjectRequest,
     CreateProjectFromDescriptionRequest,
+    AcceptProjectSpecificationRequest,
     CreateProjectFromFigmaRequest,
     UpdateProjectRequest,
     DeleteProjectRequest,
@@ -70,6 +71,7 @@ from src.services.workflows.project_import.project_import_from_jira.initializati
     JiraImportError,
     list_jira_projects,
 )
+from src.services.notifications import NotificationService
 from src.utils.ai.project_creation_source_spec import generate_spec_from_source
 
 
@@ -97,6 +99,7 @@ from src.utils.planning.invitations import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+notification_service = NotificationService()
 
 
 def _derive_project_name(description: str) -> str:
@@ -134,6 +137,7 @@ def _normalize_invitation_payload(invitation: dict) -> dict:
     payload = dict(invitation or {})
     payload["projectId"] = payload.get("projectId") or payload.get("project_id")
     payload["invitedBy"] = payload.get("invitedBy") or payload.get("invited_by")
+    payload["invitedByName"] = payload.get("invitedByName") or payload.get("invited_by_name")
     payload["invitedDate"] = payload.get("invitedDate") or payload.get("invited_date")
     payload["expiresDate"] = payload.get("expiresDate") or payload.get("expires_date")
     payload["responseDate"] = payload.get("responseDate") or payload.get("response_date")
@@ -451,6 +455,16 @@ async def add_project_member_route(
             seniority=req.seniority,
             avatar=avatar
         )
+        project_name = str((access.data or {}).get("project", {}).get("name") or "").strip() or "your project"
+        added_by_name = user_data.get_user_name() or user_data.get_email() or "A FridaPlatform administrator"
+        notification_service.try_send_project_member_added(
+            member_name=req.name,
+            member_email=req.email,
+            project_name=project_name,
+            added_by_name=added_by_name,
+            role=req.role,
+            seniority=req.seniority,
+        )
 
         response = ResponseModel(
             success=True,
@@ -639,12 +653,6 @@ async def start_project_clarification_route(
             raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update projects")
 
         project = access.data.get("project") or {}
-        status = str(project.get("creation_status") or "").strip().lower()
-        if status == "finalized":
-            return JSONResponse(
-                status_code=409,
-                content=ResponseModel(success=False, message="Project is already finalized", data=None).dict(),
-            )
 
         description = ""
         if req and req.description is not None:
@@ -805,12 +813,6 @@ async def generate_project_spec_from_file_route(
             raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update projects")
 
         project = access.data.get("project") or {}
-        status = str(project.get("creation_status") or "").strip().lower()
-        if status == "finalized":
-            return JSONResponse(
-                status_code=409,
-                content=ResponseModel(success=False, message="Project is already finalized", data=None).dict(),
-            )
 
         if not file:
             raise HTTPException(status_code=400, detail="file is required")
@@ -870,6 +872,7 @@ async def generate_project_spec_from_file_route(
 )
 async def accept_project_spec_route(
     project_id: str = Path(..., description="The project ID"),
+    req: AcceptProjectSpecificationRequest = None,
     user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
@@ -909,6 +912,7 @@ async def accept_project_spec_route(
             data = await ProjectCreationOrchestrator().complete(
                 user_data=user_data,
                 project_id=project_id,
+                spec_text_override=(req.spec_text if req else None),
             )
         except ProjectNotFoundError as exc:
             response = ResponseModel(success=False, message=str(exc), data=None)
@@ -962,12 +966,6 @@ async def generate_project_spec_from_figma_route(
             raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update projects")
 
         project = access.data.get("project") or {}
-        status = str(project.get("creation_status") or "").strip().lower()
-        if status == "finalized":
-            return JSONResponse(
-                status_code=409,
-                content=ResponseModel(success=False, message="Project is already finalized", data=None).dict(),
-            )
 
         figma_payload = {
             "url": (req.figma_url or "").strip(),
@@ -1074,6 +1072,7 @@ async def get_project_stats_timeline_route(
                     "createdDate": story.get("createdDate") or story.get("created_at"),
                     "startDate": story.get("startDate") or story.get("start_date"),
                     "dueDate": story.get("dueDate") or story.get("due_date"),
+                    "sprint_id": story.get("sprint_id"),
                     "effortHours": effort_hours,
                     "effort_hours": effort_hours,
                 })
@@ -1138,6 +1137,17 @@ async def invite_project_member_route(
             seniority=seniority,
         )
         invitation = _normalize_invitation_payload(invitation)
+        project_name = str((access.data or {}).get("project", {}).get("name") or "").strip() or "your project"
+        inviter_name = user_data.get_user_name() or user_data.get_email() or "A FridaPlatform administrator"
+        notification_service.try_send_project_invitation(
+            invitee_name=name,
+            invitee_email=email,
+            project_name=project_name,
+            inviter_name=inviter_name,
+            role=role,
+            seniority=seniority,
+            expires_at=invitation.get("expiresDate") or invitation.get("expires_date"),
+        )
 
         return JSONResponse(
             status_code=201,

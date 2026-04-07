@@ -13,6 +13,20 @@ Epic definition to enforce:
 The project description must summarize the overall purpose and goals, focusing on how different users interact with the system, the main workflows, and the relationships between different entities in the project.
 The project description MUST identify all user roles involved in the project.
 
+ROLE NORMALIZATION RULES:
+- The `roles` output must contain normalized application personas, not market segments, business sizes, or customer categories.
+- Prefer roles such as "End User", "Administrator", "Manager", "Seller", "Buyer", "Operator", "Support Agent", "Instructor", or "Student" when appropriate.
+- Convert audience/group descriptions into the functional role they play in the system.
+- Good example: "eCommerce sellers (e.g., Etsy, Shopify)" -> "Seller".
+- Good example: "Hobbyist 3D printing enthusiasts" -> "End User" or "Customer" depending on context.
+- Good example: "Small businesses offering custom prints" -> "Seller" or "Business Operator" depending on context.
+- Do NOT use segmented labels such as hobbyist, small business, enterprise, educational lab, or marketplace brand names as roles unless the product truly gives them different permissions and workflows.
+- Keep roles short, singular, and permission/workflow oriented.
+- Keep ONLY the most important roles that directly use the system and are relevant for user stories.
+- Prioritize end users and operational personas who perform actions in the product.
+- Exclude indirect audiences, market segments, business categories, or broad stakeholder groups unless they have distinct in-system workflows.
+- Prefer 2-5 roles total unless the system clearly requires more.
+
 EPIC CREATION GUIDELINES:
 - Create well-defined epics focused on specific user interactions or workflows
 - Each epic must center on a distinct set of user actions or business processes
@@ -48,6 +62,8 @@ The format of the response should be in the following JSON format:
 - Do NOT omit any fields; ensure every field is completed accurately.
 - technical_stack must be an array of strings containing technology tags (e.g., "azure", "python", "react", "nodejs", "mongodb", "docker", "kubernetes", "sql", etc.)
 - roles must be an array of strings containing user role names (e.g., "Admin", "User", "Manager", "Customer", etc.)
+- roles must be normalized personas based on system behavior and permissions, not demographics, market segments, or company-size categories
+- roles must include only the most relevant personas for user stories and direct system usage
 - Be very explicit and detailed in your responses, focusing only on user interactions, roles, views, and workflows.
 - Describe the workflows as a narrative of user actions and system responses.
 - DO NOT include any technical implementation details in the project description or epic descriptions.

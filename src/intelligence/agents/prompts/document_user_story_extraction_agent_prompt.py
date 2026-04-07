@@ -38,6 +38,10 @@ Rules:
 - "order" should be an integer sequence starting at 1 within each epic.
 - "dependencies" should list user_story_id values; use an empty array if none.
 - "effortHours" should be a numeric estimate; use 0 if unknown.
+- Extract MULTIPLE user stories per epic whenever the document supports it.
+- Prefer 2-5 atomic user stories per epic when an epic contains multiple user actions, flows, screens, integrations, or business outcomes.
+- Do NOT collapse an entire epic into a single generic user story when the source document describes separable capabilities.
+- Only return a single user story for an epic if the document truly supports only one atomic story for that epic.
 - Do not include extra top-level keys or extra fields in stories.
 - Keep all human-readable values in {language}.
 """

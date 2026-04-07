@@ -3,9 +3,12 @@ import re
 from typing import List, Dict, Any, Optional
 import logging
 
+from src.services.notifications import NotificationService
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.schemas.response import ResponseModel
 from src.utils.authz.permissions import get_project_access, get_project_id_for_epic
+from src.utils.authz.users import get_user_profile
+from src.utils.planning.assignees import build_member_lookup, normalize_assignee_fields
 
 
 def _current_timestamp_iso() -> str:
@@ -194,6 +197,145 @@ def _normalize_string_list(value: Optional[Any]) -> List[str]:
         if line:
             items.append(line)
     return items
+
+
+def _assignment_notification_result(sent: bool, status: str, reason: str, message: str) -> Dict[str, Any]:
+    return {
+        "sent": bool(sent),
+        "status": str(status),
+        "reason": str(reason),
+        "message": str(message),
+    }
+
+
+def _attach_story_sprint_assignment(story_data: Dict[str, Any], story_id: str) -> Dict[str, Any]:
+    """Attach the assigned sprint ID for a story when present."""
+    assignment_query = (
+        FIRESTORE_CLIENT.collection("sprint_items")
+        .where("item_type", "==", "story")
+        .where("item_id", "==", story_id)
+        .limit(1)
+        .get()
+    )
+
+    story_data["sprint_id"] = None
+    if assignment_query:
+        assignment_data = assignment_query[0].to_dict()
+        story_data["sprint_id"] = assignment_data.get("sprint_id")
+
+    return story_data
+
+
+def _maybe_send_user_story_assignment_notification(
+    *,
+    previous_story: Dict[str, Any],
+    updated_story: Dict[str, Any],
+    user_id: str,
+    user_email: Optional[str] = None,
+    user_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        epic_id = str(updated_story.get("epic_id") or previous_story.get("epic_id") or "").strip()
+        if not epic_id:
+            return _assignment_notification_result(
+                False,
+                "skipped",
+                "epic_missing",
+                "Assignment email was not sent because the story epic could not be resolved.",
+            )
+
+        project_id = get_project_id_for_epic(epic_id)
+        if not project_id:
+            return _assignment_notification_result(
+                False,
+                "skipped",
+                "project_missing",
+                "Assignment email was not sent because the project could not be resolved.",
+            )
+
+        member_lookup = build_member_lookup(project_id)
+        previous_assignee = normalize_assignee_fields(dict(previous_story or {}), member_lookup)
+        updated_assignee = normalize_assignee_fields(dict(updated_story or {}), member_lookup)
+
+        updated_assignee_name = str(updated_assignee.get("assignee") or "").strip()
+        updated_assignee_id = str(updated_assignee.get("assignee_id") or "").strip()
+        if not updated_assignee_name and not updated_assignee_id:
+            return _assignment_notification_result(
+                False,
+                "skipped",
+                "assignee_cleared",
+                "",
+            )
+
+        previous_email = str(previous_assignee.get("assignee_email") or "").strip().lower()
+        updated_email = str(updated_assignee.get("assignee_email") or "").strip().lower()
+        if not updated_email:
+            return _assignment_notification_result(
+                False,
+                "skipped",
+                "assignee_email_missing",
+                "Assignment email was not sent because the assigned member does not have a resolved email address.",
+            )
+        if updated_email == previous_email:
+            return _assignment_notification_result(
+                False,
+                "skipped",
+                "assignee_unchanged",
+                "Assignment email was not sent because the assignee did not change.",
+            )
+
+        project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
+        project_name = ""
+        if project_doc.exists:
+            project_name = str((project_doc.to_dict() or {}).get("name") or "").strip()
+
+        epic_doc = FIRESTORE_CLIENT.collection("epics").document(epic_id).get()
+        epic_name = ""
+        if epic_doc.exists:
+            epic_payload = epic_doc.to_dict() or {}
+            epic_name = str(epic_payload.get("epic") or epic_payload.get("name") or "").strip()
+
+        assignee_name = str(
+            updated_assignee.get("assignee")
+            or member_lookup.get("by_email", {}).get(updated_email, {}).get("name")
+            or updated_email
+        ).strip()
+        story_title = str(updated_story.get("user_story") or updated_story.get("title") or "").strip()
+        story_reference = str(updated_story.get("user_story_id") or updated_story.get("id") or "").strip()
+
+        actor_name = str(user_name or "").strip()
+        if not actor_name:
+            actor_profile = get_user_profile(user_id=user_id, email=user_email)
+            actor_name = str(
+                (actor_profile or {}).get("name")
+                or (actor_profile or {}).get("email")
+                or user_email
+                or user_id
+                or "A FridaPlatform administrator"
+            ).strip()
+
+        NotificationService().send_user_story_assignment(
+            assignee_name=assignee_name,
+            assignee_email=updated_email,
+            project_name=project_name,
+            epic_name=epic_name,
+            story_title=story_title,
+            story_reference=story_reference,
+            assigned_by_name=actor_name,
+        )
+        return _assignment_notification_result(
+            True,
+            "sent",
+            "sent",
+            f"Assignment email sent to {updated_email}.",
+        )
+    except Exception:
+        return _assignment_notification_result(
+            False,
+            "failed",
+            "notification_provider_failed",
+            "Assignment email was not sent because the notification provider failed.",
+        )
 
 
 def create_user_story(epic_id: str, user_id: str, user_story_data: Dict[str, Any], template_data: Dict[str, Any] = None) -> ResponseModel:
@@ -396,20 +538,7 @@ def get_user_story_by_id(story_id: str, user_id: str, allow_member: bool = False
                     data=None
                 )
 
-        # Search in sprint_items
-        assignment_query = FIRESTORE_CLIENT.collection('sprint_items').where(
-            'item_type', '==', 'story'
-        ).where(
-            'item_id', '==', story_id
-        ).limit(1).get()
-
-        # Extract sprint id
-        story_data["sprint_id"] = None 
-        if assignment_query:
-            assignment_data = assignment_query[0].to_dict()
-            story_data["sprint_id"] = assignment_data.get("sprint_id")
-
-        print(f"DEBUG SPRINT ID: {story_data['sprint_id']}")
+        _attach_story_sprint_assignment(story_data, story_id)
 
         return ResponseModel(
             success=True,
@@ -459,6 +588,7 @@ def get_user_stories_by_epic(epic_id: str, user_id: str = None, allow_member: bo
             story_data["id"] = story_id
 
             _normalize_story_payload(story_data)
+            _attach_story_sprint_assignment(story_data, story_id)
 
             story_data["effortHours"] = story_data.get("effortHours", 0) + total_subtask_hours
 
@@ -528,7 +658,13 @@ def get_user_stories_by_epic_with_auth(epic_id: str, user_id: str, user_email: O
         )
 
 
-def update_user_story(story_id: str, user_id: str, update_data: Dict[str, Any]) -> ResponseModel:
+def update_user_story(
+    story_id: str,
+    user_id: str,
+    update_data: Dict[str, Any],
+    user_email: Optional[str] = None,
+    user_name: Optional[str] = None,
+) -> ResponseModel:
     """
     Updates an existing user story.
     
@@ -552,6 +688,7 @@ def update_user_story(story_id: str, user_id: str, update_data: Dict[str, Any]) 
             )
         
         story_data = story_doc.to_dict()
+        previous_story_data = dict(story_data or {})
         
         # Check if user owns the user story
         if story_data.get("user_id") != user_id:
@@ -572,6 +709,14 @@ def update_user_story(story_id: str, user_id: str, update_data: Dict[str, Any]) 
         updated_data = updated_doc.to_dict()
         updated_data["id"] = story_id
         _normalize_story_payload(updated_data)
+        assignment_notification = _maybe_send_user_story_assignment_notification(
+            previous_story=previous_story_data,
+            updated_story=updated_data,
+            user_id=user_id,
+            user_email=user_email,
+            user_name=user_name,
+        )
+        updated_data["assignment_notification"] = assignment_notification
         
         return ResponseModel(
             success=True,
@@ -586,7 +731,13 @@ def update_user_story(story_id: str, user_id: str, update_data: Dict[str, Any]) 
             data=None
         )
 
-def update_user_story_fields(story_id: str, user_id: str, update_data: Dict[str, Any]) -> ResponseModel:
+def update_user_story_fields(
+    story_id: str,
+    user_id: str,
+    update_data: Dict[str, Any],
+    user_email: Optional[str] = None,
+    user_name: Optional[str] = None,
+) -> ResponseModel:
     """
     Updates the fields array of an existing user story.
     
@@ -606,8 +757,12 @@ def update_user_story_fields(story_id: str, user_id: str, update_data: Dict[str,
             return ResponseModel(success=False, message="User story not found", data=None)
 
         user_story_data = user_story_doc.to_dict()
+        previous_story_data = dict(user_story_data or {})
         if user_story_data.get("user_id") != user_id:
-            return ResponseModel(success=False, message="Unauthorized: You don't own this user story", data=None)
+            project_id = get_project_id_for_epic(user_story_data.get("epic_id"))
+            access = get_project_access(project_id, user_id, user_email) if project_id else None
+            if not access or not access.success or not (access.data or {}).get("is_lead"):
+                return ResponseModel(success=False, message="Unauthorized: You don't own this user story", data=None)
 
         allowed_fields = {
             "user_story",
@@ -619,8 +774,12 @@ def update_user_story_fields(story_id: str, user_id: str, update_data: Dict[str,
             "status",
             "story_status",
             "assignee",
+            "assignee_id",
             "assigned_to",
+            "assignedTo",
             "assigneeId",
+            "assigneeEmail",
+            "assignee_email",
             "storyPoints",
             "story_points",
             "dueDate",
@@ -628,6 +787,10 @@ def update_user_story_fields(story_id: str, user_id: str, update_data: Dict[str,
             "effort_hours",
             "startDate",
             "start_date",
+            "acceptanceCriteria",
+            "acceptance_criteria",
+            "outOfScope",
+            "out_of_scope",
         }
         filtered_update = {k: v for k, v in update_data.items() if k in allowed_fields}
 
@@ -646,6 +809,27 @@ def update_user_story_fields(story_id: str, user_id: str, update_data: Dict[str,
 
         if "start_date" in filtered_update and "startDate" not in filtered_update:
             filtered_update["startDate"] = filtered_update.pop("start_date")
+
+        if "assignedTo" in filtered_update and "assigned_to" not in filtered_update:
+            filtered_update["assigned_to"] = filtered_update.pop("assignedTo")
+
+        if "assignee_id" in filtered_update and "assigneeId" not in filtered_update:
+            filtered_update["assigneeId"] = filtered_update.pop("assignee_id")
+
+        if "assignee_email" in filtered_update and "assigneeEmail" not in filtered_update:
+            filtered_update["assigneeEmail"] = filtered_update.pop("assignee_email")
+
+        if "acceptance_criteria" in filtered_update and "acceptanceCriteria" not in filtered_update:
+            filtered_update["acceptanceCriteria"] = filtered_update.pop("acceptance_criteria")
+
+        if "out_of_scope" in filtered_update and "outOfScope" not in filtered_update:
+            filtered_update["outOfScope"] = filtered_update.pop("out_of_scope")
+
+        if "acceptanceCriteria" in filtered_update:
+            filtered_update["acceptanceCriteria"] = _normalize_string_list(filtered_update.get("acceptanceCriteria"))
+
+        if "outOfScope" in filtered_update:
+            filtered_update["outOfScope"] = _normalize_string_list(filtered_update.get("outOfScope"))
 
         incoming_status = filtered_update.get("status")
         if isinstance(incoming_status, str):
@@ -693,6 +877,14 @@ def update_user_story_fields(story_id: str, user_id: str, update_data: Dict[str,
         final_data["id"] = story_id
 
         _normalize_story_payload(final_data)
+        assignment_notification = _maybe_send_user_story_assignment_notification(
+            previous_story=previous_story_data,
+            updated_story=final_data,
+            user_id=user_id,
+            user_email=user_email,
+            user_name=user_name,
+        )
+        final_data["assignment_notification"] = assignment_notification
 
         return ResponseModel(
             success=True, 

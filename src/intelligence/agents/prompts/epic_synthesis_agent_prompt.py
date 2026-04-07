@@ -37,6 +37,12 @@ Rules:
 - Output valid JSON only, no markdown.
 - Do not include extra keys.
 - `roles` must come from the analyzed target users/roles.
+- `roles` must be normalized application personas, not audience segments, business-size categories, or marketing labels.
+- Prefer concise role names such as "End User", "Administrator", "Manager", "Seller", "Buyer", "Operator", "Support Agent", "Instructor", or "Student" when appropriate.
+- If upstream analysis contains segmented labels like "hobbyist enthusiasts", "small businesses", or "eCommerce sellers", collapse them into the functional role they play unless they truly have different permissions/workflows.
+- Keep only the most important roles that directly use the system and materially affect user stories.
+- Prioritize end users and core administrative/operational personas.
+- Prefer 2-5 project roles unless the system clearly requires more distinct in-product roles.
 - `epics` must be deduplicated, coherent, and non-overlapping.
 - Keep business/workflow language in descriptions; avoid implementation details.
 - Make epic descriptions very descriptive, covering the end-to-end user journey.

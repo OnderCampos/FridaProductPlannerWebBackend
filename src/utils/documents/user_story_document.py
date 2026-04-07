@@ -2,6 +2,7 @@ import json
 import base64
 import logging
 import os
+import re
 import secrets
 import string
 from datetime import datetime, timezone
@@ -55,6 +56,7 @@ DOCUMENT_SECTION_KEYS = [
     "api_description",
     "acceptance_criteria",
     "test_scenarios",
+    "dependencies",
     "benefits",
     "estimation_dev",
 ]
@@ -86,6 +88,7 @@ QUESTION_TEXT_BY_KEY = {
     "api_description": "API Description: Describe any API/system interactions (source/target/format), or write N/A.",
     "acceptance_criteria": "Acceptance Criteria: Provide bullet points describing the conditions for the story to be considered done.",
     "test_scenarios": "Test Scenarios: List key test scenarios (happy path, edge cases, error cases).",
+    "dependencies": "Dependencies: List any dependencies, prerequisites, or related stories/systems this user story relies on, or write N/A.",
     "benefits": "Benefits: Explain the expected benefits of this user story, or write N/A.",
     "estimation_dev": "Estimation Dev: Provide the time estimate (and any notes), or write N/A.",
 }
@@ -494,8 +497,17 @@ def _add_section_header(doc, title: str) -> None:
     # Titles: navy text (no background fill).
     _style_paragraph_text(paragraph, bold=True, color_hex=BRAND_NAVY_HEX)
     try:
-        paragraph.paragraph_format.space_before = 10
+        paragraph.paragraph_format.space_before = 12
         paragraph.paragraph_format.space_after = 4
+    except Exception:
+        pass
+
+
+def _add_section_gap(doc, points: int = 12) -> None:
+    paragraph = doc.add_paragraph("")
+    try:
+        paragraph.paragraph_format.space_before = 0
+        paragraph.paragraph_format.space_after = points
     except Exception:
         pass
 
@@ -922,23 +934,59 @@ def _parse_user_story_statement(statement: str) -> Tuple[str, str, str]:
     if not raw:
         return "", "", ""
 
-    lower = raw.lower()
-    if "as a" in lower and "i want" in lower:
-        try:
-            as_a_part = raw[lower.index("as a") + len("as a") :]
-            lower_after = as_a_part.lower()
-            i_want_idx = lower_after.index("i want")
-            persona = as_a_part[:i_want_idx].strip(" ,.-\n\t")
-            rest = as_a_part[i_want_idx + len("i want") :].strip()
-            rest_lower = rest.lower()
-            if "so that" in rest_lower:
-                want_part = rest[: rest_lower.index("so that")].strip(" ,.-\n\t")
-                so_that = rest[rest_lower.index("so that") + len("so that") :].strip(" ,.-\n\t")
-                return persona, want_part, so_that
-            return persona, rest.strip(" ,.-\n\t"), ""
-        except Exception:
-            return "", raw, ""
-    return "", raw, ""
+    normalized = re.sub(r"\s+", " ", raw).strip()
+    lower = normalized.casefold()
+
+    role_markers = ["as a ", "as an ", "as the ", "como "]
+    need_markers = [" i want to ", " i want ", " i need to ", " i need ", " quiero ", " necesito "]
+    value_markers = [" so that ", " in order to ", " para ", " con el fin de "]
+
+    role_index = -1
+    role_marker = ""
+    for marker in role_markers:
+        idx = lower.find(marker)
+        if idx >= 0:
+            role_index = idx
+            role_marker = marker
+            break
+
+    if role_index < 0:
+        return "", normalized, ""
+
+    after_role = normalized[role_index + len(role_marker) :]
+    after_role_lower = after_role.casefold()
+
+    need_index = -1
+    need_marker = ""
+    for marker in need_markers:
+        idx = after_role_lower.find(marker)
+        if idx >= 0:
+            need_index = idx
+            need_marker = marker
+            break
+
+    if need_index < 0:
+        return after_role.strip(" ,.-\n\t"), normalized, ""
+
+    persona = after_role[:need_index].strip(" ,.-\n\t")
+    rest = after_role[need_index + len(need_marker) :].strip()
+    rest_lower = rest.casefold()
+
+    value_index = -1
+    value_marker = ""
+    for marker in value_markers:
+        idx = rest_lower.find(marker)
+        if idx >= 0:
+            value_index = idx
+            value_marker = marker
+            break
+
+    if value_index >= 0:
+        want_part = rest[:value_index].strip(" ,.-\n\t")
+        so_that = rest[value_index + len(value_marker) :].strip(" ,.-\n\t")
+        return persona, want_part, so_that
+
+    return persona, rest.strip(" ,.-\n\t"), ""
 
 
 def _add_section(doc, title: str, content: str) -> None:
@@ -946,14 +994,17 @@ def _add_section(doc, title: str, content: str) -> None:
     text = (content or "").strip()
     if not text:
         doc.add_paragraph("N/A")
+        _add_section_gap(doc)
         return
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) > 1:
         for ln in lines:
             doc.add_paragraph(ln, style="List Bullet")
+        _add_section_gap(doc)
         return
     doc.add_paragraph(text)
+    _add_section_gap(doc)
 
 
 def _add_wireframe_section(doc, *, content: str, images: Any) -> None:
@@ -992,6 +1043,7 @@ def _add_wireframe_section(doc, *, content: str, images: Any) -> None:
         doc.add_paragraph("See images below." if has_images else "N/A")
 
     if not has_images:
+        _add_section_gap(doc)
         return
 
     try:
@@ -1068,12 +1120,55 @@ def _add_wireframe_section(doc, *, content: str, images: Any) -> None:
         elif url:
             doc.add_paragraph(url)
 
+    _add_section_gap(doc)
+
 
 def _set_table_style(table) -> None:
     try:
         table.style = "Table Grid"
     except Exception:
         return
+
+
+def _parse_table_rows(content: Any, expected_columns: int) -> List[List[str]]:
+    text = str(content or "").strip()
+    if not text:
+        return []
+
+    rows: List[List[str]] = []
+    for raw_line in text.splitlines():
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        for prefix in ("- ", "* ", "• "):
+            if line.startswith(prefix):
+                line = line[len(prefix) :].strip()
+                break
+        if not line:
+            continue
+
+        cells = [part.strip() for part in line.split("|")]
+        if len(cells) != expected_columns:
+            rows.append([line] + [""] * max(0, expected_columns - 1))
+            continue
+        rows.append(cells)
+    return rows
+
+
+def _add_structured_table_rows(table, content: Any, expected_columns: int, start_row_index: int = 2) -> None:
+    rows = _parse_table_rows(content, expected_columns)
+    if not rows:
+        rows = [[str(content or "N/A").strip() or "N/A"] + [""] * max(0, expected_columns - 1)]
+
+    existing_rows = len(table.rows)
+    while existing_rows < start_row_index + len(rows):
+        table.add_row()
+        existing_rows += 1
+
+    for row_offset, row_values in enumerate(rows):
+        row_index = start_row_index + row_offset
+        for col_index in range(expected_columns):
+            table.cell(row_index, col_index).text = row_values[col_index] if col_index < len(row_values) else ""
 
 
 def _add_label_value_paragraph(doc, label: str, value: str) -> None:
@@ -1121,63 +1216,18 @@ def build_user_story_document_bytes(
     _add_label_value_paragraph(doc, "Responsible", str(document.get("responsible") or story.get("assignee") or ""))
     _add_label_value_paragraph(doc, "Date", str(document.get("date") or _now_display_date()))
 
-    _add_section_header(doc, "Traceability")
-    doc.add_paragraph(
-        "This table lists the tasks required to move the user story to \"Ready for Development.\" "
-        "It provides an overview of the current status and remaining tasks."
-    )
-
-    trace_headers = [
-        "Business Requirement Defined",
-        "Legal Approval",
-        "Information on design / Wireframe",
-        "Mockup",
-        "Technical Requirement",
-        "Technical Requirement Ready",
-        "Test Data + *Test Scenarios",
-        "Test Cases Defined",
-        "Story Refined",
-        "Story Done",
-        "Go / No Go",
-    ]
-    trace_defaults = ["Open"] * 10 + ["N/A"]
-    trace_table = doc.add_table(rows=2, cols=len(trace_headers))
-    _set_table_style(trace_table)
-    for idx, header in enumerate(trace_headers):
-        trace_table.cell(0, idx).text = header
-        trace_table.cell(1, idx).text = trace_defaults[idx]
-    _style_table_header_row(trace_table)
-
-    _add_section_header(doc, "History and Acceptance")
-    doc.add_paragraph(
-        "This section records version history and approvals. "
-        "Stakeholders must approve the latest version (signature requested)."
-    )
-
     persona, want, so_that = _parse_user_story_statement(str(story.get("user_story") or ""))
+    fallback_description = str(document.get("description_and_scope") or story.get("description") or "").strip()
     story_table = doc.add_table(rows=3, cols=2)
     _set_table_style(story_table)
     story_table.cell(0, 0).text = "As a …"
-    story_table.cell(0, 1).text = persona or str(document.get("persona") or "").strip()
+    story_table.cell(0, 1).text = persona or str(document.get("persona") or "").strip() or "N/A"
     story_table.cell(1, 0).text = "I want to …"
-    story_table.cell(1, 1).text = want or str(story.get("user_story") or "").strip()
+    story_table.cell(1, 1).text = want or fallback_description or str(story.get("user_story") or "").strip() or "N/A"
     story_table.cell(2, 0).text = "In order to …"
-    story_table.cell(2, 1).text = so_that or str(document.get("in_order_to") or "").strip()
+    story_table.cell(2, 1).text = so_that or str(document.get("in_order_to") or "").strip() or str(document.get("benefits") or "").strip() or "N/A"
 
-    history_table = doc.add_table(rows=3, cols=4)
-    _set_table_style(history_table)
-    for idx, header in enumerate(["Date", "Version", "Comment", "Acceptance by"]):
-        history_table.cell(0, idx).text = header
-    _style_table_header_row(history_table)
-    history_table.cell(1, 0).text = "DD.MM.YYYY"
-    history_table.cell(1, 1).text = "<1.0>"
-    history_table.cell(1, 2).text = "<Version>"
-    history_table.cell(1, 3).text = "<Area>/<Name> <Project Role> <Signature>"
-    history_table.cell(2, 0).text = _now_display_date().replace(".", "/")
-    history_table.cell(2, 1).text = "1.0"
-    history_table.cell(2, 2).text = "Generated"
-    history_table.cell(2, 3).text = str(document.get("responsible") or story.get("assignee") or "")
-
+    _add_section_gap(doc)
     _add_section(doc, "Description and Scope", str(document.get("description_and_scope") or ""))
     _add_section(doc, "Out of Scope", str(document.get("out_of_scope") or ""))
     _add_section(doc, "Preconditions", str(document.get("preconditions") or ""))
@@ -1194,7 +1244,7 @@ def build_user_story_document_bytes(
     doc.add_paragraph(
         "List and describe each data field involved, including business rules and their expected behavior."
     )
-    field_table = doc.add_table(rows=3, cols=8)
+    field_table = doc.add_table(rows=2, cols=8)
     _set_table_style(field_table)
     field_headers = [
         "Element Name",
@@ -1221,10 +1271,11 @@ def build_user_story_document_bytes(
     ]
     for idx, value in enumerate(placeholders):
         field_table.cell(1, idx).text = value
-    field_table.cell(2, 0).text = str(document.get("field_description") or "N/A")
+    _add_structured_table_rows(field_table, document.get("field_description"), 8, start_row_index=2)
 
+    _add_section_gap(doc)
     _add_section_header(doc, "API Description*")
-    api_table = doc.add_table(rows=4, cols=6)
+    api_table = doc.add_table(rows=2, cols=6)
     _set_table_style(api_table)
     api_headers = [
         "Source System",
@@ -1247,8 +1298,9 @@ def build_user_story_document_bytes(
     ]
     for idx, value in enumerate(api_placeholders):
         api_table.cell(1, idx).text = value
-    api_table.cell(2, 0).text = str(document.get("api_description") or "N/A")
+    _add_structured_table_rows(api_table, document.get("api_description"), 6, start_row_index=2)
 
+    _add_section_gap(doc)
     _add_section(doc, "Acceptance Criteria", str(document.get("acceptance_criteria") or ""))
     _add_section(doc, "Test Scenarios", str(document.get("test_scenarios") or ""))
     _add_section(doc, "Dependencies", str(document.get("dependencies") or "N/A"))
@@ -1272,6 +1324,7 @@ def build_user_story_document_bytes(
     estimation_table.cell(2, 2).text = str(document.get("estimated_by") or "")
     estimation_table.cell(2, 3).text = _now_display_date().replace(".", "/")
 
+    _add_section_gap(doc)
     buffer = BytesIO()
     doc.save(buffer)
     buffer.seek(0)

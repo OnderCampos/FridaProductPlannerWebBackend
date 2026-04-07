@@ -13,12 +13,26 @@ JIRA_API_KEY = os.getenv("JIRA_API_KEY")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 
 FRONTEND_VERSION = os.getenv("FRONTEND_VERSION")
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL")
 
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 
 KNOWLEDGE_BASE_URL = os.getenv("KNOWLEDGE_BASE_URL")
 
 CHATBOT_KB_BASE_URL = os.getenv("CHATBOT_KB_BASE_URL")
+
+NOTIFICATION_API_URL = os.getenv(
+    "NOTIFICATION_API_URL",
+    "https://automationplatform.azurewebsites.net/api/mailnotification",
+)
+NOTIFICATION_SENDER_EMAIL = os.getenv(
+    "NOTIFICATION_SENDER_EMAIL",
+    "noreply@fridaplatform.online",
+)
+NOTIFICATION_SENDER_NAME = os.getenv(
+    "NOTIFICATION_SENDER_NAME",
+    "FridaPlatform",
+)
 
 logging.getLogger(__name__).info("Setting up Azure Chat OpenAI client...")
 

@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 PROJECTS_COLLECTION = "projects"
 PROJECT_KNOWLEDGE_COLLECTION = "project_knowledge"
+PROJECT_SPECS_COLLECTION = "project_specs"
 
 SPEC_READY_STATUS = "spec_ready"
 FINALIZED_STATUS = "finalized"
@@ -82,7 +83,7 @@ def _normalize_bullets(value: Any) -> List[str]:
 
 def _should_create_user_stories(creation_source: str) -> bool:
     source = (creation_source or "").strip().lower()
-    return source not in {"document", "file", "qa"}
+    return source not in {"qa"}
 
 
 def _normalize_extracted_epics(raw_epics: Any) -> List[Dict[str, Any]]:
@@ -283,6 +284,25 @@ def _mark_knowledge_finalized(project_id: str, now: str) -> None:
     # Mark the knowledge doc as finalized so subsequent calls can be handled idempotently.
     FIRESTORE_CLIENT.collection(PROJECT_KNOWLEDGE_COLLECTION).document(project_id).set(
         {"status": FINALIZED_STATUS, "updated_at": now},
+        merge=True,
+    )
+
+
+def _persist_spec_override(project_id: str, spec_text: str, now: str) -> None:
+    cleaned_spec = str(spec_text or "").strip()
+    FIRESTORE_CLIENT.collection(PROJECT_KNOWLEDGE_COLLECTION).document(project_id).set(
+        {
+            "spec_text": cleaned_spec,
+            "updated_at": now,
+        },
+        merge=True,
+    )
+    FIRESTORE_CLIENT.collection(PROJECT_SPECS_COLLECTION).document(project_id).set(
+        {
+            "project_id": project_id,
+            "spec_text": cleaned_spec,
+            "updated_at": now,
+        },
         merge=True,
     )
 
@@ -542,7 +562,12 @@ async def _finalize_from_epic_generation(
 # =====================
 # Public API
 # =====================
-async def finalize_project_creation(*, user_data: UserData, project_id: str) -> FinalizeProjectCreationData:
+async def finalize_project_creation(
+    *,
+    user_data: UserData,
+    project_id: str,
+    spec_text_override: Optional[str] = None,
+) -> FinalizeProjectCreationData:
     """
     Finalize a project's creation flow using the stored knowledge context.
 
@@ -564,6 +589,12 @@ async def finalize_project_creation(*, user_data: UserData, project_id: str) -> 
     if not _is_spec_ready(project, knowledge):
         status = str(project.get("creation_status") or "").strip() or "unknown"
         raise ProjectNotReadyError(status=status)
+
+    cleaned_override = str(spec_text_override or "").strip()
+    if cleaned_override:
+        now = current_timestamp_iso()
+        _persist_spec_override(project_id, cleaned_override, now)
+        knowledge["spec_text"] = cleaned_override
 
     qa_history = knowledge.get("qa_history") or []
     if not isinstance(qa_history, list):
@@ -599,10 +630,18 @@ async def finalize_project_creation(*, user_data: UserData, project_id: str) -> 
     )
 
 
-async def finalize_project_from_spec(user_data: UserData, project_id: str) -> FinalizeProjectCreationData:
+async def finalize_project_from_spec(
+    user_data: UserData,
+    project_id: str,
+    spec_text_override: Optional[str] = None,
+) -> FinalizeProjectCreationData:
     """
     Backwards-compatible name for the finalization step.
 
     Prefer `finalize_project_creation(...)` going forward.
     """
-    return await finalize_project_creation(user_data=user_data, project_id=project_id)
+    return await finalize_project_creation(
+        user_data=user_data,
+        project_id=project_id,
+        spec_text_override=spec_text_override,
+    )

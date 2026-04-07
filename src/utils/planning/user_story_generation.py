@@ -119,6 +119,22 @@ def _normalize_string_list(value: Any) -> List[str]:
     return items
 
 
+def _normalize_positive_float(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return numeric if numeric > 0 else 0.0
+
+
+def _normalize_story_points(value: Any) -> int:
+    try:
+        numeric = int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
+    return numeric if numeric > 0 else 0
+
+
 async def _enrich_acceptance_and_scope(
     *,
     user_data: UserData,
@@ -203,6 +219,183 @@ Return ONLY valid JSON with EXACTLY {len(payload)} items in the same order:
 
         next_story["acceptanceCriteria"] = acceptance
         next_story["outOfScope"] = out_scope
+        enriched.append(next_story)
+
+    return enriched
+
+
+async def enrich_user_story_details(
+    *,
+    user_data: UserData,
+    epic: Dict[str, Any],
+    project: Dict[str, Any],
+    stories: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not stories:
+        return stories
+
+    payload: List[Dict[str, str]] = []
+    for story in stories:
+        if not isinstance(story, dict):
+            continue
+        payload.append(
+            {
+                "user_story_id": str(story.get("user_story_id") or "").strip(),
+                "user_story": str(story.get("user_story") or "").strip(),
+                "description": str(story.get("description") or "").strip(),
+                "existing_effort_hours": str(story.get("effortHours") or story.get("effort_hours") or "").strip(),
+                "existing_story_points": str(story.get("storyPoints") or story.get("story_points") or "").strip(),
+            }
+        )
+
+    if len(payload) != len(stories):
+        return stories
+
+    prompt = f"""
+You are a senior product owner and QA analyst.
+
+For EACH user story below, generate detailed requirement content that can be stored directly in a planning tool.
+
+Return for every item:
+- effortHours: a positive numeric effort estimate in hours when one is missing or zero
+- storyPoints: a positive integer story point estimate when one is missing or zero
+- acceptanceCriteria: 3-6 short, testable bullet points
+- outOfScope: 1-4 bullet points (use ["N/A"] if truly none)
+- document: an object with these exact string keys:
+  - description_and_scope
+  - out_of_scope
+  - preconditions
+  - entry_points
+  - output_points
+  - success_flow
+  - wireframe_mockup
+  - field_description
+  - api_description
+  - acceptance_criteria
+  - test_scenarios
+  - benefits
+  - estimation_dev
+
+Rules:
+- Keep the same language as the input/context.
+- Be concrete and product-focused, not implementation-heavy.
+- Use concise bullet-style text where it helps readability.
+- If a detail is unknown, use "N/A".
+- If an existing estimate is already provided and greater than zero, preserve it unless it is clearly inconsistent.
+- acceptance_criteria in the document must align with acceptanceCriteria.
+- out_of_scope in the document must align with outOfScope.
+- test_scenarios should cover happy path, edge cases, and failure/validation cases when relevant.
+- estimation_dev should be a short estimate note, not a commitment.
+- Return ONLY valid JSON.
+
+Project context:
+{str(project.get("description") or "").strip()}
+
+Epic context:
+{json.dumps(epic, ensure_ascii=False)}
+
+User stories (same order must be preserved):
+{json.dumps(payload, ensure_ascii=False)}
+
+Expected JSON format:
+{{
+  "items": [
+    {{
+      "effortHours": 6,
+      "storyPoints": 3,
+      "acceptanceCriteria": ["..."],
+      "outOfScope": ["..."],
+      "document": {{
+        "description_and_scope": "...",
+        "out_of_scope": "...",
+        "preconditions": "...",
+        "entry_points": "...",
+        "output_points": "...",
+        "success_flow": "...",
+        "wireframe_mockup": "...",
+        "field_description": "...",
+        "api_description": "...",
+        "acceptance_criteria": "...",
+        "test_scenarios": "...",
+        "benefits": "...",
+        "estimation_dev": "..."
+      }}
+    }}
+  ]
+}}
+""".strip()
+
+    parsed: Any = None
+    try:
+        azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
+        raw = await azure.simple_completion(prompt)
+        parsed = parse_json_response(raw)
+    except Exception as exc:
+        logging.warning("Failed to enrich user story details: %s", exc)
+        parsed = {}
+
+    items = parsed.get("items") if isinstance(parsed, dict) else None
+    if not isinstance(items, list) or len(items) != len(stories):
+        return await _enrich_acceptance_and_scope(
+            user_data=user_data,
+            epic=epic,
+            project=project,
+            stories=stories,
+        )
+
+    enriched: List[Dict[str, Any]] = []
+    for story, extra in zip(stories, items):
+        next_story = dict(story) if isinstance(story, dict) else story
+        if not isinstance(next_story, dict) or not isinstance(extra, dict):
+            enriched.append(next_story)
+            continue
+
+        effort_hours = _normalize_positive_float(extra.get("effortHours"))
+        if effort_hours <= 0:
+            effort_hours = _normalize_positive_float(
+                next_story.get("effortHours", next_story.get("effort_hours"))
+            )
+
+        story_points = _normalize_story_points(extra.get("storyPoints"))
+        if story_points <= 0:
+            story_points = _normalize_story_points(
+                next_story.get("storyPoints", next_story.get("story_points"))
+            )
+
+        acceptance = _normalize_string_list(extra.get("acceptanceCriteria"))
+        if not acceptance:
+            acceptance = next_story.get("acceptanceCriteria") or ["Not provided."]
+
+        out_scope = _normalize_string_list(extra.get("outOfScope"))
+        if not out_scope:
+            out_scope = next_story.get("outOfScope") or ["N/A"]
+
+        raw_document = extra.get("document")
+        document = raw_document if isinstance(raw_document, dict) else {}
+
+        normalized_document = {
+            "description_and_scope": str(document.get("description_and_scope") or next_story.get("description") or "").strip(),
+            "out_of_scope": str(document.get("out_of_scope") or "\n".join(f"- {item}" for item in out_scope)).strip(),
+            "preconditions": str(document.get("preconditions") or "N/A").strip(),
+            "entry_points": str(document.get("entry_points") or "N/A").strip(),
+            "output_points": str(document.get("output_points") or "N/A").strip(),
+            "success_flow": str(document.get("success_flow") or "N/A").strip(),
+            "wireframe_mockup": str(document.get("wireframe_mockup") or "N/A").strip(),
+            "field_description": str(document.get("field_description") or "N/A").strip(),
+            "api_description": str(document.get("api_description") or "N/A").strip(),
+            "acceptance_criteria": str(document.get("acceptance_criteria") or "\n".join(f"- {item}" for item in acceptance)).strip(),
+            "test_scenarios": str(document.get("test_scenarios") or "N/A").strip(),
+            "benefits": str(document.get("benefits") or "N/A").strip(),
+            "estimation_dev": str(document.get("estimation_dev") or "N/A").strip(),
+        }
+
+        next_story["effortHours"] = effort_hours
+        if story_points > 0:
+            next_story["story_points"] = story_points
+            next_story["storyPoints"] = story_points
+        next_story["acceptanceCriteria"] = acceptance
+        next_story["outOfScope"] = out_scope
+        next_story["document"] = normalized_document
         enriched.append(next_story)
 
     return enriched
@@ -330,7 +523,7 @@ async def generate_user_stories(
             epic = graph_state.get("epic") or {}
             project = graph_state.get("project") or {}
             if isinstance(epic, dict) and isinstance(project, dict):
-                response = await _enrich_acceptance_and_scope(
+                response = await enrich_user_story_details(
                     user_data=user_data,
                     epic=epic,
                     project=project,

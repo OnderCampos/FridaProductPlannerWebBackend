@@ -12,6 +12,7 @@ from src.utils.ai.fsd_sections import FSD_SECTION_TITLES, dedupe_user_roles_pers
 
 PROJECT_KNOWLEDGE_COLLECTION = "project_knowledge"
 PROJECT_SPECS_COLLECTION = "project_specs"
+PROJECTS_COLLECTION = "projects"
 
 
 def _now_iso() -> str:
@@ -28,6 +29,18 @@ def _save_knowledge(project_id: str, payload: Dict[str, Any]) -> None:
         payload,
         merge=True,
     )
+
+
+def _update_project_creation_status(project_id: str, status: str) -> None:
+    try:
+        FIRESTORE_CLIENT.collection(PROJECTS_COLLECTION).document(project_id).update(
+            {
+                "creation_status": status,
+                "updated_at": _now_iso(),
+            }
+        )
+    except Exception:
+        logging.exception("Failed to update project creation status for clarification flow")
 
 
 def _build_context(description: str, qa_history: List[Dict[str, str]]) -> str:
@@ -203,25 +216,10 @@ async def start_clarification(
     description: str,
 ) -> ResponseModel:
     try:
-        existing = _load_knowledge(project_id)
-        if existing:
-            qa_history = existing.get("qa_history", []) or []
-            loop_count = int(existing.get("loop_count", 0) or 0)
-        else:
-            qa_history = []
-            loop_count = 0
-            _save_knowledge(
-                project_id,
-                {
-                    "project_id": project_id,
-                    "base_description": description,
-                    "qa_history": [],
-                    "loop_count": 0,
-                    "status": "questions",
-                    "created_at": _now_iso(),
-                    "updated_at": _now_iso(),
-                },
-            )
+        existing = _load_knowledge(project_id) or {}
+        qa_history = []
+        loop_count = 0
+        created_at = existing.get("created_at") or _now_iso()
 
         question_result = await _generate_questions(user_data, description, qa_history)
         complete = question_result.get("complete", False)
@@ -251,13 +249,18 @@ async def start_clarification(
         _save_knowledge(
             project_id,
             {
+                "project_id": project_id,
+                "base_description": description,
+                "qa_history": qa_history,
                 "loop_count": loop_count,
                 "status": status,
                 "last_questions": questions,
+                "created_at": created_at,
                 "updated_at": _now_iso(),
                 **spec_payload,
             },
         )
+        _update_project_creation_status(project_id, status)
 
         return ResponseModel(
             success=True,
@@ -326,6 +329,7 @@ async def submit_answers(
         _save_knowledge(
             project_id,
             {
+                "base_description": description,
                 "qa_history": qa_history,
                 "loop_count": loop_count,
                 "status": status,
@@ -334,6 +338,7 @@ async def submit_answers(
                 **spec_payload,
             },
         )
+        _update_project_creation_status(project_id, status)
 
         return ResponseModel(
             success=True,

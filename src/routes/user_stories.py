@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Path, Request, Uplo
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import List, Optional
 import secrets
+from pydantic import ValidationError
 
 from src.schemas.resources_request import (
     GenerateAnalysisRequest,
@@ -41,6 +42,7 @@ from src.utils.planning.user_stories import (
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
 from src.utils.authz.permissions import get_project_access
+from src.utils.planning.assignees import build_member_lookup, normalize_assignee_fields
 from src.utils.planning.members import get_member_by_id
 from src.utils.planning.subtask_generation import (
     generate_subtasks_for_user_story,
@@ -58,13 +60,15 @@ from src.utils.ai.user_story_creation_qa import (
     submit_user_story_qa_answers,
 )
 from src.utils.ai.user_story_expansion import expand_user_stories
+from src.services.workflows.user_story_document_generation.orchestrator import (
+    start_user_story_document_draft,
+    submit_user_story_document_answers,
+)
 from src.utils.documents.user_story_document import (
     DOCX_MEDIA_TYPE,
     build_user_story_document_download_response,
     build_user_story_document_download_response_with_wireframes,
     build_user_story_document_format_test_bytes,
-    start_user_story_document_draft,
-    submit_user_story_document_answers,
     upload_user_story_document_wireframe_images,
 )
 
@@ -76,6 +80,46 @@ def _ensure_user_story_id(value: Optional[str]) -> str:
     if raw:
         return raw
     return f"US-{secrets.token_hex(3).upper()}"
+
+
+def _build_story_assignee_update(project_id: str, req: UpdateUserStoryAssigneeRequest) -> dict:
+    update_data: dict = {}
+
+    if req.assigneeId:
+        member = get_member_by_id(project_id, req.assigneeId) if project_id else None
+        if not member:
+            raise HTTPException(status_code=404, detail="Member not found")
+
+        update_data["assigneeId"] = req.assigneeId
+        update_data["assignee"] = member.get("name")
+        update_data["assigned_to"] = req.assigneeId
+        if member.get("email"):
+            update_data["assigneeEmail"] = member.get("email")
+        return update_data
+
+    assignee_value = str(req.assignee or "").strip()
+    if not assignee_value or assignee_value.lower() == "unassigned":
+        return {
+            "assignee": "",
+            "assigneeId": None,
+            "assigned_to": None,
+            "assigneeEmail": None,
+        }
+
+    member_lookup = build_member_lookup(project_id)
+    resolved = normalize_assignee_fields({"assignee": assignee_value}, member_lookup)
+
+    update_data["assignee"] = resolved.get("assignee") or assignee_value
+    if resolved.get("assigneeId"):
+        update_data["assigneeId"] = resolved.get("assigneeId")
+    if resolved.get("assignee_id"):
+        update_data["assigned_to"] = resolved.get("assignee_id")
+    if resolved.get("assigneeEmail"):
+        update_data["assigneeEmail"] = resolved.get("assigneeEmail")
+    elif resolved.get("assignee_email"):
+        update_data["assigneeEmail"] = resolved.get("assignee_email")
+
+    return update_data
 
 
 def _require_project_lead(project_id: str, user_data):
@@ -108,6 +152,44 @@ def _attach_story_dependencies(user_stories, dependencies):
         next_story["dependencies"] = depends_on
         merged.append(next_story)
     return merged
+
+
+async def _parse_expand_user_stories_request(request: Request) -> tuple[ExpandUserStoriesRequest, List[UploadFile]]:
+    content_type = str(request.headers.get("content-type") or "").lower()
+    files: List[UploadFile] = []
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        raw_payload = {
+            "epic_id": form.get("epic_id"),
+            "instruction": form.get("instruction"),
+            "max_new_stories": form.get("max_new_stories"),
+        }
+        files = [
+            item
+            for item in form.getlist("files")
+            if isinstance(item, UploadFile)
+        ]
+    else:
+        try:
+            raw_payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Invalid request body") from exc
+        if not isinstance(raw_payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid request body")
+
+    raw_max_new_stories = raw_payload.get("max_new_stories")
+
+    payload = {
+        "epic_id": str(raw_payload.get("epic_id") or "").strip(),
+        "instruction": str(raw_payload.get("instruction") or "").strip() or None,
+        "max_new_stories": None if raw_max_new_stories in {None, ""} else raw_max_new_stories,
+    }
+
+    try:
+        return ExpandUserStoriesRequest(**payload), files
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail="Invalid expand request payload") from exc
 
 @router.post(
     "/user-story-generation-step-1/",
@@ -564,9 +646,10 @@ async def download_user_story_document_format_test_route(
     response_description="Expand user stories for an epic using AI (agentic).",
 )
 async def expand_user_stories_route(
-    req: ExpandUserStoriesRequest,
+    request: Request,
     user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
+    req, files = await _parse_expand_user_stories_request(request)
     if not req or not (req.epic_id or "").strip():
         raise HTTPException(status_code=400, detail="epic_id is required")
 
@@ -592,6 +675,7 @@ async def expand_user_stories_route(
         existing_stories=existing_stories,
         instruction=str(req.instruction or ""),
         max_new_stories=int(req.max_new_stories or 5),
+        image_files=files,
     )
     if not expanded_response.success:
         return JSONResponse(status_code=400, content=expanded_response.dict())
@@ -682,25 +766,16 @@ async def update_user_story_assignee_route(
             raise HTTPException(status_code=404, detail="Epic not found")
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
-        update_data = {}
-        if req.assigneeId:
-            epic_id = story_response.data.get("epic_id")
-            epic_response = get_epic_by_id(epic_id) if epic_id else None
-            if not epic_response or not epic_response.success:
-                raise HTTPException(status_code=404, detail="Epic not found")
+        project_id = epic_response.data.get("project_id")
+        update_data = _build_story_assignee_update(project_id, req)
 
-            project_id = epic_response.data.get("project_id")
-            member = get_member_by_id(project_id, req.assigneeId) if project_id else None
-            if not member:
-                raise HTTPException(status_code=404, detail="Member not found")
-
-            update_data["assigneeId"] = req.assigneeId
-            update_data["assignee"] = member.get("name")
-            update_data["assigned_to"] = req.assigneeId
-        elif req.assignee:
-            update_data["assignee"] = req.assignee
-
-        response = update_user_story(story_id, user_data.get_user_id(), update_data)
+        response = update_user_story(
+            story_id,
+            user_data.get_user_id(),
+            update_data,
+            user_email=user_data.get_email(),
+            user_name=user_data.get_user_name(),
+        )
 
         status_code = 200
         if not response.success:
@@ -756,25 +831,16 @@ async def update_user_story_assignee_name_route(
             raise HTTPException(status_code=404, detail="Epic not found")
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
-        update_data = {}
-        if req.assigneeId:
-            epic_id = story_response.data.get("epic_id")
-            epic_response = get_epic_by_id(epic_id) if epic_id else None
-            if not epic_response or not epic_response.success:
-                raise HTTPException(status_code=404, detail="Epic not found")
+        project_id = epic_response.data.get("project_id")
+        update_data = _build_story_assignee_update(project_id, req)
 
-            project_id = epic_response.data.get("project_id")
-            member = get_member_by_id(project_id, req.assigneeId) if project_id else None
-            if not member:
-                raise HTTPException(status_code=404, detail="Member not found")
-
-            update_data["assigneeId"] = req.assigneeId
-            update_data["assignee"] = member.get("name")
-            update_data["assigned_to"] = req.assigneeId
-        elif req.assignee:
-            update_data["assignee"] = req.assignee
-
-        response = update_user_story(story_id, user_data.get_user_id(), update_data)
+        response = update_user_story(
+            story_id,
+            user_data.get_user_id(),
+            update_data,
+            user_email=user_data.get_email(),
+            user_name=user_data.get_user_name(),
+        )
         if not response.success:
             status_code = 200
             if "not found" in response.message.lower():
@@ -794,6 +860,8 @@ async def update_user_story_assignee_name_route(
         }
         if "assigneeId" in update_data or response.data.get("assigneeId"):
             assignee_payload["assigneeId"] = update_data.get("assigneeId", response.data.get("assigneeId"))
+        if response.data.get("assignment_notification") is not None:
+            assignee_payload["assignment_notification"] = response.data.get("assignment_notification")
 
         return JSONResponse(
             status_code=200,
@@ -841,7 +909,13 @@ async def update_user_story_fields_route(
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
         update_data = await request.json()
-        response = update_user_story_fields(story_id, user_data.get_user_id(), update_data)
+        response = update_user_story_fields(
+            story_id,
+            user_data.get_user_id(),
+            update_data,
+            user_email=user_data.get_email(),
+            user_name=user_data.get_user_name(),
+        )
 
         if not response.success:
             status_code = 200
