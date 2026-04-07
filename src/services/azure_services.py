@@ -9,19 +9,22 @@ from typing import Dict, List, Tuple
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # Local Application Imports
-from src.utils.llmops_utils import log_to_llmops
-from src.utils.logging import add_request_log
-from src.utils.team import get_team_name
-from src.utils.validation_utils import has_expected_epic_structure, get_code_block
+from src.utils.ai.llmops_utils import log_to_llmops
+from src.utils.core.logging import add_request_log
+from src.utils.planning.team import get_team_name
+from src.utils.core.validation_utils import has_expected_epic_structure, get_code_block
+from src.utils.ai.llm_graph import invoke_model_with_graph
 from src.services.setup.variables_setup import (
     gpt40_client,
     gpt40_mini_client,
     LLMOPS_API_KEY,
     MODEL,
 )
+from src.services.setup.language_setup import build_llm_language_system_prompt, get_default_llm_language
 from src.utils.knowledge_bases import schemas, general
 from src.utils.knowledge_bases.embeddings import SofttekOpenAIEmbeddings
 from src.schemas.function_response import FunctionResponse
+import logging
 import sys
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -125,6 +128,7 @@ class AzureChatService:
         self.team_id = user_data.get_team_id()
         self.user_email = user_data.get_email()
         self.knowledge_base_id = knowledge_base_id
+        self.response_language = get_default_llm_language()
 
     def create_text_message(self, text: str):
         """
@@ -232,14 +236,24 @@ class AzureChatService:
 
         global_start = perf_counter_ns()
 
+        language_prompt = build_llm_language_system_prompt(self.response_language)
+        if language_prompt:
+            language_message = SystemMessage(content=language_prompt)
+            insert_at = 0
+            while insert_at < len(messages_list) and isinstance(messages_list[insert_at], SystemMessage):
+                insert_at += 1
+            messages_list = list(messages_list)
+            messages_list.insert(insert_at, language_message)
+
         # Invoke the chat service
+        logger = logging.getLogger(__name__)
         if use_images:
-            print("Using GPT-4.0 model with image support")
+            logger.info("Using GPT-4.0 model with image support")
             client = gpt40_client
         else:
-            print("Using GPT-4.0 Mini model")
+            logger.info("Using GPT-4.0 Mini model")
             client = gpt40_mini_client
-        response = client.invoke(messages_list)
+        response = invoke_model_with_graph(client=client, messages=messages_list)
 
         prompt_tokens = response.response_metadata["token_usage"]["prompt_tokens"]
         completion_tokens = response.response_metadata["token_usage"][
@@ -259,19 +273,19 @@ class AzureChatService:
             # print(f"Logging to LLMOPS: {messages_list}, {response.content}, {prompt_tokens}, {completion_tokens}, {global_start}")
             team_name = get_team_name(self.team_id)
         except Exception as e:
-            print(f"Error getting team name: {e}")
+            logger.warning("Error getting team name: %s", e)
             team_name = "Unknown Team"
 
         additional_kwargs = {
             "team_name": team_name,
         }
-        print(f"Logging to LLMOPS with additional kwargs: {additional_kwargs}")
+        logger.debug("Logging to LLMOPS with additional kwargs: %s", additional_kwargs)
         try:
             prompt = ""
             for message in messages_list:
                 prompt += f" {message.content}\n"
 
-            print(f"Final prompt for LLMOPS logging: {prompt}")
+            logger.debug("Final prompt for LLMOPS logging: %s", prompt)
             log_to_llmops(
                 prompt=prompt,
                 response=response.content,
@@ -289,7 +303,7 @@ class AzureChatService:
                 team_id=self.team_id,
             )
         except Exception as e:
-            print(f"Error logging to LLMOPS: {e}")
+            logger.warning("Error logging to LLMOPS: %s", e)
         return response.content
 
     async def completion_without_knowledge_base(
@@ -304,6 +318,19 @@ class AzureChatService:
 
     async def simple_completion(self, prompt: str):
         return self.chat_completion([HumanMessage(content=prompt)])
+
+    async def simple_completion_with_images(self, prompt: str, images: List[str]):
+        image_messages = [
+            ImageMessage(image_data=image).to_dict()
+            for image in (images or [])
+            if str(image or "").strip()
+        ]
+        if not image_messages:
+            return await self.simple_completion(prompt)
+        return self.chat_completion(
+            [HumanMessage(content=[TextMessage(text=prompt).to_dict()] + image_messages)],
+            use_images=True,
+        )
 
     async def simple_kb_completion(self, prompt: str) -> FunctionResponse:
 
@@ -326,9 +353,11 @@ class AzureChatService:
                 top_k=6,
             )
 
-            print("Knowledge base response:", kb_response)
+            logging.getLogger(__name__).debug("Knowledge base response: %s", kb_response)
             if kb_response.is_error():
-                print("Knowledge base error:", kb_response.get_error_message())
+                logging.getLogger(__name__).warning(
+                    "Knowledge base error: %s", kb_response.get_error_message()
+                )
                 return kb_response
 
             context, _sources = kb_response.get_data()
@@ -420,7 +449,9 @@ class AzureChatService:
                 expected_keys=expected_keys,
                 return_full_response=return_full_response
             )
-            print("Response from chat model with knowledge base:", response)
+            logging.getLogger(__name__).debug(
+                "Response from chat model with knowledge base: %s", response
+            )
 
             return FunctionResponse(status=True, data=response)
 
@@ -447,5 +478,5 @@ class AzureChatService:
             embedding = embeddings_model.embed(prompt)
             return embedding
         except Exception as e:
-            print(f"Error embedding text: {str(e)}")
+            logging.getLogger(__name__).warning("Error embedding text: %s", str(e))
         

@@ -1,27 +1,50 @@
 
-from fastapi import APIRouter, HTTPException, Header, Path, Request
-from fastapi.responses import JSONResponse
-from typing import Optional
+import os
+from io import BytesIO
+from urllib.parse import quote
+
+from fastapi import APIRouter, Depends, File, HTTPException, Path, Request, UploadFile
+from fastapi.responses import JSONResponse, StreamingResponse
+from typing import List, Optional
+import secrets
+from pydantic import ValidationError
 
 from src.schemas.resources_request import (
     GenerateAnalysisRequest,
     GenerateUserStoriesRequest,
     GetUserStoriesByEpicRequest,
     UpdateUserStoryAssigneeRequest,
-    GenerateUserStoryDependenciesRequest
+    GenerateUserStoryDependenciesRequest,
+    CreateUserStoryManualRequest,
+    StartUserStoryQaRequest,
+    UserStoryQaAnswersRequest,
+    AcceptUserStoryQaRequest,
+    ExpandUserStoriesRequest,
+    StartUserStoryDocumentRequest,
+    UserStoryDocumentAnswersRequest,
 )
 from src.schemas.response import ResponseModel
-from src.utils.auth import validate_user_and_get_data
-from src.utils.user_story_generation import (
+from src.schemas.user_data import UserData
+from src.utils.authz.auth import get_current_user
+from src.utils.planning.user_story_generation import (
     generate_analysis,
     generate_user_stories
 )
-from src.utils.user_story_dependencies import generate_user_story_dependencies
-from src.utils.user_stories import get_user_story_by_id, update_user_story, update_user_story_fields
-from src.utils.epics import get_epic_by_id
-from src.utils.permissions import get_project_access
-from src.utils.members import get_member_by_id
-from src.utils.subtask_generation import (
+from src.utils.planning.user_story_dependencies import generate_user_story_dependencies
+from src.utils.planning.user_stories import (
+    create_multiple_user_stories,
+    create_user_story,
+    get_user_stories_by_epic,
+    get_user_story_by_id,
+    update_user_story,
+    update_user_story_fields,
+)
+from src.utils.planning.epics import get_epic_by_id
+from src.utils.planning.projects import get_project_by_id
+from src.utils.authz.permissions import get_project_access
+from src.utils.planning.assignees import build_member_lookup, normalize_assignee_fields
+from src.utils.planning.members import get_member_by_id
+from src.utils.planning.subtask_generation import (
     generate_subtasks_for_user_story,
     create_subtask_for_user_story,
     get_subtasks_by_user_story,
@@ -30,7 +53,73 @@ from src.utils.subtask_generation import (
     delete_subtasks_by_user_story
 )
 
+from src.utils.ai.user_story_creation_qa import (
+    delete_user_story_draft,
+    get_user_story_draft,
+    start_user_story_qa,
+    submit_user_story_qa_answers,
+)
+from src.utils.ai.user_story_expansion import expand_user_stories
+from src.services.workflows.user_story_document_generation.orchestrator import (
+    start_user_story_document_draft,
+    submit_user_story_document_answers,
+)
+from src.utils.documents.user_story_document import (
+    DOCX_MEDIA_TYPE,
+    build_user_story_document_download_response,
+    build_user_story_document_download_response_with_wireframes,
+    build_user_story_document_format_test_bytes,
+    upload_user_story_document_wireframe_images,
+)
+
 router = APIRouter()
+
+
+def _ensure_user_story_id(value: Optional[str]) -> str:
+    raw = str(value or "").strip()
+    if raw:
+        return raw
+    return f"US-{secrets.token_hex(3).upper()}"
+
+
+def _build_story_assignee_update(project_id: str, req: UpdateUserStoryAssigneeRequest) -> dict:
+    update_data: dict = {}
+
+    if req.assigneeId:
+        member = get_member_by_id(project_id, req.assigneeId) if project_id else None
+        if not member:
+            raise HTTPException(status_code=404, detail="Member not found")
+
+        update_data["assigneeId"] = req.assigneeId
+        update_data["assignee"] = member.get("name")
+        update_data["assigned_to"] = req.assigneeId
+        if member.get("email"):
+            update_data["assigneeEmail"] = member.get("email")
+        return update_data
+
+    assignee_value = str(req.assignee or "").strip()
+    if not assignee_value or assignee_value.lower() == "unassigned":
+        return {
+            "assignee": "",
+            "assigneeId": None,
+            "assigned_to": None,
+            "assigneeEmail": None,
+        }
+
+    member_lookup = build_member_lookup(project_id)
+    resolved = normalize_assignee_fields({"assignee": assignee_value}, member_lookup)
+
+    update_data["assignee"] = resolved.get("assignee") or assignee_value
+    if resolved.get("assigneeId"):
+        update_data["assigneeId"] = resolved.get("assigneeId")
+    if resolved.get("assignee_id"):
+        update_data["assigned_to"] = resolved.get("assignee_id")
+    if resolved.get("assigneeEmail"):
+        update_data["assigneeEmail"] = resolved.get("assigneeEmail")
+    elif resolved.get("assignee_email"):
+        update_data["assigneeEmail"] = resolved.get("assignee_email")
+
+    return update_data
 
 
 def _require_project_lead(project_id: str, user_data):
@@ -41,13 +130,74 @@ def _require_project_lead(project_id: str, user_data):
     if not access.data.get("is_lead"):
         raise HTTPException(status_code=403, detail="Forbidden: Team members cannot perform this action")
 
+def _attach_story_dependencies(user_stories, dependencies):
+    if not isinstance(user_stories, list) or not isinstance(dependencies, list):
+        return user_stories
+
+    dep_map = {}
+    for item in dependencies:
+        story_id = item.get("story_id")
+        if story_id:
+            dep_map[str(story_id)] = item.get("depends_on", [])
+
+    merged = []
+    for story in user_stories:
+        if not isinstance(story, dict):
+            merged.append(story)
+            continue
+        story_id = str(story.get("id") or "")
+        user_story_id = str(story.get("user_story_id") or "")
+        depends_on = dep_map.get(story_id) or dep_map.get(user_story_id) or story.get("dependencies") or []
+        next_story = dict(story)
+        next_story["dependencies"] = depends_on
+        merged.append(next_story)
+    return merged
+
+
+async def _parse_expand_user_stories_request(request: Request) -> tuple[ExpandUserStoriesRequest, List[UploadFile]]:
+    content_type = str(request.headers.get("content-type") or "").lower()
+    files: List[UploadFile] = []
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        raw_payload = {
+            "epic_id": form.get("epic_id"),
+            "instruction": form.get("instruction"),
+            "max_new_stories": form.get("max_new_stories"),
+        }
+        files = [
+            item
+            for item in form.getlist("files")
+            if isinstance(item, UploadFile)
+        ]
+    else:
+        try:
+            raw_payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Invalid request body") from exc
+        if not isinstance(raw_payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid request body")
+
+    raw_max_new_stories = raw_payload.get("max_new_stories")
+
+    payload = {
+        "epic_id": str(raw_payload.get("epic_id") or "").strip(),
+        "instruction": str(raw_payload.get("instruction") or "").strip() or None,
+        "max_new_stories": None if raw_max_new_stories in {None, ""} else raw_max_new_stories,
+    }
+
+    try:
+        return ExpandUserStoriesRequest(**payload), files
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail="Invalid expand request payload") from exc
+
 @router.post(
     "/user-story-generation-step-1/",
     response_description="Step 1: Analyzes epic and generates main functionalities and user identification.",
 )
 async def generate_analysis_route(
     req: GenerateAnalysisRequest,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Step 1 of user story generation: Analyzes the epic and project description to identify:
@@ -56,27 +206,12 @@ async def generate_analysis_route(
     - Key workflows
     This prepares the foundation for detailed user story generation.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     try:
         epic_response = get_epic_by_id(req.epic_id)
         if not epic_response.success:
             raise HTTPException(status_code=404, detail="Epic not found")
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
-        print("[DEBUG] Step 1: Generating analysis for user story creation")
         response = await generate_analysis(
             user_data=user_data,
             epic_id=req.epic_id,
@@ -85,8 +220,10 @@ async def generate_analysis_route(
             status_code=200 if response.success else 400,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post(
@@ -95,7 +232,7 @@ async def generate_analysis_route(
 )
 async def generate_user_stories_route(
     req: GenerateUserStoriesRequest,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Step 2 of user story generation: Creates detailed user stories based on:
@@ -104,27 +241,12 @@ async def generate_user_stories_route(
     - Project context and requirements
     This generates the final user stories ready for development.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detaiccl="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     try:
         epic_response = get_epic_by_id(req.epic_id)
         if not epic_response.success:
             raise HTTPException(status_code=404, detail="Epic not found")
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
-        print("[DEBUG] Step 2: Generating detailed user stories")
         response = await generate_user_stories(
             user_data=user_data,
             epic_id=req.epic_id,
@@ -135,9 +257,74 @@ async def generate_user_stories_route(
             status_code=200 if response.success else 400,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
+@router.post(
+    "/user-story-generation/",
+    response_description="Single-step: Analyze epic, brainstorm, synthesize, and return user stories.",
+)
+async def generate_user_stories_single_route(
+    req: GenerateUserStoriesRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    """
+    Single-step user story generation using the agent graph:
+    - Analyze epic
+    - Brainstorm user stories
+    - Synthesize and dedupe
+    - Generate dependencies
+    Returns the same data structure as Step 2.
+    """
+    try:
+        epic_response = get_epic_by_id(req.epic_id)
+        if not epic_response.success:
+            raise HTTPException(status_code=404, detail="Epic not found")
+        _require_project_lead(epic_response.data.get("project_id"), user_data)
+
+        response = await generate_user_stories(
+            user_data=user_data,
+            epic_id=req.epic_id,
+            functionality=req.functionality,
+            functionalities=req.functionalities,
+        )
+
+        if not response.success:
+            return JSONResponse(
+                status_code=400,
+                content=response.dict(),
+            )
+
+        data = response.data if isinstance(response.data, dict) else {}
+        user_stories = data.get("user_stories") if isinstance(data, dict) else None
+
+        if isinstance(user_stories, list) and user_stories:
+            dependencies_response = await generate_user_story_dependencies(
+                user_data=user_data,
+                epic_id=req.epic_id,
+                user_stories=user_stories,
+            )
+
+            if dependencies_response.success and dependencies_response.data:
+                dependencies = dependencies_response.data.get("dependencies", [])
+                data["user_stories"] = _attach_story_dependencies(user_stories, dependencies)
+            else:
+                data["user_stories"] = user_stories
+
+        return JSONResponse(
+            status_code=200,
+            content=ResponseModel(
+                success=True,
+                message=response.message,
+                data=data,
+            ).dict(),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.post(
     "/user-story-dependencies/",
@@ -145,25 +332,11 @@ async def generate_user_stories_route(
 )
 async def generate_user_story_dependencies_route(
     req: GenerateUserStoryDependenciesRequest,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Generates dependencies between user stories for an epic.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     if not req.user_stories:
         raise HTTPException(status_code=400, detail="user_stories is required")
 
@@ -185,8 +358,353 @@ async def generate_user_story_dependencies_route(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post(
+    "/manual/",
+    response_description="Create a user story manually for an epic.",
+)
+async def create_user_story_manual_route(
+    req: CreateUserStoryManualRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not (req.epic_id or "").strip():
+        raise HTTPException(status_code=400, detail="epic_id is required")
+    if not (req.user_story or "").strip():
+        raise HTTPException(status_code=400, detail="user_story is required")
+    if not (req.description or "").strip():
+        raise HTTPException(status_code=400, detail="description is required")
+
+    epic_response = get_epic_by_id(req.epic_id)
+    if not epic_response.success:
+        raise HTTPException(status_code=404, detail="Epic not found")
+    project_id = epic_response.data.get("project_id")
+    _require_project_lead(project_id, user_data)
+
+    payload = req.model_dump(exclude={"epic_id"})
+    payload["epic"] = epic_response.data.get("name") or epic_response.data.get("epic") or ""
+    payload["user_story_id"] = _ensure_user_story_id(payload.get("user_story_id"))
+    payload["dependencies"] = payload.get("dependencies") or []
+
+    response = create_user_story(req.epic_id, user_data.get_user_id(), payload)
+    return JSONResponse(
+        status_code=201 if response.success else 400,
+        content=response.dict(),
+    )
+
+
+@router.post(
+    "/qa/start/",
+    response_description="Start Q&A flow to create a single user story.",
+)
+async def start_user_story_qa_route(
+    req: StartUserStoryQaRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not (req.epic_id or "").strip():
+        raise HTTPException(status_code=400, detail="epic_id is required")
+
+    epic_response = get_epic_by_id(req.epic_id)
+    if not epic_response.success:
+        raise HTTPException(status_code=404, detail="Epic not found")
+    project_id = epic_response.data.get("project_id")
+    _require_project_lead(project_id, user_data)
+
+    project_response = get_project_by_id(project_id, user_data.get_user_id(), allow_member=True, user_email=user_data.get_email())
+    project_description = ""
+    if project_response and project_response.success and project_response.data:
+        project_description = str(project_response.data.get("description") or "")
+
+    existing = get_user_stories_by_epic(req.epic_id, user_data.get_user_id(), allow_member=True)
+    existing_stories = existing.data if existing and existing.success and isinstance(existing.data, list) else []
+
+    response = await start_user_story_qa(
+        user_data=user_data,
+        epic_id=req.epic_id,
+        project_description=project_description,
+        epic_name=str(epic_response.data.get("name") or ""),
+        epic_description=str(epic_response.data.get("description") or ""),
+        goal=str(req.goal or ""),
+        existing_stories=existing_stories,
+    )
+    return JSONResponse(status_code=200 if response.success else 400, content=response.dict())
+
+
+@router.post(
+    "/qa/answer/",
+    response_description="Submit answers for a user story Q&A draft.",
+)
+async def submit_user_story_qa_answers_route(
+    req: UserStoryQaAnswersRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not (req.draft_id or "").strip():
+        raise HTTPException(status_code=400, detail="draft_id is required")
+
+    draft_response = get_user_story_draft(req.draft_id)
+    if not draft_response.success:
+        return JSONResponse(status_code=404, content=draft_response.dict())
+
+    epic_id = str((draft_response.data or {}).get("epic_id") or "").strip()
+    if not epic_id:
+        raise HTTPException(status_code=400, detail="Draft is missing epic_id")
+
+    epic_response = get_epic_by_id(epic_id)
+    if not epic_response.success:
+        raise HTTPException(status_code=404, detail="Epic not found")
+    project_id = epic_response.data.get("project_id")
+    _require_project_lead(project_id, user_data)
+
+    existing = get_user_stories_by_epic(epic_id, user_data.get_user_id(), allow_member=True)
+    existing_stories = existing.data if existing and existing.success and isinstance(existing.data, list) else []
+
+    answers_payload = [ans.model_dump() for ans in (req.answers or [])]
+    response = await submit_user_story_qa_answers(
+        user_data=user_data,
+        draft_id=req.draft_id,
+        answers=answers_payload,
+        existing_stories=existing_stories,
+    )
+    return JSONResponse(status_code=200 if response.success else 400, content=response.dict())
+
+
+@router.post(
+    "/qa/accept/",
+    response_description="Accept a user story draft and create the story.",
+)
+async def accept_user_story_qa_route(
+    req: AcceptUserStoryQaRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not (req.draft_id or "").strip():
+        raise HTTPException(status_code=400, detail="draft_id is required")
+
+    draft_response = get_user_story_draft(req.draft_id)
+    if not draft_response.success:
+        return JSONResponse(status_code=404, content=draft_response.dict())
+
+    draft_data = draft_response.data or {}
+    status = str(draft_data.get("status") or "")
+    if status != "story_ready":
+        return JSONResponse(
+            status_code=409,
+            content=ResponseModel(success=False, message="Draft is not ready to accept", data=None).dict(),
+        )
+
+    epic_id = str(draft_data.get("epic_id") or "").strip()
+    if not epic_id:
+        raise HTTPException(status_code=400, detail="Draft is missing epic_id")
+
+    epic_response = get_epic_by_id(epic_id)
+    if not epic_response.success:
+        raise HTTPException(status_code=404, detail="Epic not found")
+    project_id = epic_response.data.get("project_id")
+    _require_project_lead(project_id, user_data)
+
+    story_draft = draft_data.get("story_draft") or {}
+    if not isinstance(story_draft, dict):
+        story_draft = {}
+
+    payload = {
+        "epic": str(draft_data.get("epic_name") or epic_response.data.get("name") or ""),
+        "user_story": str(story_draft.get("user_story") or "").strip(),
+        "description": str(story_draft.get("description") or "").strip(),
+        "user_story_id": _ensure_user_story_id(story_draft.get("user_story_id")),
+        "order": story_draft.get("order", 0),
+        "dependencies": story_draft.get("dependencies") or [],
+        "effortHours": story_draft.get("effortHours", 0),
+        "story_points": story_draft.get("story_points", 0),
+    }
+    if isinstance(story_draft.get("acceptanceCriteria"), list):
+        payload["acceptanceCriteria"] = story_draft.get("acceptanceCriteria")
+    if isinstance(story_draft.get("outOfScope"), list):
+        payload["outOfScope"] = story_draft.get("outOfScope")
+    if isinstance(story_draft.get("document"), dict):
+        payload["document"] = story_draft.get("document")
+    if not payload["user_story"] or not payload["description"]:
+        return JSONResponse(
+            status_code=400,
+            content=ResponseModel(success=False, message="Draft is missing required fields", data=None).dict(),
+        )
+
+    response = create_user_story(epic_id, user_data.get_user_id(), payload)
+    if response.success:
+        delete_user_story_draft(req.draft_id)
+        return JSONResponse(status_code=201, content=response.dict())
+    return JSONResponse(status_code=400, content=response.dict())
+
+
+@router.post(
+    "/document/start/",
+    response_description="Start document generation for a user story (may ask clarification questions).",
+)
+async def start_user_story_document_route(
+    req: StartUserStoryDocumentRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not (req.story_id or "").strip():
+        raise HTTPException(status_code=400, detail="story_id is required")
+
+    response = await start_user_story_document_draft(user_data=user_data, story_id=req.story_id)
+    return JSONResponse(status_code=200 if response.success else 400, content=response.dict())
+
+
+@router.post(
+    "/document/answer/",
+    response_description="Submit document clarification answers for a user story document draft.",
+)
+async def submit_user_story_document_answers_route(
+    req: UserStoryDocumentAnswersRequest,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not req or not (req.draft_id or "").strip():
+        raise HTTPException(status_code=400, detail="draft_id is required")
+
+    answers_payload = [ans.model_dump() for ans in (req.answers or [])]
+    response = await submit_user_story_document_answers(
+        user_data=user_data,
+        draft_id=req.draft_id,
+        answers=answers_payload,
+    )
+    return JSONResponse(status_code=200 if response.success else 400, content=response.dict())
+
+
+@router.post(
+    "/document/upload/{draft_id}/wireframe/",
+    response_description="Upload wireframe/mockup images for a user story document draft.",
+)
+async def upload_user_story_document_wireframe_route(
+    draft_id: str = Path(..., description="The user story document draft ID"),
+    files: List[UploadFile] = File(..., description="One or more image files (PNG/JPG)."),
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    if not (draft_id or "").strip():
+        raise HTTPException(status_code=400, detail="draft_id is required")
+    response = await upload_user_story_document_wireframe_images(user_data=user_data, draft_id=draft_id, files=files)
+    return JSONResponse(status_code=200 if response.success else 400, content=response.dict())
+
+
+@router.get(
+    "/document/download/{draft_id}/",
+    response_description="Download a generated Word document (DOCX) for a user story draft.",
+)
+async def download_user_story_document_route(
+    draft_id: str = Path(..., description="The user story document draft ID"),
+    user_data: UserData = Depends(get_current_user),
+):
+    if not (draft_id or "").strip():
+        raise HTTPException(status_code=400, detail="draft_id is required")
+    return await build_user_story_document_download_response(user_data=user_data, draft_id=draft_id)
+
+
+@router.post(
+    "/document/download/{draft_id}/wireframe/",
+    response_description="Download a generated Word document (DOCX) embedding wireframe images from this request (no storage).",
+)
+async def download_user_story_document_with_wireframes_route(
+    draft_id: str = Path(..., description="The user story document draft ID"),
+    files: List[UploadFile] = File(..., description="One or more image files (PNG/JPG)."),
+    user_data: UserData = Depends(get_current_user),
+):
+    if not (draft_id or "").strip():
+        raise HTTPException(status_code=400, detail="draft_id is required")
+    return await build_user_story_document_download_response_with_wireframes(
+        user_data=user_data,
+        draft_id=draft_id,
+        files=files,
+    )
+
+
+def _docx_format_test_enabled() -> bool:
+    value = str(os.getenv("ENABLE_DOCX_FORMAT_TEST") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+@router.get(
+    "/document/test/",
+    response_description="Download a fast format-test DOCX (feature-flagged).",
+)
+async def download_user_story_document_format_test_route(
+    user_data: UserData = Depends(get_current_user),
+):
+    if not _docx_format_test_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    doc_bytes, filename = build_user_story_document_format_test_bytes()
+    encoded = quote(filename)
+    return StreamingResponse(
+        BytesIO(doc_bytes),
+        media_type=DOCX_MEDIA_TYPE,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded}"},
+    )
+
+
+@router.post(
+    "/expand/",
+    response_description="Expand user stories for an epic using AI (agentic).",
+)
+async def expand_user_stories_route(
+    request: Request,
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    req, files = await _parse_expand_user_stories_request(request)
+    if not req or not (req.epic_id or "").strip():
+        raise HTTPException(status_code=400, detail="epic_id is required")
+
+    epic_response = get_epic_by_id(req.epic_id)
+    if not epic_response.success:
+        raise HTTPException(status_code=404, detail="Epic not found")
+    project_id = epic_response.data.get("project_id")
+    _require_project_lead(project_id, user_data)
+
+    project_response = get_project_by_id(project_id, user_data.get_user_id(), allow_member=True, user_email=user_data.get_email())
+    project_description = ""
+    if project_response and project_response.success and project_response.data:
+        project_description = str(project_response.data.get("description") or "")
+
+    existing = get_user_stories_by_epic(req.epic_id, user_data.get_user_id(), allow_member=True)
+    existing_stories = existing.data if existing and existing.success and isinstance(existing.data, list) else []
+
+    expanded_response = await expand_user_stories(
+        user_data=user_data,
+        project_description=project_description,
+        epic_name=str(epic_response.data.get("name") or ""),
+        epic_description=str(epic_response.data.get("description") or ""),
+        existing_stories=existing_stories,
+        instruction=str(req.instruction or ""),
+        max_new_stories=int(req.max_new_stories or 5),
+        image_files=files,
+    )
+    if not expanded_response.success:
+        return JSONResponse(status_code=400, content=expanded_response.dict())
+
+    expanded_payload = expanded_response.data if isinstance(expanded_response.data, dict) else {}
+    new_stories = expanded_payload.get("user_stories") if isinstance(expanded_payload, dict) else None
+    if not isinstance(new_stories, list) or not new_stories:
+        return JSONResponse(
+            status_code=200,
+            content=ResponseModel(success=True, message="No new user stories generated", data={"user_stories": [], "generated_count": 0}).dict(),
+        )
+
+    save_result = create_multiple_user_stories(
+        req.epic_id,
+        user_data.get_user_id(),
+        new_stories,
+        template_data=None,
+    )
+    if not save_result.success:
+        return JSONResponse(status_code=400, content=save_result.dict())
+
+    return JSONResponse(
+        status_code=200,
+        content=ResponseModel(
+            success=True,
+            message=save_result.message,
+            data={"user_stories": save_result.data, "generated_count": len(save_result.data or [])},
+        ).dict(),
+    )
 
 
 @router.get(
@@ -195,35 +713,22 @@ async def generate_user_story_dependencies_route(
 )
 async def get_user_story_route(
     story_id: str = Path(..., description="The user story ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Retrieves a single user story by its ID.
     Requires authentication and verifies that the user owns the user story.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    # Extract token from "Bearer <token>" format
     try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
-    try:
-        print(f"[DEBUG] Retrieving user story with ID: {story_id}")
         response = get_user_story_by_id(story_id, user_data.get_user_id(), allow_member=True, user_email=user_data.get_email())
         return JSONResponse(
             status_code=200 if response.success else 404 if "not found" in response.message.lower() else 403,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.patch(
@@ -233,25 +738,11 @@ async def get_user_story_route(
 async def update_user_story_assignee_route(
     story_id: str = Path(..., description="The user story ID"),
     req: UpdateUserStoryAssigneeRequest = None,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Assigns or reassigns a user story to a team member.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     if not req or (req.assigneeId is None and req.assignee is None):
         raise HTTPException(status_code=400, detail="assigneeId or assignee is required")
 
@@ -275,25 +766,16 @@ async def update_user_story_assignee_route(
             raise HTTPException(status_code=404, detail="Epic not found")
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
-        update_data = {}
-        if req.assigneeId:
-            epic_id = story_response.data.get("epic_id")
-            epic_response = get_epic_by_id(epic_id) if epic_id else None
-            if not epic_response or not epic_response.success:
-                raise HTTPException(status_code=404, detail="Epic not found")
+        project_id = epic_response.data.get("project_id")
+        update_data = _build_story_assignee_update(project_id, req)
 
-            project_id = epic_response.data.get("project_id")
-            member = get_member_by_id(project_id, req.assigneeId) if project_id else None
-            if not member:
-                raise HTTPException(status_code=404, detail="Member not found")
-
-            update_data["assigneeId"] = req.assigneeId
-            update_data["assignee"] = member.get("name")
-            update_data["assigned_to"] = req.assigneeId
-        elif req.assignee:
-            update_data["assignee"] = req.assignee
-
-        response = update_user_story(story_id, user_data.get_user_id(), update_data)
+        response = update_user_story(
+            story_id,
+            user_data.get_user_id(),
+            update_data,
+            user_email=user_data.get_email(),
+            user_name=user_data.get_user_name(),
+        )
 
         status_code = 200
         if not response.success:
@@ -310,8 +792,8 @@ async def update_user_story_assignee_route(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.patch(
@@ -321,25 +803,11 @@ async def update_user_story_assignee_route(
 async def update_user_story_assignee_name_route(
     story_id: str = Path(..., description="The user story ID"),
     req: UpdateUserStoryAssigneeRequest = None,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Assigns or reassigns a user story to a team member via assignee name or ID.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     if not req or (req.assigneeId is None and req.assignee is None):
         raise HTTPException(status_code=400, detail="assigneeId or assignee is required")
 
@@ -363,25 +831,16 @@ async def update_user_story_assignee_name_route(
             raise HTTPException(status_code=404, detail="Epic not found")
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
-        update_data = {}
-        if req.assigneeId:
-            epic_id = story_response.data.get("epic_id")
-            epic_response = get_epic_by_id(epic_id) if epic_id else None
-            if not epic_response or not epic_response.success:
-                raise HTTPException(status_code=404, detail="Epic not found")
+        project_id = epic_response.data.get("project_id")
+        update_data = _build_story_assignee_update(project_id, req)
 
-            project_id = epic_response.data.get("project_id")
-            member = get_member_by_id(project_id, req.assigneeId) if project_id else None
-            if not member:
-                raise HTTPException(status_code=404, detail="Member not found")
-
-            update_data["assigneeId"] = req.assigneeId
-            update_data["assignee"] = member.get("name")
-            update_data["assigned_to"] = req.assigneeId
-        elif req.assignee:
-            update_data["assignee"] = req.assignee
-
-        response = update_user_story(story_id, user_data.get_user_id(), update_data)
+        response = update_user_story(
+            story_id,
+            user_data.get_user_id(),
+            update_data,
+            user_email=user_data.get_email(),
+            user_name=user_data.get_user_name(),
+        )
         if not response.success:
             status_code = 200
             if "not found" in response.message.lower():
@@ -401,6 +860,8 @@ async def update_user_story_assignee_name_route(
         }
         if "assigneeId" in update_data or response.data.get("assigneeId"):
             assignee_payload["assigneeId"] = update_data.get("assigneeId", response.data.get("assigneeId"))
+        if response.data.get("assignment_notification") is not None:
+            assignee_payload["assignment_notification"] = response.data.get("assignment_notification")
 
         return JSONResponse(
             status_code=200,
@@ -412,8 +873,8 @@ async def update_user_story_assignee_name_route(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.patch(
     "/{story_id}/fields/",
@@ -422,25 +883,11 @@ async def update_user_story_assignee_name_route(
 async def update_user_story_fields_route(
     story_id: str = Path(..., description="The user story ID"),
     request: Request = None,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Updates fields of a specific user story.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     try:
         story_response = get_user_story_by_id(
             story_id,
@@ -462,7 +909,13 @@ async def update_user_story_fields_route(
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
         update_data = await request.json()
-        response = update_user_story_fields(story_id, user_data.get_user_id(), update_data)
+        response = update_user_story_fields(
+            story_id,
+            user_data.get_user_id(),
+            update_data,
+            user_email=user_data.get_email(),
+            user_name=user_data.get_user_name(),
+        )
 
         if not response.success:
             status_code = 200
@@ -481,8 +934,10 @@ async def update_user_story_fields_route(
             status_code=200,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.post(
     "/{story_id}/subtasks/",
@@ -490,7 +945,7 @@ async def update_user_story_fields_route(
 )
 async def generate_subtasks_route(
     story_id: str = Path(..., description="The user story ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Generates subtasks for a user story using AI analysis.
@@ -504,20 +959,6 @@ async def generate_subtasks_route(
     
     Requires authentication and verifies that the user owns the user story.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     try:
         story_response = get_user_story_by_id(
             story_id,
@@ -538,14 +979,15 @@ async def generate_subtasks_route(
             raise HTTPException(status_code=404, detail="Epic not found")
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
-        print(f"[DEBUG] Generating subtasks for user story ID: {story_id}")
         response = await generate_subtasks_for_user_story(user_data, story_id)
         return JSONResponse(
             status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.post(
     "/{story_id}/subtasks-manually/",
@@ -554,21 +996,8 @@ async def generate_subtasks_route(
 async def create_subtask_route(
     story_id: str = Path(..., description="The user story ID"),
     request: Request = None,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     try:
         story_response = get_user_story_by_id(
             story_id,
@@ -596,8 +1025,10 @@ async def create_subtask_route(
             status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.get(
     "/{story_id}/subtasks/",
@@ -605,7 +1036,7 @@ async def create_subtask_route(
 )
 async def get_subtasks_route(
     story_id: str = Path(..., description="The user story ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Retrieves all subtasks for a user story.
@@ -619,22 +1050,7 @@ async def get_subtasks_route(
     
     Requires authentication and verifies that the user owns the user story.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    # Extract token from "Bearer <token>" format
     try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
-    try:
-        print(f"[DEBUG] Retrieving subtasks for user story ID: {story_id}")
         response = get_subtasks_by_user_story(
             story_id,
             user_data.get_user_id(),
@@ -645,8 +1061,10 @@ async def get_subtasks_route(
             status_code=200 if response.success else 400,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.patch(
@@ -657,7 +1075,7 @@ async def update_subtask_status_route(
     story_id: str = Path(..., description="The user story ID"),
     subtask_id: str = Path(..., description="The subtask ID"),
     request: Request = None,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Updates the status of a specific subtask within a user story.
@@ -679,20 +1097,9 @@ async def update_subtask_status_route(
     
     Requires authentication and verifies that the user owns the subtask.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
+    # Auth handled by dependency
     
     # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     try:
         # Parse request body
         body = await request.json()
@@ -702,7 +1109,6 @@ async def update_subtask_status_route(
         if not status:
             raise HTTPException(status_code=400, detail="Status field is required")
         
-        print(f"[DEBUG] Updating subtask {subtask_id} status to: {status}")
         response = update_subtask_status(subtask_id, user_data.get_user_id(), status, completed_date)
         
         status_code = 200
@@ -722,8 +1128,8 @@ async def update_subtask_status_route(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.patch(
     "/{story_id}/subtasks/{subtask_id}/fields/",
@@ -733,25 +1139,11 @@ async def update_subtask_fields_route(
     story_id: str = Path(..., description="The user story ID"),
     subtask_id: str = Path(..., description="The subtask ID"),
     request: Request = None,
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Updates fields of a specific subtask within a user story.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     try:
         story_response = get_user_story_by_id(
             story_id,
@@ -783,8 +1175,10 @@ async def update_subtask_fields_route(
             status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.delete(
     "/{story_id}/subtasks/{subtask_id}/",
@@ -793,25 +1187,11 @@ async def update_subtask_fields_route(
 async def delete_subtask_route(
     story_id: str = Path(..., description="The user story ID"),
     subtask_id: str = Path(..., description="The subtask ID"),
-    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+    user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Deletes a specific subtask within a user story.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
-    
-    # Extract token from "Bearer <token>" format
-    try:
-        token_type, token = authorization.split(" ", 1)
-        if token_type.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
-    
-    user_data = validate_user_and_get_data(token)
-    print(f"[DEBUG] User data: {user_data}")
-
     try:
         story_response = get_user_story_by_id(
             story_id,
@@ -832,11 +1212,13 @@ async def delete_subtask_route(
             raise HTTPException(status_code=404, detail="Epic not found")
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
-        print(f"[DEBUG] Deleting subtask {subtask_id}")
         response = delete_subtasks_by_user_story(subtask_id, user_data.get_user_id())
         return JSONResponse(
             status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
             content=response.dict(),
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
+

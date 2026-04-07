@@ -26,6 +26,11 @@ class TeamMemberCreateRequest(TeamMemberBase):
     avatar: Optional[str] = Field(None, description="Optional avatar initials or URL")
 
 
+class ProjectInvitationRequest(TeamMemberBase):
+    """Schema for inviting a member via project invitation endpoints"""
+    pass
+
+
 class TeamMemberCreate(TeamMemberBase):
     """Schema for creating a team member"""
     project_id: str = Field(..., description="Project ID the member belongs to")
