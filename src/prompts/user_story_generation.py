@@ -181,3 +181,90 @@ The value of all fields MUST be a string, even if the field description indicate
 For list-formatted fields, provide the list as a string in markdown format.
 The response should be in English language, but respect the object keys.
 """
+
+GENERATE_ANALYSIS_OF_THE_UI_PROMPT = """ 
+  You are a UX/UI analyst. I am sending you one or more images that represent an interface flow
+  for this project:
+  '{project_description}'
+
+  If there are multiple images, consider them as a step-by-step sequence of the same flow.
+  Describe in detail what interactive elements you see, what action on one screen leads to the next,
+  and what the purpose of this flow is. Pay special attention to small UI elements like 3-dot menus (kebab menus), icons, or small links, and describe what action they likely trigger. Do not generate stories yet.
+
+  IMPORTANT: Answer ONLY with a valid JSON object with the following structure:
+  {{
+    "ui_analysis": "Your detailed description of the complete flow here"
+  }}
+"""
+
+# GENERATE_USER_STORIES_FROM_UI_PROMPT = """
+#   Based on the following analysis of an interface flow:
+#   {ui_analysis}
+
+#   And the project description:
+#   {project_description}
+
+#   Generate atomic User Stories.
+
+#   CRITICAL RULES (FAILING THESE WILL BREAK THE SYSTEM):
+#   1. STRICT SCOPE ISOLATION: ONLY extract stories from the visible ui_analysis. Do not assume or invent prior steps like logins if they are not explicitly in the analysis.
+#   2. The VERY FIRST story you generate MUST have an empty 'dependencies' array [] because it is the starting point of the flow you are analyzing.
+#   3. NO GHOST DEPENDENCIES: Every string inside a 'dependencies' array MUST exactly match a 'user_story_id' that you are generating right now in this exact JSON.
+
+#   IMPORTANT: Answer ONLY with a valid JSON object with the following exact structure:
+#   {{
+#     "user_stories": [
+#       {{
+#         "user_story_id": "feature_name_step_1",
+#         "user_story": "As a [role], I want to [action], so that [value]",
+#         "description": "A brief overview of the feature's goal...",
+#         "storyPoints": 3,
+#         "effortHours": 5.5,
+#         "order": 1,
+#         "dependencies": [] 
+#       }}
+#     ]
+#   }}
+# """
+
+GENERATE_USER_STORIES_FROM_UI_PROMPT = """
+  Based on the following analysis of an interface flow:
+  {ui_analysis}
+
+  And the project description:
+  {project_description}
+
+  ATOMIC USER STORY CREATION PROCESS:
+  1. For the functionality provided, create a SEPARATE atomic user story for EACH user role that would interact with it.
+  2. For EACH specific action a user can take with this functionality, create a SEPARATE user story.
+  3. Do NOT combine multiple roles into a single user story.
+  4. For CRUD operations, create a SEPARATE user story for EACH operation (Create, Read, Update, Delete).
+  5. Include user stories for error handling and edge cases related to this functionality.
+
+  CRITICAL RULES (FAILING THESE WILL BREAK THE SYSTEM):
+  1. STRICT SCOPE ISOLATION: ONLY extract stories from the visible ui_analysis. Do not assume or invent prior steps like logins if they are not explicitly in the analysis.
+  2. The VERY FIRST story you generate MUST have an empty 'dependencies' array [] because it is the starting point of the flow you are analyzing.
+  3. NO GHOST DEPENDENCIES: Every string inside a 'dependencies' array MUST exactly match a 'user_story_id' that you are generating right now in this exact JSON.
+  4. STORY POINTS: Assign Story Points to estimate effort. You MUST use the Fibonacci sequence (1, 2, 3, 5, 8, 13, 21).
+  5. SEQUENCE ORDER: The 'order' field MUST start at 1 for the very first story you generate, and increment sequentially.
+  
+  IMPORTANT EXAMPLE: Answer ONLY with a valid JSON object with the following exact structure:
+  {{
+    "user_stories": [
+      {{
+        "epic": "{epic_name}",
+        "user_story": "As a [role], I need [specific feature/UI element], so that [clear business value]",
+        "description": "", // Provide a clear description and include acceptance criteria naturally.
+        "user_story_id": "",// A ID generated for each user story with a short reference of the user story eg. "login_feature"
+        "order": 1, // Sequential number indicating implementation order (1, 2, 3, etc.)
+        "story_points": 3, // Integer using Fibonacci sequence (1, 2, 3, 5, 8, 13, 21) indicating estimated effort
+        "dependencies": []// Array of user_story_id values that must be completed first (empty array if no dependencies)
+      }}
+    ]
+  }}
+
+  Fields from the template:
+  {fields_description}
+
+  The value of all template fields MUST be a string.
+"""

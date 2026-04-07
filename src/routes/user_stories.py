@@ -1,8 +1,9 @@
 
-from fastapi import APIRouter, HTTPException, Header, Path, Request
+from fastapi import APIRouter, HTTPException, Header, Path, Request, UploadFile, Form, File
 from fastapi.responses import JSONResponse
-from typing import Optional
+from typing import List, Optional
 
+from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.schemas.resources_request import (
     GenerateAnalysisRequest,
     GenerateUserStoriesRequest,
@@ -29,6 +30,7 @@ from src.utils.subtask_generation import (
     update_subtask_fields,
     delete_subtasks_by_user_story
 )
+from src.utils.ui_story_graph import generate_user_stories_from_ui
 
 router = APIRouter()
 
@@ -188,6 +190,79 @@ async def generate_user_story_dependencies_route(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@router.post("/generate-user-stories-from-ui")
+async def generate_user_stories_from_ui_route(
+    epic_id: str = Form(...),
+    project_description: str = Form(...),
+    images: List[UploadFile] = File(...),
+    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+):
+    # Extract token from "Bearer <token>" format
+    try:
+        token_type, token = authorization.split(" ", 1)
+        if token_type.lower() != "bearer":
+            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+
+    user_data = validate_user_and_get_data(token)
+    print(f"[DEBUG] User data: {user_data}")
+
+    try:
+        response = await generate_user_stories_from_ui(epic_id, project_description, images, user_data)
+        return JSONResponse(
+            status_code=200 if response.success else 400,
+            content=response.dict(),
+        )
+    except HTTPException:
+        raise HTTPException(status_code=400, detail="An error occurred while generating user stories from UI")
+
+@router.delete("/delete-test-stories/{epic_id}")
+async def delete_test_stories_route(
+    epic_id: str,
+    authorization: Optional[str] = Header(None, description="Bearer token for authentication")
+):
+    """
+    Endpoint rápido para limpiar historias de prueba generadas para un Epic específico.
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header is required")
+    
+    # Extraer el token (tu lógica de siempre)
+    try:
+        token_type, token = authorization.split(" ", 1)
+        if token_type.lower() != "bearer":
+            raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid authorization header format. Use 'Bearer <token>'")
+    
+    # Validar usuario
+    user_data = validate_user_and_get_data(token)
+    print(f"[DEBUG] Limpiando historias de prueba para el epic: {epic_id}")
+
+    try:
+        # 1. Buscar todas las historias que pertenezcan a este epic_id
+        docs = FIRESTORE_CLIENT.collection("user_stories").where("epic_id", "==", epic_id).stream()
+        
+        deleted_count = 0
+        # 2. Iterar y borrar cada documento
+        for doc in docs:
+            doc.reference.delete()
+            deleted_count += 1
+            
+        return ResponseModel(
+            success=True,
+            message=f"Limpieza completada. Se borraron {deleted_count} historias de prueba.",
+            data={"deleted_count": deleted_count}
+        )
+        
+    except Exception as e:
+        print(f"[ERROR] Falló la limpieza de historias: {str(e)}")
+        return ResponseModel(
+            success=False, 
+            message=f"Error al borrar las historias: {str(e)}", 
+            data=None
+        )
 
 @router.get(
     "/{story_id}/",
