@@ -289,6 +289,8 @@ async def assign_sprint_item_route(
             sprint_id=sprint_id,
             project_id=project_id,
             user_id=user_data.get_user_id(),
+            user_email=user_data.get_email(),
+            user_name=user_data.get_user_name(),
             item_type=req.type,
             item_id=req.id,
             include_subtasks=req.include_subtasks
@@ -337,6 +339,8 @@ async def unassign_sprint_item_route(
             sprint_id=sprint_id,
             project_id=project_id,
             user_id=user_data.get_user_id(),
+            user_email=user_data.get_email(),
+            user_name=user_data.get_user_name(),
             item_type=resolved_type,
             item_id=resolved_id,
         )
