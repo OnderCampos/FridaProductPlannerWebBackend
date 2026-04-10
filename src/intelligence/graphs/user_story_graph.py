@@ -1,7 +1,7 @@
 import logging
 from typing import Any, Dict, List, Optional, TypedDict
 
-from src.intelligence.agents.json_executor import execute_json_agent, parse_json_response
+from src.intelligence.agents.json_executor import execute_agent, parse_json_response
 from src.intelligence.agents.user_story_generation.analysis_agent import (
     USER_STORY_ANALYSIS_AGENT,
 )
@@ -223,7 +223,7 @@ def _brainstorm_node(state: UserStoryGraphState) -> Dict[str, Any]:
     users_context = users or (project.get("roles", []) if isinstance(project, dict) else [])
 
     for current_functionality in worklist:
-        stories_batch = execute_json_agent(
+        stories_batch = execute_agent(
             agent=USER_STORY_GENERATION_AGENT,
             prompt_kwargs={
                 "functionality": current_functionality,

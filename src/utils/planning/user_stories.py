@@ -9,7 +9,8 @@ from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.schemas.response import ResponseModel
 from src.utils.authz.permissions import get_project_access, get_project_id_for_epic
 from src.utils.authz.users import get_user_profile
-from src.utils.planning.assignees import build_member_lookup, normalize_assignee_fields
+from src.utils.planning.assignees import build_member_lookup, ensure_assignee_email
+from src.utils.firebase.identifier import get_next_US_identifier
 
 
 def _current_timestamp_iso() -> str:
@@ -154,6 +155,7 @@ def _normalize_story_payload(story_data: Dict[str, Any]) -> Dict[str, Any]:
     story_data["effortHours"] = effort_hours
     story_data["acceptanceCriteria"] = acceptance
     story_data["outOfScope"] = out_scope
+    ensure_assignee_email(story_data)
     return story_data
 
 
@@ -253,11 +255,16 @@ def _maybe_send_user_story_assignment_notification(
             )
 
         member_lookup = build_member_lookup(project_id)
-        previous_assignee = normalize_assignee_fields(dict(previous_story or {}), member_lookup)
-        updated_assignee = normalize_assignee_fields(dict(updated_story or {}), member_lookup)
+        previous_assignee = ensure_assignee_email(dict(previous_story or {}), member_lookup)
+        updated_assignee = ensure_assignee_email(dict(updated_story or {}), member_lookup)
 
         updated_assignee_name = str(updated_assignee.get("assignee") or "").strip()
-        updated_assignee_id = str(updated_assignee.get("assignee_id") or "").strip()
+        updated_assignee_id = str(
+            updated_assignee.get("assigneeId")
+            or updated_assignee.get("assigned_to")
+            or updated_assignee.get("assignee_id")
+            or ""
+        ).strip()
         if not updated_assignee_name and not updated_assignee_id:
             return NotificationService()._notification_result(
                 False,
@@ -449,7 +456,12 @@ def _maybe_send_user_story_updated_notification(
             "Assignment email was not sent because the notification provider failed.",
         )
 
-def create_user_story(epic_id: str, user_id: str, user_story_data: Dict[str, Any], template_data: Dict[str, Any] = None) -> ResponseModel:
+def create_user_story(
+    epic_id: str,
+    user_id: str,
+    user_story_data: Dict[str, Any],
+    template_data: Dict[str, Any] = None,
+) -> ResponseModel:
     """
     Creates a new user story in Firestore using structured format with fields array.
     
@@ -464,6 +476,7 @@ def create_user_story(epic_id: str, user_id: str, user_story_data: Dict[str, Any
     """
     try:
         now = _current_timestamp_iso()
+        user_story_identifier = get_next_US_identifier()
         
         # Core user story fields that should not go into the fields array
         core_fields = {
@@ -503,7 +516,7 @@ def create_user_story(epic_id: str, user_id: str, user_story_data: Dict[str, Any
             "epic": user_story_data.get("epic", ""),
             "user_story": user_story_data.get("user_story", ""),
             "description": user_story_data.get("description", ""),
-            "user_story_id": user_story_data.get("user_story_id", ""),
+            "user_story_id": user_story_identifier,
             "order": user_story_data.get("order", 0),
             "dependencies": user_story_data.get("dependencies", []),
             "document": user_story_data.get("document") if isinstance(user_story_data.get("document"), dict) else {},
@@ -928,7 +941,9 @@ def update_user_story_fields(
             filtered_update["assigneeId"] = filtered_update.pop("assignee_id")
 
         if "assignee_email" in filtered_update and "assigneeEmail" not in filtered_update:
-            filtered_update["assigneeEmail"] = filtered_update.pop("assignee_email")
+            filtered_update["assigneeEmail"] = filtered_update.get("assignee_email")
+        if "assigneeEmail" in filtered_update:
+            filtered_update["assignee_email"] = filtered_update.get("assigneeEmail")
 
         if "acceptance_criteria" in filtered_update and "acceptanceCriteria" not in filtered_update:
             filtered_update["acceptanceCriteria"] = filtered_update.pop("acceptance_criteria")

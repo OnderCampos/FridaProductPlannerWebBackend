@@ -11,6 +11,7 @@ RoleType = Literal["Frontend", "Backend", "FullStack", "DevOps", "QA", "UX/UI", 
 SeniorityType = Literal["Junior", "Mid", "Senior", "Lead", "Principal"]
 MemberStatusType = Literal["Active", "Inactive"]
 InvitationStatusType = Literal["Pending", "Accepted", "Rejected", "Expired"]
+MemberType = Literal["leader", "coleader", "member"]
 
 
 class TeamMemberBase(BaseModel):
@@ -24,11 +25,12 @@ class TeamMemberBase(BaseModel):
 class TeamMemberCreateRequest(TeamMemberBase):
     """Schema for creating a team member via project members endpoints"""
     avatar: Optional[str] = Field(None, description="Optional avatar initials or URL")
+    member_type: MemberType = Field("member", description="Project permission role")
 
 
 class ProjectInvitationRequest(TeamMemberBase):
     """Schema for inviting a member via project invitation endpoints"""
-    pass
+    member_type: MemberType = Field("member", description="Project permission role")
 
 
 class TeamMemberCreate(TeamMemberBase):
@@ -42,6 +44,7 @@ class TeamMemberUpdate(BaseModel):
     """Schema for updating a team member"""
     role: Optional[RoleType] = Field(None, description="Role of the team member")
     seniority: Optional[SeniorityType] = Field(None, description="Seniority level of the team member")
+    member_type: Optional[MemberType] = Field(None, description="Project permission role")
 
 
 class TeamMemberResponse(TeamMemberBase):
@@ -50,6 +53,7 @@ class TeamMemberResponse(TeamMemberBase):
     status: MemberStatusType = Field(..., description="Status of the member")
     joined_date: str = Field(..., description="Date the member joined the project")
     avatar: Optional[str] = Field(None, description="URL to avatar image")
+    member_type: MemberType = Field("member", description="Project permission role")
 
     class Config:
         json_schema_extra = {
@@ -59,6 +63,7 @@ class TeamMemberResponse(TeamMemberBase):
                 "email": "john.doe@company.com",
                 "role": "Frontend",
                 "seniority": "Senior",
+                "member_type": "member",
                 "status": "Active",
                 "joined_date": "2024-01-15T10:30:00Z",
                 "avatar": "https://example.com/avatars/john.jpg"
@@ -88,6 +93,7 @@ class MemberInvitationResponse(BaseModel):
     name: str = Field(..., description="Name of the invitee")
     role: RoleType = Field(..., description="Role for the invitee")
     seniority: SeniorityType = Field(..., description="Seniority level for the invitee")
+    member_type: MemberType = Field("member", description="Project permission role")
     status: InvitationStatusType = Field(..., description="Status of the invitation")
     invited_by: str = Field(..., description="UUID of the user who sent the invitation")
     invited_by_name: Optional[str] = Field(None, description="Name of the user who sent the invitation")
@@ -104,6 +110,7 @@ class MemberInvitationResponse(BaseModel):
                 "name": "Alice Johnson",
                 "role": "FullStack",
                 "seniority": "Mid",
+                "member_type": "member",
                 "status": "Pending",
                 "invited_by": "current-user-uuid",
                 "invited_by_name": "John Doe",
@@ -131,6 +138,7 @@ class MembersListResponse(BaseModel):
                         "email": "john.doe@company.com",
                         "role": "Frontend",
                         "seniority": "Senior",
+                        "member_type": "member",
                         "status": "Active",
                         "joined_date": "2024-01-15T10:30:00Z",
                         "avatar": "https://example.com/avatars/john.jpg"
@@ -155,3 +163,4 @@ class InvitationAcceptResponse(BaseModel):
     member_id: str = Field(..., description="New member ID")
     role: RoleType = Field(..., description="Member role")
     seniority: SeniorityType = Field(..., description="Member seniority")
+    member_type: MemberType = Field("member", description="Project permission role")

@@ -12,6 +12,7 @@ from src.schemas.user_data import UserData
 from src.services.azure_services import AzureChatService
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
+from src.utils.planning.user_story_dependencies import generate_and_persist_user_story_dependencies
 from src.utils.planning.user_stories import create_multiple_user_stories, _current_timestamp_iso
 
 
@@ -542,12 +543,33 @@ async def generate_user_stories(
             )
 
             if save_result.success:
+                saved_stories = save_result.data if isinstance(save_result.data, list) else []
+                updated_stories = saved_stories
+
+                dependencies_result = await generate_and_persist_user_story_dependencies(
+                    user_data=user_data,
+                    epic_id=epic_id,
+                    user_stories=saved_stories,
+                )
+                if (
+                    dependencies_result.success
+                    and isinstance(dependencies_result.data, dict)
+                    and isinstance(dependencies_result.data.get("user_stories"), list)
+                ):
+                    updated_stories = dependencies_result.data.get("user_stories") or []
+                elif not dependencies_result.success:
+                    logging.warning(
+                        "Generated user stories for epic %s were saved without refreshed dependencies: %s",
+                        epic_id,
+                        dependencies_result.message,
+                    )
+
                 print("[DEBUG] User stories saved successfully")
                 return ResponseModel(
                     success=True,
                     message="User stories generated and saved successfully for functionality",
                     data={
-                        "user_stories": save_result.data,
+                        "user_stories": updated_stories,
                         "generated_count": len(response),
                     },
                 )

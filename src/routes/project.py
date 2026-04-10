@@ -76,9 +76,11 @@ from src.utils.ai.project_creation_source_spec import generate_spec_from_source
 
 
 from src.utils.authz.permissions import get_project_access, get_global_user_role
+from src.utils.authz.project_memberships import normalize_membership_role
 from src.utils.planning.members import (
     get_project_members as get_team_members,
     create_team_member,
+    get_member_by_id,
     update_team_member,
     remove_team_member,
     check_member_exists,
@@ -136,12 +138,19 @@ def _random_project_key_suffix(length: int = 3) -> str:
 def _normalize_invitation_payload(invitation: dict) -> dict:
     payload = dict(invitation or {})
     payload["projectId"] = payload.get("projectId") or payload.get("project_id")
+    payload["memberType"] = payload.get("memberType") or payload.get("member_type") or "member"
     payload["invitedBy"] = payload.get("invitedBy") or payload.get("invited_by")
     payload["invitedByName"] = payload.get("invitedByName") or payload.get("invited_by_name")
     payload["invitedDate"] = payload.get("invitedDate") or payload.get("invited_date")
     payload["expiresDate"] = payload.get("expiresDate") or payload.get("expires_date")
     payload["responseDate"] = payload.get("responseDate") or payload.get("response_date")
     return payload
+
+
+def _requester_member_type(access_data: Optional[dict]) -> str:
+    if (access_data or {}).get("is_owner"):
+        return "leader"
+    return normalize_membership_role((access_data or {}).get("member_type"))
 
 @router.get(
     "/{project_id}",
@@ -389,12 +398,12 @@ async def get_project_members_route(
     Retrieves detailed project info including members. User must own the project.
     """
     try:
-        project_response = get_project_for_user(project_id, user_data.user_id)
-        if not project_response.success:
-            status_code = 404 if "not found" in project_response.message.lower() else 403
+        access = get_project_access(project_id, user_data.user_id, user_data.email)
+        if not access.success:
+            status_code = 404 if "not found" in access.message.lower() else 403
             return JSONResponse(
                 status_code=status_code,
-                content=project_response.dict(),
+                content=access.dict(),
             )
 
         members = get_team_members(project_id, status=status, role=role, seniority=seniority)
@@ -436,6 +445,10 @@ async def add_project_member_route(
             )
         if not access.data.get("is_lead"):
             raise HTTPException(status_code=403, detail="Forbidden: Team members cannot add members")
+        if req.member_type == "leader":
+            raise HTTPException(status_code=400, detail="The project leader is always the project creator")
+        if req.member_type == "coleader" and not access.data.get("can_manage_member_types"):
+            raise HTTPException(status_code=403, detail="Forbidden: Only the leader can assign coleaders")
 
         if check_member_exists(project_id, req.email):
             raise HTTPException(status_code=409, detail="Member already exists for this project")
@@ -453,7 +466,8 @@ async def add_project_member_route(
             email=req.email,
             role=req.role,
             seniority=req.seniority,
-            avatar=avatar
+            avatar=avatar,
+            member_type=req.member_type,
         )
         project_name = str((access.data or {}).get("project", {}).get("name") or "").strip() or "your project"
         added_by_name = user_data.get_user_name() or user_data.get_email() or "A FridaPlatform administrator"
@@ -1120,12 +1134,17 @@ async def invite_project_member_route(
     email = req.email
     role = req.role
     seniority = req.seniority
+    member_type = req.member_type
 
     try:
         if check_member_exists(project_id, email):
             raise HTTPException(status_code=409, detail="Member already exists for this project")
         if check_pending_invitation(project_id, email):
             raise HTTPException(status_code=409, detail="A pending invitation already exists for this email")
+        if member_type == "leader":
+            raise HTTPException(status_code=400, detail="The project leader is always the project creator")
+        if member_type == "coleader" and not access.data.get("can_manage_member_types"):
+            raise HTTPException(status_code=403, detail="Forbidden: Only the leader can assign coleaders")
 
         invitation = create_invitation(
             project_id=project_id,
@@ -1135,6 +1154,7 @@ async def invite_project_member_route(
             email=email,
             role=role,
             seniority=seniority,
+            member_type=member_type,
         )
         invitation = _normalize_invitation_payload(invitation)
         project_name = str((access.data or {}).get("project", {}).get("name") or "").strip() or "your project"
@@ -1315,8 +1335,8 @@ async def update_project_member_route(
     """
     Updates role or seniority for a project member.
     """
-    if not req or (req.role is None and req.seniority is None):
-        raise HTTPException(status_code=400, detail="At least one field (role, seniority) is required")
+    if not req or (req.role is None and req.seniority is None and req.member_type is None):
+        raise HTTPException(status_code=400, detail="At least one field (role, seniority, member_type) is required")
 
     try:
         access = get_project_access(project_id, user_data.user_id, user_data.email)
@@ -1329,11 +1349,35 @@ async def update_project_member_route(
         if not access.data.get("is_lead"):
             raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update members")
 
+        existing_member = get_member_by_id(project_id, member_id)
+        if not existing_member:
+            raise HTTPException(status_code=404, detail="Member not found")
+
+        requester_member_type = _requester_member_type(access.data)
+        target_member_type = normalize_membership_role(existing_member.get("member_type"))
+        requested_member_type = normalize_membership_role(req.member_type) if req.member_type is not None else None
+
+        if target_member_type == "leader":
+            raise HTTPException(status_code=403, detail="The project leader cannot be updated here")
+        if target_member_type == "coleader" and requester_member_type != "leader":
+            raise HTTPException(status_code=403, detail="Forbidden: Only the leader can update a coleader")
+        if requested_member_type == "leader":
+            raise HTTPException(status_code=400, detail="The project leader is always the project creator")
+        if requested_member_type == "coleader" and not access.data.get("can_manage_member_types"):
+            raise HTTPException(status_code=403, detail="Forbidden: Only the leader can assign coleaders")
+        if (
+            requested_member_type is not None
+            and requested_member_type != target_member_type
+            and not access.data.get("can_manage_member_types")
+        ):
+            raise HTTPException(status_code=403, detail="Forbidden: Only the leader can change member types")
+
         updated_member = update_team_member(
             project_id=project_id,
             member_id=member_id,
             role=req.role,
-            seniority=req.seniority
+            seniority=req.seniority,
+            member_type=req.member_type,
         )
 
         if not updated_member:
@@ -1377,6 +1421,17 @@ async def remove_project_member_route(
             )
         if not access.data.get("is_lead"):
             raise HTTPException(status_code=403, detail="Forbidden: Team members cannot remove members")
+
+        existing_member = get_member_by_id(project_id, member_id)
+        if not existing_member:
+            raise HTTPException(status_code=404, detail="Member not found")
+
+        requester_member_type = _requester_member_type(access.data)
+        target_member_type = normalize_membership_role(existing_member.get("member_type"))
+        if target_member_type == "leader":
+            raise HTTPException(status_code=403, detail="The project leader cannot be removed")
+        if target_member_type == "coleader" and requester_member_type != "leader":
+            raise HTTPException(status_code=403, detail="Forbidden: Only the leader can remove a coleader")
 
         removed = remove_team_member(project_id, member_id)
         if not removed:

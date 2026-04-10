@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 def _normalize_invitation_payload(invitation: dict) -> dict:
     payload = dict(invitation or {})
     payload["projectId"] = payload.get("projectId") or payload.get("project_id")
+    payload["memberType"] = payload.get("memberType") or payload.get("member_type") or "member"
     payload["invitedBy"] = payload.get("invitedBy") or payload.get("invited_by")
     payload["invitedDate"] = payload.get("invitedDate") or payload.get("invited_date")
     payload["expiresDate"] = payload.get("expiresDate") or payload.get("expires_date")

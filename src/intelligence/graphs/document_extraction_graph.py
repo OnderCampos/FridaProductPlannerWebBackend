@@ -1,15 +1,17 @@
-import json
+import os
 import logging
-from typing import Any, Dict, Iterable, List, Optional, TypedDict
+import math
+import re
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, TypedDict
 
 from src.intelligence.agents.document_extraction.document_chunk_extraction_agent import (
     DOCUMENT_CHUNK_EXTRACTION_AGENT,
 )
 from src.intelligence.agents.document_extraction.document_description_agent import (
     DOCUMENT_DESCRIPTION_AGENT,
-)
-from src.intelligence.agents.document_extraction.document_entity_consolidation_agent import (
-    DOCUMENT_ENTITY_CONSOLIDATION_AGENT,
 )
 from src.intelligence.agents.document_extraction.document_epic_extraction_agent import (
     DOCUMENT_EPIC_EXTRACTION_AGENT,
@@ -20,10 +22,11 @@ from src.intelligence.agents.document_extraction.document_story_grouping_agent i
 from src.intelligence.agents.document_extraction.document_user_story_extraction_agent import (
     DOCUMENT_USER_STORY_EXTRACTION_AGENT,
 )
-from src.intelligence.agents.epic_generation.epic_agent import PROJECT_SUMMARY_AGENT
-from src.intelligence.agents.json_executor import execute_json_agent, parse_json_response
+from src.intelligence.agents.json_executor import execute_agent, parse_json_response
 from src.schemas.user_data import UserData
+from src.services.setup.variables_setup import LLMOPS_API_KEY
 from src.services.setup.language_setup import get_default_llm_language, normalize_language
+from src.utils.knowledge_bases.embeddings import SofttekOpenAIEmbeddings
 
 try:
     from langgraph.graph import END, START, StateGraph
@@ -35,10 +38,10 @@ except Exception:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
-MAX_LENGTH = 7000
-EVIDENCE_CHUNK_SIZE = 3500
-EVIDENCE_CHUNK_OVERLAP = 400
-CONSOLIDATION_BATCH_SIZE = 4
+EVIDENCE_CHUNK_SIZE = 5000
+EVIDENCE_CHUNK_OVERLAP = 200
+STORY_DEDUP_SIMILARITY = 0.93
+STORY_RELATION_SIMILARITY = 0.82
 
 
 class DocumentExtractionState(TypedDict, total=False):
@@ -47,10 +50,10 @@ class DocumentExtractionState(TypedDict, total=False):
     document_text: str
     language: str
 
-    prepared_text: str
     evidence_chunks: List[Dict[str, str]]
     chunk_extractions: List[Dict[str, Any]]
     consolidated_extraction: Dict[str, Any]
+    story_relationships: List[Dict[str, Any]]
     grouped_epics: List[Dict[str, Any]]
     project_description: str
     roles: List[str]
@@ -61,19 +64,88 @@ class DocumentExtractionState(TypedDict, total=False):
     error: str
 
 
-def _to_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
+def _is_document_extraction_debug_enabled() -> bool:
+    value = str(os.getenv("DOCUMENT_EXTRACTION_DEBUG") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _trace_node_call(node_name: str) -> None:
+    if not _is_document_extraction_debug_enabled():
+        return
+    message = f"Document extraction node called: {node_name}"
+    logger.warning(message)
+    print(message)
+    _append_document_extraction_trace(message)
+
+
+def _get_document_extraction_logs_dir() -> Path:
+    backend_root = Path(__file__).resolve().parents[3]
+    return backend_root / "logs"
+
+
+def _append_document_extraction_trace(message: str) -> None:
+    if not _is_document_extraction_debug_enabled():
+        return
     try:
-        return json.dumps(value, ensure_ascii=False)
-    except Exception:
-        return str(value)
+        logs_dir = _get_document_extraction_logs_dir()
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        trace_path = logs_dir / "document_extraction_trace.log"
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with trace_path.open("a", encoding="utf-8") as trace_file:
+            trace_file.write(f"[{timestamp}] {message}\n")
+    except Exception as exc:
+        logger.warning("Failed to write document extraction trace log: %s", exc)
 
 
-def _split_text(text: str, size: int) -> List[str]:
-    return [text[i:i + size] for i in range(0, len(text), size)] if text else []
+def _write_consolidated_story_debug_dump(
+    state: DocumentExtractionState,
+    stories: List[Dict[str, Any]],
+) -> None:
+    if not _is_document_extraction_debug_enabled():
+        return
+    logs_dir = _get_document_extraction_logs_dir()
+    latest_path = logs_dir / "document_extraction_consolidated_stories_latest.json"
+    history_path = logs_dir / "document_extraction_consolidated_stories.jsonl"
+
+    payload = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "project_name": str(state.get("project_name") or "").strip(),
+        "story_count": len(stories),
+        "stories": stories,
+    }
+
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        latest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        with history_path.open("a", encoding="utf-8") as history_file:
+            history_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        logger.warning("Wrote consolidated user story debug dump to %s", latest_path)
+        print(f"Wrote consolidated user story debug dump to {latest_path}")
+        _append_document_extraction_trace(
+            f"Wrote consolidated user story debug dump to {latest_path} with {len(stories)} stories."
+        )
+    except Exception as exc:
+        logger.warning("Failed to write consolidated user story debug dump: %s", exc)
+        _append_document_extraction_trace(f"Failed to write consolidated user story debug dump: {exc}")
+
+
+def _require_non_empty_text(value: Any) -> bool:
+    return bool(str(value or "").strip())
+
+
+def _require_non_empty_list(value: Any) -> bool:
+    return isinstance(value, list) and len(value) > 0
+
+
+def _ensure_node_requirements(
+    state: DocumentExtractionState,
+    node_name: str,
+    checks: Dict[str, bool],
+) -> Optional[Dict[str, Any]]:
+    missing = [label for label, valid in checks.items() if not valid]
+    if not missing:
+        return None
+    return {"error": f"{node_name} requires: {', '.join(missing)}."}
 
 
 def _build_overlapping_chunks(text: str, size: int, overlap: int) -> List[Dict[str, str]]:
@@ -102,31 +174,24 @@ def _slugify(value: str) -> str:
     return "_".join(part for part in cleaned.split("_") if part)
 
 
-def _prepare_text_node(state: DocumentExtractionState) -> Dict[str, Any]:
+def _build_source_text(state: DocumentExtractionState) -> str:
     project_name = state.get("project_name", "")
     document_text = state.get("document_text", "")
-    language = normalize_language(state.get("language"), default=get_default_llm_language())
-    user_data = state.get("user_data")
+    return f"Project Name: {project_name}\n\n{document_text}".strip()
 
-    combined_text = f"Project Name: {project_name}\n\n{document_text}".strip()
-    text_for_analysis = combined_text
 
-    if len(combined_text) > MAX_LENGTH:
-        parts = _split_text(combined_text, MAX_LENGTH)
-        if parts:
-            summary_agent = PROJECT_SUMMARY_AGENT.bind_context({"user_data": user_data})
-            merged_text = parts[0]
-            for next_part in parts[1:]:
-                merged_text = summary_agent.execute(
-                    current=merged_text,
-                    next=next_part,
-                    language=language,
-                )
-                merged_text = _to_text(merged_text)
-            text_for_analysis = merged_text
+def _prepare_text_node(state: DocumentExtractionState) -> Dict[str, Any]:
+    _trace_node_call("prepare_text")
+    combined_text = _build_source_text(state)
+    requirements = _ensure_node_requirements(
+        state,
+        "prepare_text",
+        {"document_text or project_name": _require_non_empty_text(combined_text)},
+    )
+    if requirements:
+        return requirements
 
     return {
-        "prepared_text": text_for_analysis,
         "evidence_chunks": _build_overlapping_chunks(
             combined_text,
             size=EVIDENCE_CHUNK_SIZE,
@@ -182,32 +247,280 @@ def _normalize_number(value: Any, default: float = 0) -> float:
         return default
 
 
-def _description_node(state: DocumentExtractionState) -> Dict[str, Any]:
-    user_data = state.get("user_data")
-    prepared_text = state.get("prepared_text", "")
-    language = normalize_language(state.get("language"), default=get_default_llm_language())
+def _extract_role_from_user_story(user_story: str) -> str:
+    text = str(user_story or "").strip()
+    if not text:
+        return ""
 
-    raw = execute_json_agent(
+    match = re.match(r"(?i)^as a[n]?\s+([^,]+),", text)
+    if not match:
+        return ""
+    return str(match.group(1) or "").strip()
+
+
+def _build_story_embedding_text(story: Dict[str, Any]) -> str:
+    parts = [
+        str(story.get("user_story") or "").strip(),
+        str(story.get("description") or "").strip(),
+        " | ".join(_normalize_bullets(story.get("acceptanceCriteria"))),
+        " | ".join(_normalize_list(story.get("dependencies"))),
+        " | ".join(_normalize_list(story.get("roles"))),
+        " | ".join(_normalize_list(story.get("technologies"))),
+        " | ".join(_normalize_list(story.get("keywords"))),
+        " | ".join(_normalize_list(story.get("task_hints"))),
+        str(story.get("epic_hint") or "").strip(),
+        str(story.get("evidence") or "").strip(),
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def _embed_story_records(
+    records: List[Dict[str, Any]],
+) -> Optional[List[List[float]]]:
+    if not records:
+        return []
+
+    embeddings_model = _build_embedding_model()
+    if embeddings_model is None:
+        return None
+
+    story_texts = [_build_story_embedding_text(record) for record in records]
+    try:
+        return [embeddings_model.embed(text) for text in story_texts]
+    except Exception as exc:
+        logger.warning("Embedding generation failed for document extraction: %s", exc)
+        return None
+
+
+def _cosine_similarity(left: List[float], right: List[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+
+    numerator = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return numerator / (left_norm * right_norm)
+
+
+def _build_embedding_model() -> Optional[SofttekOpenAIEmbeddings]:
+    if not LLMOPS_API_KEY:
+        return None
+    try:
+        return SofttekOpenAIEmbeddings(
+            model_name="OpenAIEmbeddings",
+            api_key=LLMOPS_API_KEY,
+        )
+    except Exception as exc:
+        logger.warning("Could not initialize embeddings model for document extraction: %s", exc)
+        return None
+
+
+def _union_find(items: int) -> Dict[int, int]:
+    return {index: index for index in range(items)}
+
+
+def _find_root(parent: Dict[int, int], index: int) -> int:
+    while parent[index] != index:
+        parent[index] = parent[parent[index]]
+        index = parent[index]
+    return index
+
+
+def _union(parent: Dict[int, int], left: int, right: int) -> None:
+    left_root = _find_root(parent, left)
+    right_root = _find_root(parent, right)
+    if left_root != right_root:
+        parent[right_root] = left_root
+
+
+def _merge_story_cluster(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not records:
+        return {}
+
+    base = dict(records[0])
+    base["story_key"] = min(
+        (str(record.get("story_key") or "").strip() for record in records if str(record.get("story_key") or "").strip()),
+        key=lambda value: (len(value), value),
+        default=str(base.get("story_key") or "").strip(),
+    )
+    if not base["story_key"]:
+        base["story_key"] = _slugify(str(base.get("user_story") or "").strip())[:40] or "story"
+
+    for item in records[1:]:
+        if not base.get("user_story") and item.get("user_story"):
+            base["user_story"] = item.get("user_story")
+        if not base.get("description") and item.get("description"):
+            base["description"] = item.get("description")
+        if not base.get("epic_hint") and item.get("epic_hint"):
+            base["epic_hint"] = item.get("epic_hint")
+        if not base.get("evidence") and item.get("evidence"):
+            base["evidence"] = item.get("evidence")
+        base["roles"] = _normalize_list((base.get("roles") or []) + (item.get("roles") or []))
+        base["technologies"] = _normalize_list((base.get("technologies") or []) + (item.get("technologies") or []))
+        base["keywords"] = _normalize_list((base.get("keywords") or []) + (item.get("keywords") or []))
+        base["task_hints"] = _normalize_list((base.get("task_hints") or []) + (item.get("task_hints") or []))
+        base["dependencies"] = _normalize_list((base.get("dependencies") or []) + (item.get("dependencies") or []))
+        base["acceptanceCriteria"] = _normalize_bullets(
+            (base.get("acceptanceCriteria") or []) + (item.get("acceptanceCriteria") or [])
+        )
+        base["outOfScope"] = _normalize_bullets((base.get("outOfScope") or []) + (item.get("outOfScope") or []))
+        base["effortHours"] = max(
+            _normalize_number(base.get("effortHours"), default=0),
+            _normalize_number(item.get("effortHours"), default=0),
+        )
+    return base
+
+
+def _average_embeddings(vectors: List[List[float]]) -> List[float]:
+    if not vectors:
+        return []
+    if len(vectors) == 1:
+        return list(vectors[0])
+
+    dimensions = len(vectors[0])
+    averaged = [0.0] * dimensions
+    for vector in vectors:
+        if len(vector) != dimensions:
+            return []
+        for index, value in enumerate(vector):
+            averaged[index] += value
+    return [value / len(vectors) for value in averaged]
+
+
+def _dedupe_stories_with_embeddings(
+    records: List[Dict[str, Any]],
+    embeddings: Optional[List[List[float]]] = None,
+) -> tuple[List[Dict[str, Any]], Optional[List[List[float]]]]:
+    if not records:
+        return [], []
+
+    if embeddings is None:
+        embeddings = _embed_story_records(records)
+
+    if embeddings is None:
+        logger.warning("Embeddings model unavailable; falling back to story-key deduplication.")
+        return _merge_story_records(records), None
+
+    parent = _union_find(len(records))
+    for left in range(len(records)):
+        for right in range(left + 1, len(records)):
+            if records[left].get("story_key") == records[right].get("story_key"):
+                _union(parent, left, right)
+                continue
+            similarity = _cosine_similarity(embeddings[left], embeddings[right])
+            if similarity >= STORY_DEDUP_SIMILARITY:
+                _union(parent, left, right)
+
+    clusters: Dict[int, List[Dict[str, Any]]] = {}
+    cluster_embeddings: Dict[int, List[List[float]]] = {}
+    for index, record in enumerate(records):
+        root = _find_root(parent, index)
+        clusters.setdefault(root, []).append(record)
+        cluster_embeddings.setdefault(root, []).append(embeddings[index])
+
+    deduped_stories: List[Dict[str, Any]] = []
+    deduped_embeddings: List[List[float]] = []
+    for root, cluster in clusters.items():
+        deduped_stories.append(_merge_story_cluster(cluster))
+        deduped_embeddings.append(_average_embeddings(cluster_embeddings.get(root) or []))
+
+    return deduped_stories, deduped_embeddings
+
+
+def _build_story_relationships(
+    stories: List[Dict[str, Any]],
+    embeddings: Optional[List[List[float]]] = None,
+) -> List[Dict[str, Any]]:
+    if len(stories) < 2:
+        return []
+
+    if embeddings is None:
+        embeddings = _embed_story_records(stories)
+
+    if embeddings is None:
+        return []
+
+    relationships: List[Dict[str, Any]] = []
+    for left in range(len(stories)):
+        for right in range(left + 1, len(stories)):
+            similarity = _cosine_similarity(embeddings[left], embeddings[right])
+            if similarity < STORY_RELATION_SIMILARITY:
+                continue
+            left_key = str(stories[left].get("story_key") or "").strip()
+            right_key = str(stories[right].get("story_key") or "").strip()
+            if not left_key or not right_key:
+                continue
+            relationships.append(
+                {
+                    "source_story_key": left_key,
+                    "target_story_key": right_key,
+                    "relationship": "similar_to",
+                    "similarity": round(similarity, 4),
+                }
+            )
+    return relationships
+
+
+def _collect_story_records(payloads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    stories: List[Dict[str, Any]] = []
+    for payload in payloads:
+        stories.extend(payload.get("user_stories") or [])
+    return stories
+
+
+def _derive_roles_from_epics(epics: List[Dict[str, Any]]) -> List[str]:
+    roles: List[str] = []
+    for epic in epics:
+        roles.extend(epic.get("roles") or [])
+    return _normalize_list(roles)
+
+
+def _derive_technical_stack_from_epics(epics: List[Dict[str, Any]]) -> List[str]:
+    technologies: List[str] = []
+    for epic in epics:
+        technologies.extend(epic.get("technologies") or [])
+    return _normalize_list(technologies)
+
+
+def _description_node(state: DocumentExtractionState) -> Dict[str, Any]:
+    _trace_node_call("description")
+    requirements = _ensure_node_requirements(
+        state,
+        "description",
+        {"epics": _require_non_empty_list(state.get("epics"))},
+    )
+    if requirements:
+        return requirements
+    user_data = state.get("user_data")
+    epics = state.get("epics") or []
+    language = normalize_language(state.get("language"), default=get_default_llm_language())
+    epic_inputs = [
+        {
+            "name": str(epic.get("name") or "").strip(),
+            "description": str(epic.get("description") or "").strip(),
+        }
+        for epic in epics
+        if str(epic.get("name") or "").strip() or str(epic.get("description") or "").strip()
+    ]
+    if not epic_inputs:
+        return {"error": "Cannot generate project description without epics."}
+
+    raw = execute_agent(
         agent=DOCUMENT_DESCRIPTION_AGENT,
-        prompt_kwargs={"text": prepared_text, "language": language},
+        prompt_kwargs={"epics": epic_inputs, "language": language},
         context={"user_data": user_data},
     )
     parsed = raw if isinstance(raw, dict) else parse_json_response(raw)
     if not isinstance(parsed, dict):
-        return {"error": "Description extraction did not return valid JSON."}
+        return {"error": "Project description synthesis did not return valid JSON."}
 
     description = str(parsed.get("project_description") or "").strip()
-    roles = _normalize_list(parsed.get("roles"))
-    tech_stack = _normalize_list(parsed.get("technical_stack"))
-
     if not description:
-        return {"error": "Document did not yield a project description."}
+        return {"error": "Epic analysis did not yield a project description."}
 
-    return {
-        "project_description": description,
-        "roles": roles,
-        "technical_stack": tech_stack,
-    }
+    return {"project_description": description}
 
 
 def _normalize_epics(raw_epics: Any) -> List[Dict[str, Any]]:
@@ -239,15 +552,23 @@ def _normalize_epics(raw_epics: Any) -> List[Dict[str, Any]]:
 
 
 def _epics_node(state: DocumentExtractionState) -> Dict[str, Any]:
+    _trace_node_call("epics")
+    source_text = _build_source_text(state)
+    requirements = _ensure_node_requirements(
+        state,
+        "epics",
+        {"document_text or project_name": _require_non_empty_text(source_text)},
+    )
+    if requirements:
+        return requirements
     user_data = state.get("user_data")
-    prepared_text = state.get("prepared_text", "")
     language = normalize_language(state.get("language"), default=get_default_llm_language())
     project_description = state.get("project_description", "")
 
-    raw_epics = execute_json_agent(
+    raw_epics = execute_agent(
         agent=DOCUMENT_EPIC_EXTRACTION_AGENT,
         prompt_kwargs={
-            "text": prepared_text,
+            "text": source_text,
             "project_description": project_description,
             "language": language,
         },
@@ -332,8 +653,19 @@ def _normalize_user_stories(raw_stories: Any, epic_names: List[str]) -> List[Dic
 
 
 def _user_stories_node(state: DocumentExtractionState) -> Dict[str, Any]:
+    _trace_node_call("user_stories")
+    source_text = _build_source_text(state)
+    requirements = _ensure_node_requirements(
+        state,
+        "user_stories",
+        {
+            "epics": _require_non_empty_list(state.get("epics")),
+            "document_text or project_name": _require_non_empty_text(source_text),
+        },
+    )
+    if requirements:
+        return requirements
     user_data = state.get("user_data")
-    prepared_text = state.get("prepared_text", "")
     language = normalize_language(state.get("language"), default=get_default_llm_language())
     epics = state.get("epics") or []
     epic_names = [str(epic.get("name") or "").strip() for epic in epics if epic.get("name")]
@@ -341,10 +673,10 @@ def _user_stories_node(state: DocumentExtractionState) -> Dict[str, Any]:
     if not epic_names:
         return {"error": "Cannot extract user stories without epic names."}
 
-    raw_stories = execute_json_agent(
+    raw_stories = execute_agent(
         agent=DOCUMENT_USER_STORY_EXTRACTION_AGENT,
         prompt_kwargs={
-            "text": prepared_text,
+            "text": source_text,
             "epics": epics,
             "language": language,
         },
@@ -356,55 +688,6 @@ def _user_stories_node(state: DocumentExtractionState) -> Dict[str, Any]:
     if not stories:
         return {"error": "User story extraction returned no stories."}
     return {"user_stories": stories}
-
-
-def _normalize_relations(value: Any) -> List[Dict[str, str]]:
-    if not isinstance(value, list):
-        return []
-
-    normalized: List[Dict[str, str]] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        source = str(item.get("source") or "").strip()
-        relation = str(item.get("relation") or "").strip()
-        target = str(item.get("target") or "").strip()
-        if not source or not relation or not target:
-            continue
-        normalized.append(
-            {
-                "source_type": str(item.get("source_type") or "").strip(),
-                "source": source,
-                "relation": relation,
-                "target_type": str(item.get("target_type") or "").strip(),
-                "target": target,
-                "evidence": str(item.get("evidence") or "").strip(),
-            }
-        )
-    return normalized
-
-
-def _normalize_tasks(value: Any) -> List[Dict[str, str]]:
-    if not isinstance(value, list):
-        return []
-
-    normalized: List[Dict[str, str]] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "").strip()
-        description = str(item.get("description") or "").strip()
-        if not name and not description:
-            continue
-        normalized.append(
-            {
-                "name": name or "Untitled Task",
-                "description": description,
-                "related_user_story": str(item.get("related_user_story") or "").strip(),
-                "evidence": str(item.get("evidence") or "").strip(),
-            }
-        )
-    return normalized
 
 
 def _normalize_story_candidates(value: Any) -> List[Dict[str, Any]]:
@@ -425,12 +708,16 @@ def _normalize_story_candidates(value: Any) -> List[Dict[str, Any]]:
             story_key = _slugify(user_story)[:40] or f"story_{index}"
         if story_key in seen:
             continue
-        seen.add(story_key)
 
         roles = _normalize_list(item.get("roles"))
         role = str(item.get("role") or "").strip()
+        if not role:
+            role = _extract_role_from_user_story(user_story)
+        if not role:
+            continue
         if role and role.lower() not in {value.lower() for value in roles}:
             roles = [role, *roles]
+        seen.add(story_key)
 
         normalized.append(
             {
@@ -454,57 +741,16 @@ def _normalize_story_candidates(value: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
-def _normalize_epic_candidates(value: Any) -> List[Dict[str, Any]]:
-    if not isinstance(value, list):
-        return []
-
-    normalized: List[Dict[str, Any]] = []
-    seen = set()
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "").strip()
-        description = str(item.get("description") or "").strip()
-        if not name and not description:
-            continue
-        key = (name or description).lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        normalized.append(
-            {
-                "name": name or "Untitled Epic",
-                "description": description,
-                "roles": _normalize_list(item.get("roles")),
-                "technologies": _normalize_list(item.get("technologies")),
-                "keywords": _normalize_list(item.get("keywords")),
-                "evidence": str(item.get("evidence") or "").strip(),
-            }
-        )
-    return normalized
-
-
 def _normalize_chunk_extraction(raw_payload: Any, chunk_id: str) -> Dict[str, Any]:
     payload = raw_payload if isinstance(raw_payload, dict) else {}
     return {
         "chunk_id": chunk_id,
-        "roles": _normalize_list(payload.get("roles")),
-        "technical_stack": _normalize_list(payload.get("technical_stack")),
-        "epic_candidates": _normalize_epic_candidates(payload.get("epic_candidates")),
         "user_stories": _normalize_story_candidates(payload.get("user_stories")),
-        "tasks": _normalize_tasks(payload.get("tasks")),
-        "relations": _normalize_relations(payload.get("relations")),
     }
 
 
 def _has_signal(payload: Dict[str, Any]) -> bool:
-    return any(payload.get(key) for key in ("roles", "technical_stack", "epic_candidates", "user_stories"))
-
-
-def _batched(items: List[Any], size: int) -> Iterable[List[Any]]:
-    batch_size = max(1, int(size))
-    for index in range(0, len(items), batch_size):
-        yield items[index:index + batch_size]
+    return bool(payload.get("user_stories"))
 
 
 def _merge_story_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -547,54 +793,6 @@ def _merge_story_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(merged.values())
 
 
-def _merge_epic_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    merged: Dict[str, Dict[str, Any]] = {}
-    for item in records:
-        name = str(item.get("name") or "").strip() or "Untitled Epic"
-        key = name.lower()
-        if key not in merged:
-            merged[key] = dict(item)
-            merged[key]["name"] = name
-            continue
-        existing = merged[key]
-        if not existing.get("description") and item.get("description"):
-            existing["description"] = item.get("description")
-        existing["roles"] = _normalize_list((existing.get("roles") or []) + (item.get("roles") or []))
-        existing["technologies"] = _normalize_list(
-            (existing.get("technologies") or []) + (item.get("technologies") or [])
-        )
-        existing["keywords"] = _normalize_list((existing.get("keywords") or []) + (item.get("keywords") or []))
-    return list(merged.values())
-
-
-def _fallback_merge_extractions(payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
-    roles: List[str] = []
-    technical_stack: List[str] = []
-    epic_candidates: List[Dict[str, Any]] = []
-    user_stories: List[Dict[str, Any]] = []
-    for payload in payloads:
-        roles.extend(payload.get("roles") or [])
-        technical_stack.extend(payload.get("technical_stack") or [])
-        epic_candidates.extend(payload.get("epic_candidates") or [])
-        user_stories.extend(payload.get("user_stories") or [])
-    return {
-        "roles": _normalize_list(roles),
-        "technical_stack": _normalize_list(technical_stack),
-        "epic_candidates": _merge_epic_records(epic_candidates),
-        "user_stories": _merge_story_records(user_stories),
-    }
-
-
-def _normalize_consolidated_extraction(raw_payload: Any) -> Dict[str, Any]:
-    payload = raw_payload if isinstance(raw_payload, dict) else {}
-    return {
-        "roles": _normalize_list(payload.get("roles")),
-        "technical_stack": _normalize_list(payload.get("technical_stack")),
-        "epic_candidates": _merge_epic_records(_normalize_epic_candidates(payload.get("epic_candidates"))),
-        "user_stories": _merge_story_records(_normalize_story_candidates(payload.get("user_stories"))),
-    }
-
-
 def _normalize_grouped_epics(raw_payload: Any, story_keys: List[str]) -> List[Dict[str, Any]]:
     if not isinstance(raw_payload, dict):
         return []
@@ -627,6 +825,14 @@ def _normalize_grouped_epics(raw_payload: Any, story_keys: List[str]) -> List[Di
 
 
 def _chunk_extraction_node(state: DocumentExtractionState) -> Dict[str, Any]:
+    _trace_node_call("chunk_extraction")
+    requirements = _ensure_node_requirements(
+        state,
+        "chunk_extraction",
+        {"evidence_chunks": _require_non_empty_list(state.get("evidence_chunks"))},
+    )
+    if requirements:
+        return requirements
     language = normalize_language(state.get("language"), default=get_default_llm_language())
     chunk_extractions: List[Dict[str, Any]] = []
 
@@ -636,11 +842,10 @@ def _chunk_extraction_node(state: DocumentExtractionState) -> Dict[str, Any]:
         if not chunk_id or not chunk_text:
             continue
 
-        raw = execute_json_agent(
+        raw = execute_agent(
             agent=DOCUMENT_CHUNK_EXTRACTION_AGENT,
             prompt_kwargs={
                 "project_name": state.get("project_name", ""),
-                "project_description": state.get("project_description", ""),
                 "chunk_id": chunk_id,
                 "text": chunk_text,
                 "language": language,
@@ -657,58 +862,64 @@ def _chunk_extraction_node(state: DocumentExtractionState) -> Dict[str, Any]:
 
 
 def _consolidation_node(state: DocumentExtractionState) -> Dict[str, Any]:
+    _trace_node_call("consolidation")
+    requirements = _ensure_node_requirements(
+        state,
+        "consolidation",
+        {"chunk_extractions": _require_non_empty_list(state.get("chunk_extractions"))},
+    )
+    if requirements:
+        return requirements
     current_payloads = list(state.get("chunk_extractions") or [])
-    if not current_payloads:
-        return {"error": "Cannot consolidate without chunk extractions."}
+    user_stories = _collect_story_records(current_payloads)
+    if not user_stories:
+        return {"error": "Document consolidation requires extracted user stories."}
+    if _is_document_extraction_debug_enabled():
+        logger.warning("Document extraction collected %s user stories before consolidation.", len(user_stories))
+        print(f"Document extraction collected {len(user_stories)} user stories before consolidation.")
 
-    language = normalize_language(state.get("language"), default=get_default_llm_language())
-    while len(current_payloads) > 1:
-        next_round: List[Dict[str, Any]] = []
-        for batch in _batched(current_payloads, CONSOLIDATION_BATCH_SIZE):
-            raw = execute_json_agent(
-                agent=DOCUMENT_ENTITY_CONSOLIDATION_AGENT,
-                prompt_kwargs={
-                    "project_name": state.get("project_name", ""),
-                    "project_description": state.get("project_description", ""),
-                    "extractions": batch,
-                    "language": language,
-                },
-                context={"user_data": state.get("user_data")},
-            )
-            normalized = _normalize_consolidated_extraction(raw)
-            next_round.append(normalized if _has_signal(normalized) else _fallback_merge_extractions(batch))
-        current_payloads = next_round
-
-    consolidated = _normalize_consolidated_extraction(current_payloads[0])
-    if not _has_signal(consolidated):
-        consolidated = _fallback_merge_extractions(state.get("chunk_extractions") or [])
-    if not consolidated.get("user_stories") and not consolidated.get("epic_candidates"):
+    embeddings = _embed_story_records(user_stories)
+    consolidated_stories, consolidated_embeddings = _dedupe_stories_with_embeddings(
+        user_stories,
+        embeddings=embeddings,
+    )
+    _write_consolidated_story_debug_dump(state, consolidated_stories)
+    story_relationships = _build_story_relationships(consolidated_stories, embeddings=consolidated_embeddings)
+    consolidated = {
+        "roles": [],
+        "technical_stack": [],
+        "epic_candidates": [],
+        "user_stories": consolidated_stories,
+    }
+    if not consolidated_stories:
         return {"error": "Document consolidation returned no usable entities."}
 
     return {
-        "roles": _normalize_list((state.get("roles") or []) + (consolidated.get("roles") or [])),
-        "technical_stack": _normalize_list(
-            (state.get("technical_stack") or []) + (consolidated.get("technical_stack") or [])
-        ),
+        "roles": [],
+        "technical_stack": [],
         "consolidated_extraction": consolidated,
+        "story_relationships": story_relationships,
     }
 
 
 def _grouping_node(state: DocumentExtractionState) -> Dict[str, Any]:
+    _trace_node_call("grouping")
     consolidated = state.get("consolidated_extraction") or {}
+    requirements = _ensure_node_requirements(
+        state,
+        "grouping",
+        {"consolidated user_stories": _require_non_empty_list(consolidated.get("user_stories"))},
+    )
+    if requirements:
+        return requirements
     user_stories = consolidated.get("user_stories") or []
-    if not user_stories:
-        return {"error": "Cannot group stories because no consolidated user stories were found."}
 
-    raw = execute_json_agent(
+    raw = execute_agent(
         agent=DOCUMENT_STORY_GROUPING_AGENT,
         prompt_kwargs={
             "project_name": state.get("project_name", ""),
-            "project_description": state.get("project_description", ""),
-            "roles": state.get("roles") or [],
-            "technical_stack": state.get("technical_stack") or [],
-            "epic_candidates": consolidated.get("epic_candidates") or [],
             "user_stories": user_stories,
+            "story_relationships": state.get("story_relationships") or [],
             "language": normalize_language(state.get("language"), default=get_default_llm_language()),
         },
         context={"user_data": state.get("user_data")},
@@ -813,9 +1024,23 @@ def _materialize_grouped_outputs(state: DocumentExtractionState) -> Dict[str, An
 
 
 def _materialize_outputs_node(state: DocumentExtractionState) -> Dict[str, Any]:
+    _trace_node_call("materialize_outputs")
+    source_text = _build_source_text(state)
+    requirements = _ensure_node_requirements(
+        state,
+        "materialize_outputs",
+        {"document_text or project_name": _require_non_empty_text(source_text)},
+    )
+    if requirements:
+        return requirements
     materialized = _materialize_grouped_outputs(state)
     if materialized.get("epics") and materialized.get("user_stories"):
-        return materialized
+        epics = materialized.get("epics") or []
+        return {
+            **materialized,
+            "roles": _derive_roles_from_epics(epics),
+            "technical_stack": _derive_technical_stack_from_epics(epics),
+        }
 
     legacy_epics = _epics_node(state)
     if legacy_epics.get("error"):
@@ -830,10 +1055,24 @@ def _materialize_outputs_node(state: DocumentExtractionState) -> Dict[str, Any]:
     return {
         "epics": legacy_epics.get("epics") or [],
         "user_stories": legacy_stories.get("user_stories") or [],
+        "roles": _derive_roles_from_epics(legacy_epics.get("epics") or []),
+        "technical_stack": _derive_technical_stack_from_epics(legacy_epics.get("epics") or []),
     }
 
 
 def _validate_node(state: DocumentExtractionState) -> Dict[str, Any]:
+    _trace_node_call("validate")
+    requirements = _ensure_node_requirements(
+        state,
+        "validate",
+        {
+            "project_description": _require_non_empty_text(state.get("project_description")),
+            "epics": _require_non_empty_list(state.get("epics")),
+            "user_stories": _require_non_empty_list(state.get("user_stories")),
+        },
+    )
+    if requirements:
+        return requirements
     if not state.get("project_description"):
         return {"error": "Missing extracted project description."}
     if not state.get("epics"):
@@ -851,11 +1090,11 @@ def _run_sequential_fallback(initial_state: DocumentExtractionState) -> Document
     state: DocumentExtractionState = dict(initial_state)
     for node in (
         _prepare_text_node,
-        _description_node,
         _chunk_extraction_node,
         _consolidation_node,
         _grouping_node,
         _materialize_outputs_node,
+        _description_node,
         _validate_node,
     ):
         updates = node(state)
@@ -884,21 +1123,16 @@ def run_document_extraction_graph(
 
     graph = StateGraph(DocumentExtractionState)
     graph.add_node("prepare_text", _prepare_text_node)
-    graph.add_node("description", _description_node)
     graph.add_node("chunk_extraction", _chunk_extraction_node)
     graph.add_node("consolidation", _consolidation_node)
     graph.add_node("grouping", _grouping_node)
     graph.add_node("materialize_outputs", _materialize_outputs_node)
+    graph.add_node("description", _description_node)
     graph.add_node("validate", _validate_node)
 
     graph.add_edge(START, "prepare_text")
     graph.add_conditional_edges(
         "prepare_text",
-        _route_on_error,
-        {"ok": "description", "error": END},
-    )
-    graph.add_conditional_edges(
-        "description",
         _route_on_error,
         {"ok": "chunk_extraction", "error": END},
     )
@@ -919,6 +1153,11 @@ def run_document_extraction_graph(
     )
     graph.add_conditional_edges(
         "materialize_outputs",
+        _route_on_error,
+        {"ok": "description", "error": END},
+    )
+    graph.add_conditional_edges(
+        "description",
         _route_on_error,
         {"ok": "validate", "error": END},
     )

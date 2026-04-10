@@ -9,6 +9,7 @@ from src.utils.authz.auth import get_current_user
 from src.utils.ai.assistant_chat_history import (
     ASSISTANT_CHAT_HISTORY_LIMIT,
     append_assistant_chat_messages,
+    clear_assistant_chat_history,
     get_assistant_chat_history,
 )
 from src.utils.planning.epics import get_epic_by_id
@@ -172,6 +173,50 @@ async def assistant_chat_history_route(
             "project_id": project_id_value,
             "messages": history,
         },
+    )
+    return JSONResponse(status_code=200, content=response.dict())
+
+
+@router.delete(
+    "/chat/history",
+    response_description="Clear persisted assistant chat history for the current user and project.",
+)
+async def assistant_clear_chat_history_route(
+    project_id: str,
+    user_data: UserData = Depends(get_current_user),
+):
+    project_id_value = (project_id or "").strip()
+    if not project_id_value:
+        return JSONResponse(
+            status_code=422,
+            content=ResponseModel(success=False, message="project_id is required", data=None).dict(),
+        )
+
+    access = get_project_access(project_id_value, user_data.get_user_id(), user_data.get_email())
+    if not access.success:
+        return JSONResponse(
+            status_code=403,
+            content=ResponseModel(success=False, message=access.message, data=None).dict(),
+        )
+
+    cleared = clear_assistant_chat_history(
+        user_id=user_data.get_user_id(),
+        project_id=project_id_value,
+    )
+    if not cleared:
+        return JSONResponse(
+            status_code=500,
+            content=ResponseModel(
+                success=False,
+                message="Failed to clear assistant chat history",
+                data=None,
+            ).dict(),
+        )
+
+    response = ResponseModel(
+        success=True,
+        message="Assistant chat history cleared",
+        data={"project_id": project_id_value},
     )
     return JSONResponse(status_code=200, content=response.dict())
 

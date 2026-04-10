@@ -117,3 +117,18 @@ def append_assistant_chat_messages(
         messages=combined_messages,
         limit=limit,
     )
+
+
+def clear_assistant_chat_history(user_id: str, project_id: str) -> bool:
+    if not user_id or not project_id:
+        return False
+
+    doc_id = _history_doc_id(user_id, project_id)
+
+    try:
+        doc_ref = FIRESTORE_CLIENT.collection(ASSISTANT_CHAT_HISTORY_COLLECTION).document(doc_id)
+        doc_ref.delete()
+        return True
+    except Exception as history_error:
+        logging.error("Failed to clear assistant chat history (%s): %s", doc_id, history_error)
+        return False

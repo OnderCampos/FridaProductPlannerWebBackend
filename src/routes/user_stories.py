@@ -6,7 +6,6 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, File, HTTPException, Path, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import List, Optional
-import secrets
 from pydantic import ValidationError
 
 from src.schemas.resources_request import (
@@ -30,7 +29,10 @@ from src.utils.planning.user_story_generation import (
     generate_analysis,
     generate_user_stories
 )
-from src.utils.planning.user_story_dependencies import generate_user_story_dependencies
+from src.utils.planning.user_story_dependencies import (
+    generate_and_persist_user_story_dependencies,
+    generate_user_story_dependencies,
+)
 from src.utils.planning.user_stories import (
     create_multiple_user_stories,
     create_user_story,
@@ -42,7 +44,7 @@ from src.utils.planning.user_stories import (
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
 from src.utils.authz.permissions import get_project_access
-from src.utils.planning.assignees import build_member_lookup, normalize_assignee_fields
+from src.utils.planning.assignees import build_member_lookup
 from src.utils.planning.members import get_member_by_id
 from src.utils.planning.subtask_generation import (
     generate_subtasks_for_user_story,
@@ -74,14 +76,6 @@ from src.utils.documents.user_story_document import (
 
 router = APIRouter()
 
-
-def _ensure_user_story_id(value: Optional[str]) -> str:
-    raw = str(value or "").strip()
-    if raw:
-        return raw
-    return f"US-{secrets.token_hex(3).upper()}"
-
-
 def _build_story_assignee_update(project_id: str, req: UpdateUserStoryAssigneeRequest) -> dict:
     update_data: dict = {}
 
@@ -95,31 +89,91 @@ def _build_story_assignee_update(project_id: str, req: UpdateUserStoryAssigneeRe
         update_data["assigned_to"] = req.assigneeId
         if member.get("email"):
             update_data["assigneeEmail"] = member.get("email")
+            update_data["assignee_email"] = member.get("email")
         return update_data
 
+    assignee_email = str(req.assignee_email or "").strip()
     assignee_value = str(req.assignee or "").strip()
-    if not assignee_value or assignee_value.lower() == "unassigned":
+    resolved_assignee = assignee_email or assignee_value
+    if not resolved_assignee or resolved_assignee.lower() == "unassigned":
         return {
             "assignee": "",
             "assigneeId": None,
             "assigned_to": None,
             "assigneeEmail": None,
+            "assignee_email": None,
         }
 
-    member_lookup = build_member_lookup(project_id)
-    resolved = normalize_assignee_fields({"assignee": assignee_value}, member_lookup)
-
-    update_data["assignee"] = resolved.get("assignee") or assignee_value
-    if resolved.get("assigneeId"):
-        update_data["assigneeId"] = resolved.get("assigneeId")
-    if resolved.get("assignee_id"):
-        update_data["assigned_to"] = resolved.get("assignee_id")
-    if resolved.get("assigneeEmail"):
-        update_data["assigneeEmail"] = resolved.get("assigneeEmail")
-    elif resolved.get("assignee_email"):
-        update_data["assigneeEmail"] = resolved.get("assignee_email")
+    update_data["assignee"] = assignee_value or assignee_email
+    if assignee_email:
+        update_data["assigneeEmail"] = assignee_email
+        update_data["assignee_email"] = assignee_email
+        member_lookup = build_member_lookup(project_id)
+        member = member_lookup.get("by_email", {}).get(assignee_email.lower())
+        if member:
+            update_data["assignee"] = member.get("name") or assignee_email
+            update_data["assigneeId"] = member.get("id")
+            update_data["assigned_to"] = member.get("id")
 
     return update_data
+
+
+def _story_identifier_map(user_stories: List[dict]) -> dict:
+    identifiers = {}
+    for story in user_stories or []:
+        if not isinstance(story, dict):
+            continue
+        story_id = str(story.get("id") or "").strip()
+        user_story_id = str(story.get("user_story_id") or "").strip()
+        if story_id:
+            identifiers[story_id] = story
+        if user_story_id:
+            identifiers[user_story_id] = story
+    return identifiers
+
+
+async def _refresh_epic_story_dependencies(epic_id: str, user_data: UserData) -> List[dict]:
+    existing = get_user_stories_by_epic(epic_id, user_data.get_user_id(), allow_member=True)
+    existing_stories = existing.data if existing and existing.success and isinstance(existing.data, list) else []
+    if not existing_stories:
+        return []
+
+    dependencies_response = await generate_and_persist_user_story_dependencies(
+        user_data=user_data,
+        epic_id=epic_id,
+        user_stories=existing_stories,
+    )
+    if (
+        dependencies_response.success
+        and isinstance(dependencies_response.data, dict)
+        and isinstance(dependencies_response.data.get("user_stories"), list)
+    ):
+        return dependencies_response.data.get("user_stories") or []
+
+    return existing_stories
+
+
+def _select_updated_stories(created_stories: List[dict], refreshed_stories: List[dict]) -> List[dict]:
+    if not created_stories or not refreshed_stories:
+        return created_stories
+
+    refreshed_by_identifier = _story_identifier_map(refreshed_stories)
+    updated_stories: List[dict] = []
+    for story in created_stories:
+        if not isinstance(story, dict):
+            updated_stories.append(story)
+            continue
+
+        story_id = str(story.get("id") or "").strip()
+        user_story_id = str(story.get("user_story_id") or "").strip()
+        updated_story = (
+            refreshed_by_identifier.get(story_id)
+            or refreshed_by_identifier.get(user_story_id)
+            or story
+        )
+        updated_stories.append(updated_story)
+
+    return updated_stories
 
 
 def _require_project_lead(project_id: str, user_data):
@@ -129,30 +183,6 @@ def _require_project_lead(project_id: str, user_data):
         raise HTTPException(status_code=status_code, detail=access.message)
     if not access.data.get("is_lead"):
         raise HTTPException(status_code=403, detail="Forbidden: Team members cannot perform this action")
-
-def _attach_story_dependencies(user_stories, dependencies):
-    if not isinstance(user_stories, list) or not isinstance(dependencies, list):
-        return user_stories
-
-    dep_map = {}
-    for item in dependencies:
-        story_id = item.get("story_id")
-        if story_id:
-            dep_map[str(story_id)] = item.get("depends_on", [])
-
-    merged = []
-    for story in user_stories:
-        if not isinstance(story, dict):
-            merged.append(story)
-            continue
-        story_id = str(story.get("id") or "")
-        user_story_id = str(story.get("user_story_id") or "")
-        depends_on = dep_map.get(story_id) or dep_map.get(user_story_id) or story.get("dependencies") or []
-        next_story = dict(story)
-        next_story["dependencies"] = depends_on
-        merged.append(next_story)
-    return merged
-
 
 async def _parse_expand_user_stories_request(request: Request) -> tuple[ExpandUserStoriesRequest, List[UploadFile]]:
     content_type = str(request.headers.get("content-type") or "").lower()
@@ -297,29 +327,9 @@ async def generate_user_stories_single_route(
                 content=response.dict(),
             )
 
-        data = response.data if isinstance(response.data, dict) else {}
-        user_stories = data.get("user_stories") if isinstance(data, dict) else None
-
-        if isinstance(user_stories, list) and user_stories:
-            dependencies_response = await generate_user_story_dependencies(
-                user_data=user_data,
-                epic_id=req.epic_id,
-                user_stories=user_stories,
-            )
-
-            if dependencies_response.success and dependencies_response.data:
-                dependencies = dependencies_response.data.get("dependencies", [])
-                data["user_stories"] = _attach_story_dependencies(user_stories, dependencies)
-            else:
-                data["user_stories"] = user_stories
-
         return JSONResponse(
             status_code=200,
-            content=ResponseModel(
-                success=True,
-                message=response.message,
-                data=data,
-            ).dict(),
+            content=response.dict(),
         )
     except HTTPException:
         raise
@@ -385,10 +395,14 @@ async def create_user_story_manual_route(
 
     payload = req.model_dump(exclude={"epic_id"})
     payload["epic"] = epic_response.data.get("name") or epic_response.data.get("epic") or ""
-    payload["user_story_id"] = _ensure_user_story_id(payload.get("user_story_id"))
     payload["dependencies"] = payload.get("dependencies") or []
 
     response = create_user_story(req.epic_id, user_data.get_user_id(), payload)
+    if response.success and isinstance(response.data, dict):
+        refreshed_stories = await _refresh_epic_story_dependencies(req.epic_id, user_data)
+        updated_stories = _select_updated_stories([response.data], refreshed_stories)
+        response.data = updated_stories[0] if updated_stories else response.data
+
     return JSONResponse(
         status_code=201 if response.success else 400,
         content=response.dict(),
@@ -511,7 +525,6 @@ async def accept_user_story_qa_route(
         "epic": str(draft_data.get("epic_name") or epic_response.data.get("name") or ""),
         "user_story": str(story_draft.get("user_story") or "").strip(),
         "description": str(story_draft.get("description") or "").strip(),
-        "user_story_id": _ensure_user_story_id(story_draft.get("user_story_id")),
         "order": story_draft.get("order", 0),
         "dependencies": story_draft.get("dependencies") or [],
         "effortHours": story_draft.get("effortHours", 0),
@@ -531,6 +544,10 @@ async def accept_user_story_qa_route(
 
     response = create_user_story(epic_id, user_data.get_user_id(), payload)
     if response.success:
+        if isinstance(response.data, dict):
+            refreshed_stories = await _refresh_epic_story_dependencies(epic_id, user_data)
+            updated_stories = _select_updated_stories([response.data], refreshed_stories)
+            response.data = updated_stories[0] if updated_stories else response.data
         delete_user_story_draft(req.draft_id)
         return JSONResponse(status_code=201, content=response.dict())
     return JSONResponse(status_code=400, content=response.dict())
@@ -697,12 +714,16 @@ async def expand_user_stories_route(
     if not save_result.success:
         return JSONResponse(status_code=400, content=save_result.dict())
 
+    saved_stories = save_result.data if isinstance(save_result.data, list) else []
+    refreshed_stories = await _refresh_epic_story_dependencies(req.epic_id, user_data)
+    updated_stories = _select_updated_stories(saved_stories, refreshed_stories)
+
     return JSONResponse(
         status_code=200,
         content=ResponseModel(
             success=True,
             message=save_result.message,
-            data={"user_stories": save_result.data, "generated_count": len(save_result.data or [])},
+            data={"user_stories": updated_stories, "generated_count": len(updated_stories)},
         ).dict(),
     )
 
@@ -743,8 +764,8 @@ async def update_user_story_assignee_route(
     """
     Assigns or reassigns a user story to a team member.
     """
-    if not req or (req.assigneeId is None and req.assignee is None):
-        raise HTTPException(status_code=400, detail="assigneeId or assignee is required")
+    if not req or (req.assigneeId is None and req.assignee is None and req.assignee_email is None):
+        raise HTTPException(status_code=400, detail="assigneeId, assignee, or assignee_email is required")
 
     try:
         story_response = get_user_story_by_id(
@@ -808,8 +829,8 @@ async def update_user_story_assignee_name_route(
     """
     Assigns or reassigns a user story to a team member via assignee name or ID.
     """
-    if not req or (req.assigneeId is None and req.assignee is None):
-        raise HTTPException(status_code=400, detail="assigneeId or assignee is required")
+    if not req or (req.assigneeId is None and req.assignee is None and req.assignee_email is None):
+        raise HTTPException(status_code=400, detail="assigneeId, assignee, or assignee_email is required")
 
     try:
         story_response = get_user_story_by_id(

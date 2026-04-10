@@ -19,11 +19,8 @@ DOCUMENT_STORY_GROUPING_AGENT = Agent(
     azure_deployment=_DOCUMENT_STORY_GROUPING_DEPLOYMENT,
     args=[
         "project_name",
-        "project_description",
-        "roles",
-        "technical_stack",
-        "epic_candidates",
         "user_stories",
+        "story_relationships",
         "language",
     ],
 )

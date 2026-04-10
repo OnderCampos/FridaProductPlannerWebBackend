@@ -22,7 +22,8 @@ from src.services.workflows.project_creation.common import (
 )
 from src.utils.planning.projects import get_project_by_id
 from src.utils.planning.epics import create_epic
-from src.utils.planning.user_stories import create_user_story
+from src.utils.planning.user_story_dependencies import generate_and_persist_user_story_dependencies
+from src.utils.planning.user_stories import create_user_story, get_user_stories_by_epic
 from src.utils.planning.user_story_generation import enrich_user_story_details
 
 
@@ -687,7 +688,7 @@ def _try_group_stories_with_agent(
         from src.intelligence.agents.jira_import.story_grouping_agent import (
             JIRA_STORY_GROUPING_AGENT,
         )
-        from src.intelligence.agents.json_executor import execute_json_agent
+        from src.intelligence.agents.json_executor import execute_agent
     except Exception as exc:
         logger.warning("Jira grouping agent not available: %s", exc)
         return None
@@ -725,7 +726,7 @@ def _try_group_stories_with_agent(
         )
 
     try:
-        raw = execute_json_agent(
+        raw = execute_agent(
             agent=JIRA_STORY_GROUPING_AGENT,
             prompt_kwargs={
                 "existing_epics": trimmed_existing_epics,
@@ -1104,6 +1105,7 @@ async def import_project_from_jira(
     story_order = 0
     unlinked_batch: List[Dict[str, Any]] = []
     unlinked_by_key: Dict[str, Dict[str, Any]] = {}
+    affected_epic_ids: set[str] = set()
 
     async def _create_user_story_in_epic(*, epic_id: str, epic_name: str, story: Dict[str, Any]) -> None:
         nonlocal imported_stories
@@ -1118,10 +1120,13 @@ async def import_project_from_jira(
             "epic": epic_name,
             "user_story": summary or jira_key or "User story",
             "description": description_text,
-            "user_story_id": jira_key,
             "order": order,
             "dependencies": [],
             "jira_base_url": credentials.base_url,
+            "document": {
+                "jira_id": jira_key,
+                "jira_base_url": credentials.base_url,
+            },
             "effortHours": effort_hours,
         }
 
@@ -1140,6 +1145,7 @@ async def import_project_from_jira(
                 "Failed to create user story from Jira issue %s: %s", jira_key, created_story.message
             )
             return
+        affected_epic_ids.add(epic_id)
         imported_stories += 1
 
     def _get_or_create_agent_epic(*, epic_name: str, description: str) -> Optional[Tuple[str, str]]:
@@ -1361,6 +1367,32 @@ async def import_project_from_jira(
         )
 
     await _flush_unlinked_batch()
+
+    for epic_id in affected_epic_ids:
+        existing_stories = get_user_stories_by_epic(
+            epic_id,
+            user_data.get_user_id(),
+            allow_member=True,
+        )
+        stories_for_epic = (
+            existing_stories.data
+            if existing_stories.success and isinstance(existing_stories.data, list)
+            else []
+        )
+        if not stories_for_epic:
+            continue
+
+        dependencies_response = await generate_and_persist_user_story_dependencies(
+            user_data=user_data,
+            epic_id=epic_id,
+            user_stories=stories_for_epic,
+        )
+        if not dependencies_response.success:
+            logger.warning(
+                "Jira import saved user stories for epic %s without refreshed dependencies: %s",
+                epic_id,
+                dependencies_response.message,
+            )
 
     stats = {
         "imported_epics": imported_epics,

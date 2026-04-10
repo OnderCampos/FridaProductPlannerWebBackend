@@ -18,6 +18,8 @@ from src.schemas.user_data import UserData
 from src.services.setup.variables_setup import gpt40_mini_client
 from src.services.setup.language_setup import get_default_llm_language, normalize_language
 from src.utils.planning.epics import (
+    create_epic,
+    delete_epic,
     get_epic_by_id,
     get_epics_for_project_with_auth,
     update_epic,
@@ -28,16 +30,22 @@ from src.utils.authz.permissions import get_project_access, get_project_id_for_s
 from src.utils.planning.projects import get_project_by_id
 from src.utils.planning.sprints import (
     assign_item_to_sprint,
+    create_sprint,
+    delete_sprint,
     get_sprint_items,
     get_sprints_for_project,
     unassign_item_from_sprint,
+    update_sprint,
 )
 from src.utils.planning.subtask_generation import (
+    create_subtask_for_user_story,
+    delete_subtasks_by_user_story,
     get_subtasks_by_user_story,
     update_subtask_fields,
     update_subtask_status,
 )
 from src.utils.planning.user_stories import (
+    create_user_story,
     get_user_story_by_id,
     get_user_stories_by_epic_with_auth,
     update_user_story,
@@ -267,6 +275,189 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
         else:
             operation = update_subtask_status(item_id, user_id, status)
 
+        return _action_result(action_type, action_id, operation)
+
+    if action_type == "create_epic":
+        project_id = str(payload.get("project_id") or "").strip()
+        fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+
+        if not project_id:
+            return ResponseModel(success=False, message="project_id is required", data=None)
+        if not fields:
+            return ResponseModel(success=False, message="fields are required", data=None)
+
+        access = _require_project_lead_access(user_data, project_id)
+        if not access.success:
+            return access
+
+        name = str(fields.get("name") or "").strip()
+        description = str(fields.get("description") or "").strip()
+        if not name:
+            return ResponseModel(success=False, message="Epic name is required", data=None)
+
+        operation = create_epic(
+            project_id,
+            user_id,
+            {
+                "name": name,
+                "description": description,
+                "labels": fields.get("labels") if isinstance(fields.get("labels"), list) else [],
+                "priority": str(fields.get("priority") or "").strip() or "Medium",
+                "status": _normalize_item_status(fields.get("status")) or "To Do",
+                "storyPoints": fields.get("storyPoints") or fields.get("story_points") or 0,
+            },
+        )
+        return _action_result(action_type, action_id, operation)
+
+    if action_type == "delete_epic":
+        epic_id = str(payload.get("epic_id") or "").strip()
+        if not epic_id:
+            return ResponseModel(success=False, message="epic_id is required", data=None)
+
+        epic_response = get_epic_by_id(epic_id)
+        if not epic_response.success or not isinstance(epic_response.data, dict):
+            return ResponseModel(success=False, message="Epic not found", data=None)
+
+        access = _require_project_lead_access(user_data, epic_response.data.get("project_id") or "")
+        if not access.success:
+            return access
+
+        operation = delete_epic(epic_id, user_id)
+        return _action_result(action_type, action_id, operation)
+
+    if action_type == "create_sprint":
+        project_id = str(payload.get("project_id") or "").strip()
+        fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+
+        if not project_id:
+            return ResponseModel(success=False, message="project_id is required", data=None)
+        if not fields:
+            return ResponseModel(success=False, message="fields are required", data=None)
+
+        access = _require_project_lead_access(user_data, project_id)
+        if not access.success:
+            return access
+
+        name = str(fields.get("name") or "").strip()
+        if not name:
+            return ResponseModel(success=False, message="Sprint name is required", data=None)
+
+        raw_length_days = fields.get("lengthDays", fields.get("length_days"))
+        try:
+            length_days = int(raw_length_days)
+        except (TypeError, ValueError):
+            return ResponseModel(success=False, message="lengthDays must be a number", data=None)
+
+        operation = create_sprint(
+            project_id=project_id,
+            user_id=user_id,
+            name=name,
+            length_days=length_days,
+            start_date=str(fields.get("startDate") or fields.get("start_date") or "").strip() or None,
+            end_date=str(fields.get("endDate") or fields.get("end_date") or "").strip() or None,
+        )
+        return _action_result(action_type, action_id, operation)
+
+    if action_type == "update_sprint":
+        project_id = str(payload.get("project_id") or "").strip()
+        sprint_id = str(payload.get("sprint_id") or "").strip()
+        fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+
+        if not project_id or not sprint_id:
+            return ResponseModel(success=False, message="project_id and sprint_id are required", data=None)
+        if not fields:
+            return ResponseModel(success=False, message="fields are required", data=None)
+
+        access = _require_project_lead_access(user_data, project_id)
+        if not access.success:
+            return access
+
+        raw_length_days = fields.get("lengthDays", fields.get("length_days"))
+        length_days: Optional[int] = None
+        if raw_length_days is not None:
+            try:
+                length_days = int(raw_length_days)
+            except (TypeError, ValueError):
+                return ResponseModel(success=False, message="lengthDays must be a number", data=None)
+
+        operation = update_sprint(
+            sprint_id=sprint_id,
+            project_id=project_id,
+            user_id=user_id,
+            name=str(fields.get("name")).strip() if fields.get("name") is not None else None,
+            length_days=length_days,
+            start_date=str(fields.get("startDate") or fields.get("start_date")).strip()
+            if fields.get("startDate") is not None or fields.get("start_date") is not None
+            else None,
+            end_date=str(fields.get("endDate") or fields.get("end_date")).strip()
+            if fields.get("endDate") is not None or fields.get("end_date") is not None
+            else None,
+        )
+        return _action_result(action_type, action_id, operation)
+
+    if action_type == "delete_sprint":
+        project_id = str(payload.get("project_id") or "").strip()
+        sprint_id = str(payload.get("sprint_id") or "").strip()
+        if not project_id or not sprint_id:
+            return ResponseModel(success=False, message="project_id and sprint_id are required", data=None)
+
+        access = _require_project_lead_access(user_data, project_id)
+        if not access.success:
+            return access
+
+        operation = delete_sprint(
+            sprint_id=sprint_id,
+            project_id=project_id,
+            user_id=user_id,
+            unassign_items=bool(payload.get("unassign_items", True)),
+        )
+        return _action_result(action_type, action_id, operation)
+
+    if action_type == "create_user_story":
+        epic_id = str(payload.get("epic_id") or "").strip()
+        fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+
+        if not epic_id:
+            return ResponseModel(success=False, message="epic_id is required", data=None)
+        if not fields:
+            return ResponseModel(success=False, message="fields are required", data=None)
+
+        epic_response = get_epic_by_id(epic_id)
+        if not epic_response.success or not isinstance(epic_response.data, dict):
+            return ResponseModel(success=False, message="Epic not found", data=None)
+
+        access = _require_project_lead_access(user_data, epic_response.data.get("project_id") or "")
+        if not access.success:
+            return access
+
+        story_title = str(
+            fields.get("user_story")
+            or fields.get("title")
+            or ""
+        ).strip()
+        description = str(fields.get("description") or "").strip()
+        if not story_title or not description:
+            return ResponseModel(
+                success=False,
+                message="User story title and description are required",
+                data=None,
+            )
+
+        operation = create_user_story(
+            epic_id,
+            user_id,
+            {
+                "epic": str(epic_response.data.get("name") or "").strip(),
+                "user_story": story_title,
+                "description": description,
+                "priority": fields.get("priority"),
+                "story_points": fields.get("storyPoints", fields.get("story_points", 0)),
+                "dueDate": fields.get("dueDate", fields.get("due_date")),
+                "status": _normalize_item_status(fields.get("status")) or fields.get("status") or "To Do",
+                "effortHours": fields.get("effortHours", fields.get("effort_hours", 0)),
+                "dependencies": fields.get("dependencies") if isinstance(fields.get("dependencies"), list) else [],
+            },
+        )
         return _action_result(action_type, action_id, operation)
 
     if action_type == "update_user_story":
@@ -543,6 +734,38 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
 
         return _action_result(action_type, action_id, latest_result)
 
+    if action_type == "create_subtask":
+        story_id = str(payload.get("story_id") or "").strip()
+        fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+
+        if not story_id:
+            return ResponseModel(success=False, message="story_id is required", data=None)
+        if not fields:
+            return ResponseModel(success=False, message="fields are required", data=None)
+
+        project_id = get_project_id_for_story(story_id)
+        access = _require_project_lead_access(user_data, project_id or "")
+        if not access.success:
+            return access
+
+        title = str(fields.get("title") or "").strip()
+        if not title:
+            return ResponseModel(success=False, message="Subtask title is required", data=None)
+
+        operation = create_subtask_for_user_story(
+            story_id,
+            user_id,
+            {
+                "title": title,
+                "description": str(fields.get("description") or "").strip(),
+                "estimated_hours": fields.get("estimated_hours", 0),
+                "complexity": str(fields.get("complexity") or "Medium").strip() or "Medium",
+                "dependencies": fields.get("dependencies") if isinstance(fields.get("dependencies"), list) else [],
+                "status": _normalize_item_status(fields.get("status")) or fields.get("status") or "To Do",
+            },
+        )
+        return _action_result(action_type, action_id, operation)
+
     if action_type == "assign_sprint_item":
         project_id = str(payload.get("project_id") or "").strip()
         sprint_id = str(payload.get("sprint_id") or "").strip()
@@ -595,6 +818,19 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
             item_type=item_type,
             item_id=item_id,
         )
+        return _action_result(action_type, action_id, operation)
+
+    if action_type == "delete_subtask":
+        subtask_id = str(payload.get("subtask_id") or "").strip()
+        if not subtask_id:
+            return ResponseModel(success=False, message="subtask_id is required", data=None)
+
+        project_id = get_project_id_for_subtask(subtask_id)
+        access = _require_project_lead_access(user_data, project_id or "")
+        if not access.success:
+            return access
+
+        operation = delete_subtasks_by_user_story(subtask_id, user_id)
         return _action_result(action_type, action_id, operation)
 
     return ResponseModel(success=False, message=f"Unsupported action_type: {action_type}", data=None)
@@ -802,6 +1038,254 @@ def run_project_chat_agent(
         candidates.sort(key=lambda item: item.get("score", 0), reverse=True)
         max_items = max(1, min(limit, 20))
         return candidates[:max_items]
+
+    def _find_epic_candidates(
+        epic_query_arg: str,
+        project_id_arg: Optional[str] = None,
+        limit: int = 8,
+    ) -> List[Dict[str, Any]]:
+        text = (epic_query_arg or "").strip().lower()
+        if not text:
+            return []
+
+        scope = _project_scope(project_id_arg if project_id_arg is not None else focused_project_id)
+        candidates: List[Dict[str, Any]] = []
+        query_tokens = [token for token in text.split() if token]
+
+        for scoped_project_id in scope:
+            loaded_project = _load_project(scoped_project_id)
+            if not loaded_project:
+                continue
+
+            project_name = loaded_project.get("name")
+            project_key = loaded_project.get("project_key")
+            for epic in loaded_project.get("epics") or []:
+                epic_id = str(epic.get("id") or "").strip()
+                epic_name = str(epic.get("name") or "").strip()
+                epic_description = str(epic.get("description") or "").strip()
+                if not epic_id or not epic_name:
+                    continue
+
+                name_lower = epic_name.lower()
+                description_lower = epic_description.lower()
+                combined = f"{name_lower} {description_lower}"
+
+                score = 0
+                match_basis = ""
+                if text == epic_id.lower() or text == name_lower:
+                    score = 120
+                    match_basis = "exact"
+                elif text in name_lower:
+                    score = 100
+                    match_basis = "name_contains"
+                elif text in description_lower:
+                    score = 80
+                    match_basis = "description_contains"
+                elif query_tokens:
+                    token_hits = sum(1 for token in query_tokens if token in combined)
+                    if token_hits > 0:
+                        coverage = token_hits / len(query_tokens)
+                        if coverage >= 0.7:
+                            score = 60 + token_hits
+                            match_basis = "token_similarity"
+
+                if score <= 0:
+                    continue
+
+                candidates.append(
+                    {
+                        "epic_id": epic_id,
+                        "epic_name": epic_name,
+                        "project_id": scoped_project_id,
+                        "project_name": project_name,
+                        "project_key": project_key,
+                        "status": epic.get("status"),
+                        "score": score,
+                        "match_basis": match_basis,
+                    }
+                )
+
+        candidates.sort(key=lambda item: item.get("score", 0), reverse=True)
+        return candidates[: max(1, min(limit, 20))]
+
+    def _resolve_epic_for_action(
+        epic_id_arg: Optional[str] = None,
+        epic_query_arg: Optional[str] = None,
+        project_id_arg: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        epic_id_value = (epic_id_arg or "").strip()
+        if epic_id_value:
+            epic_response = get_epic_by_id(epic_id_value)
+            if not epic_response.success or not isinstance(epic_response.data, dict):
+                return {"error": "Epic not found or not accessible"}
+
+            epic_project_id = epic_response.data.get("project_id")
+            if epic_project_id not in assigned_project_ids:
+                return {"error": "Epic not found or not accessible"}
+            if project_id_arg and epic_project_id != project_id_arg:
+                return {"error": "Epic not found for the specified project"}
+
+            return {
+                "epic_id": epic_id_value,
+                "project_id": epic_project_id,
+                "epic_name": epic_response.data.get("name"),
+            }
+
+        query_value = (epic_query_arg or "").strip()
+        if not query_value:
+            return {"error": "epic_id or epic_query is required"}
+
+        candidates = _find_epic_candidates(query_value, project_id_arg=project_id_arg, limit=8)
+        if not candidates:
+            return {"error": f"No epics matched '{query_value}' in this project"}
+        if len(candidates) == 1:
+            selected = candidates[0]
+            return {
+                "epic_id": selected.get("epic_id"),
+                "project_id": selected.get("project_id"),
+                "epic_name": selected.get("epic_name"),
+            }
+
+        top = candidates[0]
+        second = candidates[1]
+        top_score = int(top.get("score", 0))
+        second_score = int(second.get("score", 0))
+        if top_score >= 100 and top_score >= second_score + 15:
+            return {
+                "epic_id": top.get("epic_id"),
+                "project_id": top.get("project_id"),
+                "epic_name": top.get("epic_name"),
+            }
+
+        return {
+            "error": "Multiple epics matched your reference. Please clarify which one you mean.",
+            "requires_disambiguation": True,
+            "candidates": candidates[:5],
+        }
+
+    def _find_sprint_candidates(
+        sprint_query_arg: str,
+        project_id_arg: Optional[str] = None,
+        limit: int = 8,
+    ) -> List[Dict[str, Any]]:
+        text = (sprint_query_arg or "").strip().lower()
+        if not text:
+            return []
+
+        scope = _project_scope(project_id_arg if project_id_arg is not None else focused_project_id)
+        candidates: List[Dict[str, Any]] = []
+        query_tokens = [token for token in text.split() if token]
+
+        for scoped_project_id in scope:
+            project = _load_project(scoped_project_id)
+            if not project:
+                continue
+
+            for sprint in _load_project_sprints(scoped_project_id):
+                sprint_id = str(sprint.get("id") or "").strip()
+                sprint_name = str(sprint.get("name") or "").strip()
+                if not sprint_id or not sprint_name:
+                    continue
+
+                name_lower = sprint_name.lower()
+                combined = " ".join(
+                    [
+                        name_lower,
+                        str(sprint.get("startDate") or "").lower(),
+                        str(sprint.get("endDate") or "").lower(),
+                    ]
+                )
+
+                score = 0
+                match_basis = ""
+                if text == sprint_id.lower() or text == name_lower:
+                    score = 120
+                    match_basis = "exact"
+                elif text in name_lower:
+                    score = 100
+                    match_basis = "name_contains"
+                elif query_tokens:
+                    token_hits = sum(1 for token in query_tokens if token in combined)
+                    if token_hits > 0:
+                        coverage = token_hits / len(query_tokens)
+                        if coverage >= 0.7:
+                            score = 60 + token_hits
+                            match_basis = "token_similarity"
+
+                if score <= 0:
+                    continue
+
+                candidates.append(
+                    {
+                        "sprint_id": sprint_id,
+                        "sprint_name": sprint_name,
+                        "project_id": scoped_project_id,
+                        "project_name": project.get("name"),
+                        "project_key": project.get("project_key"),
+                        "startDate": sprint.get("startDate"),
+                        "endDate": sprint.get("endDate"),
+                        "lengthDays": sprint.get("lengthDays"),
+                        "score": score,
+                        "match_basis": match_basis,
+                    }
+                )
+
+        candidates.sort(key=lambda item: item.get("score", 0), reverse=True)
+        return candidates[: max(1, min(limit, 20))]
+
+    def _resolve_sprint_for_action(
+        sprint_id_arg: Optional[str] = None,
+        sprint_query_arg: Optional[str] = None,
+        project_id_arg: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        sprint_id_value = (sprint_id_arg or "").strip()
+        if sprint_id_value:
+            sprint_project_id = _resolve_sprint_project(sprint_id_value, project_id_arg)
+            if not sprint_project_id:
+                return {"error": "Sprint not found or not accessible"}
+
+            sprint_name = ""
+            for sprint in _load_project_sprints(sprint_project_id):
+                if sprint.get("id") == sprint_id_value:
+                    sprint_name = sprint.get("name") or ""
+                    break
+            return {
+                "sprint_id": sprint_id_value,
+                "project_id": sprint_project_id,
+                "sprint_name": sprint_name,
+            }
+
+        query_value = (sprint_query_arg or "").strip()
+        if not query_value:
+            return {"error": "sprint_id or sprint_query is required"}
+
+        candidates = _find_sprint_candidates(query_value, project_id_arg=project_id_arg, limit=8)
+        if not candidates:
+            return {"error": f"No sprints matched '{query_value}' in this project"}
+        if len(candidates) == 1:
+            selected = candidates[0]
+            return {
+                "sprint_id": selected.get("sprint_id"),
+                "project_id": selected.get("project_id"),
+                "sprint_name": selected.get("sprint_name"),
+            }
+
+        top = candidates[0]
+        second = candidates[1]
+        top_score = int(top.get("score", 0))
+        second_score = int(second.get("score", 0))
+        if top_score >= 100 and top_score >= second_score + 15:
+            return {
+                "sprint_id": top.get("sprint_id"),
+                "project_id": top.get("project_id"),
+                "sprint_name": top.get("sprint_name"),
+            }
+
+        return {
+            "error": "Multiple sprints matched your reference. Please clarify which one you mean.",
+            "requires_disambiguation": True,
+            "candidates": candidates[:5],
+        }
 
     def _resolve_story_for_action(
         story_id_arg: Optional[str] = None,
@@ -1564,22 +2048,94 @@ def run_project_chat_agent(
         )
         return {"confirmation_required": True, "pending_action": action}
 
-    def propose_update_epic_tool(
-        epic_id: str,
-        fields: Dict[str, Any],
+    def propose_create_epic_tool(
+        name: str,
+        description: Optional[str] = None,
+        project_id_arg: Optional[str] = None,
+        labels: Optional[List[str]] = None,
+        priority: Optional[str] = None,
+        status: Optional[str] = None,
+        storyPoints: Optional[Any] = None,
+        story_points: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        epic_id_value = (epic_id or "").strip()
-        if not epic_id_value:
-            return {"error": "epic_id is required"}
-        if not isinstance(fields, dict) or not fields:
-            return {"error": "fields are required"}
+        resolved_project_id = _resolve_project_arg(project_id_arg)
+        if not resolved_project_id:
+            return {"error": "Project not found or not accessible"}
 
-        epic_response = get_epic_by_id(epic_id_value)
-        if not epic_response.success or not isinstance(epic_response.data, dict):
-            return {"error": "Epic not found or not accessible"}
+        lead_error = _validate_lead_for_project(resolved_project_id)
+        if lead_error:
+            return {"error": lead_error}
 
-        project_for_epic = epic_response.data.get("project_id")
-        if project_for_epic not in assigned_project_ids:
+        cleaned_name = str(name or "").strip()
+        if not cleaned_name:
+            return {"error": "Epic name is required"}
+
+        proposal_fields: Dict[str, Any] = {
+            "name": cleaned_name,
+            "description": str(description or "").strip(),
+            "labels": labels if isinstance(labels, list) else [],
+            "priority": str(priority or "").strip() or "Medium",
+            "status": _normalize_item_status(status) or "To Do",
+            "storyPoints": storyPoints if storyPoints is not None else story_points if story_points is not None else 0,
+        }
+
+        action = _register_pending_action(
+            action_type="create_epic",
+            title="Create epic",
+            summary=f"Create epic '{cleaned_name}' in the current project.",
+            payload={
+                "project_id": resolved_project_id,
+                "fields": proposal_fields,
+            },
+            project_id_hint=resolved_project_id,
+        )
+        return {"confirmation_required": True, "pending_action": action}
+
+    def propose_update_epic_tool(
+        epic_id: Optional[str] = None,
+        epic_query: Optional[str] = None,
+        project_id_arg: Optional[str] = None,
+        fields: Optional[Dict[str, Any]] = None,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        labels: Optional[List[str]] = None,
+        status: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        proposal_fields: Dict[str, Any] = {}
+        if isinstance(fields, dict):
+            proposal_fields.update(fields)
+
+        direct_fields = {
+            "name": name,
+            "description": description,
+            "labels": labels,
+            "status": status,
+        }
+        for field_key, field_value in direct_fields.items():
+            if field_value is None:
+                continue
+            if isinstance(field_value, str):
+                cleaned = field_value.strip()
+                if not cleaned:
+                    continue
+                proposal_fields[field_key] = cleaned
+            else:
+                proposal_fields[field_key] = field_value
+
+        if not proposal_fields:
+            return {"error": "No supported epic fields provided"}
+
+        resolved_epic = _resolve_epic_for_action(
+            epic_id_arg=epic_id,
+            epic_query_arg=epic_query,
+            project_id_arg=(project_id_arg or "").strip() or None,
+        )
+        if resolved_epic.get("error"):
+            return resolved_epic
+
+        epic_id_value = str(resolved_epic.get("epic_id") or "").strip()
+        project_for_epic = resolved_epic.get("project_id")
+        if not epic_id_value or not project_for_epic:
             return {"error": "Epic not found or not accessible"}
 
         lead_error = _validate_lead_for_project(project_for_epic)
@@ -1588,7 +2144,7 @@ def run_project_chat_agent(
 
         allowed_field_keys = {"name", "description", "labels", "status"}
         proposal_fields = {
-            key: value for key, value in dict(fields).items() if key in allowed_field_keys
+            key: value for key, value in dict(proposal_fields).items() if key in allowed_field_keys
         }
         if not proposal_fields:
             return {"error": "No supported epic fields provided"}
@@ -1602,7 +2158,290 @@ def run_project_chat_agent(
         action = _register_pending_action(
             action_type="update_epic",
             title="Update epic",
-            summary=f"Update epic {epic_id_value} fields: {', '.join(sorted(proposal_fields.keys()))}.",
+            summary=(
+                f"Update epic '{resolved_epic.get('epic_name') or epic_id_value}' "
+                f"fields: {', '.join(sorted(proposal_fields.keys()))}."
+            ),
+            payload={
+                "epic_id": epic_id_value,
+                "fields": proposal_fields,
+            },
+            project_id_hint=project_for_epic,
+        )
+        return {"confirmation_required": True, "pending_action": action}
+
+    def propose_delete_epic_tool(
+        epic_id: Optional[str] = None,
+        epic_query: Optional[str] = None,
+        project_id_arg: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        resolved_epic = _resolve_epic_for_action(
+            epic_id_arg=epic_id,
+            epic_query_arg=epic_query,
+            project_id_arg=(project_id_arg or "").strip() or None,
+        )
+        if resolved_epic.get("error"):
+            return resolved_epic
+
+        epic_id_value = str(resolved_epic.get("epic_id") or "").strip()
+        project_for_epic = resolved_epic.get("project_id")
+        if not epic_id_value or not project_for_epic:
+            return {"error": "Epic not found or not accessible"}
+
+        lead_error = _validate_lead_for_project(project_for_epic)
+        if lead_error:
+            return {"error": lead_error}
+
+        action = _register_pending_action(
+            action_type="delete_epic",
+            title="Delete epic",
+            summary=f"Delete epic '{resolved_epic.get('epic_name') or epic_id_value}'.",
+            payload={"epic_id": epic_id_value},
+            project_id_hint=project_for_epic,
+        )
+        return {"confirmation_required": True, "pending_action": action}
+
+    def propose_create_sprint_tool(
+        name: str,
+        lengthDays: Any,
+        project_id_arg: Optional[str] = None,
+        startDate: Optional[str] = None,
+        start_date: Optional[str] = None,
+        endDate: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        resolved_project_id = _resolve_project_arg(project_id_arg)
+        if not resolved_project_id:
+            return {"error": "Project not found or not accessible"}
+
+        lead_error = _validate_lead_for_project(resolved_project_id)
+        if lead_error:
+            return {"error": lead_error}
+
+        cleaned_name = str(name or "").strip()
+        if not cleaned_name:
+            return {"error": "Sprint name is required"}
+
+        try:
+            length_days = int(lengthDays)
+        except (TypeError, ValueError):
+            return {"error": "lengthDays must be a number"}
+
+        action = _register_pending_action(
+            action_type="create_sprint",
+            title="Create sprint",
+            summary=f"Create sprint '{cleaned_name}' with length {length_days} days.",
+            payload={
+                "project_id": resolved_project_id,
+                "fields": {
+                    "name": cleaned_name,
+                    "lengthDays": length_days,
+                    "startDate": str(startDate if startDate is not None else start_date or "").strip() or None,
+                    "endDate": str(endDate if endDate is not None else end_date or "").strip() or None,
+                },
+            },
+            project_id_hint=resolved_project_id,
+        )
+        return {"confirmation_required": True, "pending_action": action}
+
+    def propose_update_sprint_tool(
+        sprint_id: Optional[str] = None,
+        sprint_query: Optional[str] = None,
+        project_id_arg: Optional[str] = None,
+        fields: Optional[Dict[str, Any]] = None,
+        name: Optional[str] = None,
+        lengthDays: Optional[Any] = None,
+        length_days: Optional[Any] = None,
+        startDate: Optional[str] = None,
+        start_date: Optional[str] = None,
+        endDate: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        proposal_fields: Dict[str, Any] = {}
+        if isinstance(fields, dict):
+            proposal_fields.update(fields)
+
+        direct_fields = {
+            "name": name,
+            "lengthDays": lengthDays if lengthDays is not None else length_days,
+            "startDate": startDate if startDate is not None else start_date,
+            "endDate": endDate if endDate is not None else end_date,
+        }
+        for field_key, field_value in direct_fields.items():
+            if field_value is None:
+                continue
+            if isinstance(field_value, str):
+                cleaned = field_value.strip()
+                if not cleaned:
+                    continue
+                proposal_fields[field_key] = cleaned
+            else:
+                proposal_fields[field_key] = field_value
+
+        if not proposal_fields:
+            return {"error": "No supported sprint fields provided"}
+
+        scoped_project_id = (project_id_arg or "").strip() or None
+        resolved_sprint = _resolve_sprint_for_action(
+            sprint_id_arg=sprint_id,
+            sprint_query_arg=sprint_query,
+            project_id_arg=scoped_project_id,
+        )
+        if resolved_sprint.get("error"):
+            return resolved_sprint
+
+        sprint_id_value = str(resolved_sprint.get("sprint_id") or "").strip()
+        project_for_sprint = resolved_sprint.get("project_id")
+        if not sprint_id_value or not project_for_sprint:
+            return {"error": "Sprint not found or not accessible"}
+
+        lead_error = _validate_lead_for_project(project_for_sprint)
+        if lead_error:
+            return {"error": lead_error}
+
+        allowed_field_keys = {"name", "lengthDays", "startDate", "endDate"}
+        proposal_fields = {
+            key: value for key, value in proposal_fields.items() if key in allowed_field_keys
+        }
+        if not proposal_fields:
+            return {"error": "No supported sprint fields provided"}
+
+        if "lengthDays" in proposal_fields:
+            try:
+                proposal_fields["lengthDays"] = int(proposal_fields["lengthDays"])
+            except (TypeError, ValueError):
+                return {"error": "lengthDays must be a number"}
+
+        action = _register_pending_action(
+            action_type="update_sprint",
+            title="Update sprint",
+            summary=(
+                f"Update sprint '{resolved_sprint.get('sprint_name') or sprint_id_value}' "
+                f"fields: {', '.join(sorted(proposal_fields.keys()))}."
+            ),
+            payload={
+                "project_id": project_for_sprint,
+                "sprint_id": sprint_id_value,
+                "fields": proposal_fields,
+            },
+            project_id_hint=project_for_sprint,
+        )
+        return {"confirmation_required": True, "pending_action": action}
+
+    def propose_delete_sprint_tool(
+        sprint_id: Optional[str] = None,
+        sprint_query: Optional[str] = None,
+        project_id_arg: Optional[str] = None,
+        unassign_items: bool = True,
+    ) -> Dict[str, Any]:
+        scoped_project_id = (project_id_arg or "").strip() or None
+        resolved_sprint = _resolve_sprint_for_action(
+            sprint_id_arg=sprint_id,
+            sprint_query_arg=sprint_query,
+            project_id_arg=scoped_project_id,
+        )
+        if resolved_sprint.get("error"):
+            return resolved_sprint
+
+        sprint_id_value = str(resolved_sprint.get("sprint_id") or "").strip()
+        project_for_sprint = resolved_sprint.get("project_id")
+        if not sprint_id_value or not project_for_sprint:
+            return {"error": "Sprint not found or not accessible"}
+
+        lead_error = _validate_lead_for_project(project_for_sprint)
+        if lead_error:
+            return {"error": lead_error}
+
+        action = _register_pending_action(
+            action_type="delete_sprint",
+            title="Delete sprint",
+            summary=f"Delete sprint '{resolved_sprint.get('sprint_name') or sprint_id_value}'.",
+            payload={
+                "project_id": project_for_sprint,
+                "sprint_id": sprint_id_value,
+                "unassign_items": bool(unassign_items),
+            },
+            project_id_hint=project_for_sprint,
+        )
+        return {"confirmation_required": True, "pending_action": action}
+
+    def propose_create_user_story_tool(
+        epic_id: Optional[str] = None,
+        epic_query: Optional[str] = None,
+        project_id_arg: Optional[str] = None,
+        fields: Optional[Dict[str, Any]] = None,
+        title: Optional[str] = None,
+        user_story: Optional[str] = None,
+        userStory: Optional[str] = None,
+        description: Optional[str] = None,
+        priority: Optional[str] = None,
+        storyPoints: Optional[Any] = None,
+        story_points: Optional[Any] = None,
+        dueDate: Optional[str] = None,
+        due_date: Optional[str] = None,
+        status: Optional[str] = None,
+        effortHours: Optional[Any] = None,
+        effort_hours: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        proposal_fields: Dict[str, Any] = {}
+        if isinstance(fields, dict):
+            proposal_fields.update(fields)
+
+        direct_fields = {
+            "user_story": user_story if user_story is not None else userStory if userStory is not None else title,
+            "description": description,
+            "priority": priority,
+            "storyPoints": storyPoints if storyPoints is not None else story_points,
+            "dueDate": dueDate if dueDate is not None else due_date,
+            "status": status,
+            "effortHours": effortHours if effortHours is not None else effort_hours,
+        }
+        for field_key, field_value in direct_fields.items():
+            if field_value is None:
+                continue
+            if isinstance(field_value, str):
+                cleaned = field_value.strip()
+                if not cleaned:
+                    continue
+                proposal_fields[field_key] = cleaned
+            else:
+                proposal_fields[field_key] = field_value
+
+        resolved_epic = _resolve_epic_for_action(
+            epic_id_arg=epic_id,
+            epic_query_arg=epic_query,
+            project_id_arg=(project_id_arg or "").strip() or None,
+        )
+        if resolved_epic.get("error"):
+            return resolved_epic
+
+        epic_id_value = str(resolved_epic.get("epic_id") or "").strip()
+        project_for_epic = resolved_epic.get("project_id")
+        if not epic_id_value or not project_for_epic:
+            return {"error": "Epic not found or not accessible"}
+
+        lead_error = _validate_lead_for_project(project_for_epic)
+        if lead_error:
+            return {"error": lead_error}
+
+        if not str(proposal_fields.get("user_story") or "").strip():
+            return {"error": "User story title is required"}
+        if not str(proposal_fields.get("description") or "").strip():
+            return {"error": "User story description is required"}
+
+        if "status" in proposal_fields:
+            normalized_status = _normalize_item_status(proposal_fields.get("status"))
+            if normalized_status is None:
+                return {"error": "Invalid status value"}
+            proposal_fields["status"] = normalized_status
+
+        action = _register_pending_action(
+            action_type="create_user_story",
+            title="Create user story",
+            summary=(
+                f"Create user story '{proposal_fields.get('user_story')}' "
+                f"in epic '{resolved_epic.get('epic_name') or epic_id_value}'."
+            ),
             payload={
                 "epic_id": epic_id_value,
                 "fields": proposal_fields,
@@ -1654,16 +2493,120 @@ def run_project_chat_agent(
         )
         return {"confirmation_required": True, "pending_action": action}
 
+    def propose_create_subtask_tool(
+        story_id: Optional[str] = None,
+        story_query: Optional[str] = None,
+        project_id_arg: Optional[str] = None,
+        fields: Optional[Dict[str, Any]] = None,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        estimated_hours: Optional[Any] = None,
+        complexity: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        proposal_fields: Dict[str, Any] = {}
+        if isinstance(fields, dict):
+            proposal_fields.update(fields)
+
+        direct_fields = {
+            "title": title,
+            "description": description,
+            "estimated_hours": estimated_hours,
+            "complexity": complexity,
+            "status": status,
+        }
+        for field_key, field_value in direct_fields.items():
+            if field_value is None:
+                continue
+            if isinstance(field_value, str):
+                cleaned = field_value.strip()
+                if not cleaned:
+                    continue
+                proposal_fields[field_key] = cleaned
+            else:
+                proposal_fields[field_key] = field_value
+
+        if not str(proposal_fields.get("title") or "").strip():
+            return {"error": "Subtask title is required"}
+
+        resolved_story = _resolve_story_for_action(
+            story_id_arg=story_id,
+            story_query_arg=story_query,
+            project_id_arg=(project_id_arg or "").strip() or None,
+        )
+        if resolved_story.get("error"):
+            return resolved_story
+
+        story_id_value = str(resolved_story.get("story_id") or "").strip()
+        project_for_story = resolved_story.get("project_id")
+        if not story_id_value or not project_for_story:
+            return {"error": "Story not found or not accessible"}
+
+        lead_error = _validate_lead_for_project(project_for_story)
+        if lead_error:
+            return {"error": lead_error}
+
+        if "status" in proposal_fields:
+            normalized_status = _normalize_item_status(proposal_fields.get("status"))
+            if normalized_status is None:
+                return {"error": "Invalid status value"}
+            proposal_fields["status"] = normalized_status
+
+        action = _register_pending_action(
+            action_type="create_subtask",
+            title="Create subtask",
+            summary=(
+                f"Create subtask '{proposal_fields.get('title')}' "
+                f"for story '{resolved_story.get('story_title') or story_id_value}'."
+            ),
+            payload={
+                "story_id": story_id_value,
+                "fields": proposal_fields,
+            },
+            project_id_hint=project_for_story,
+        )
+        return {"confirmation_required": True, "pending_action": action}
+
+    def propose_delete_subtask_tool(subtask_id: str) -> Dict[str, Any]:
+        subtask_id_value = (subtask_id or "").strip()
+        if not subtask_id_value:
+            return {"error": "subtask_id is required"}
+
+        project_for_subtask = _project_for_subtask(subtask_id_value)
+        if not project_for_subtask:
+            return {"error": "Subtask not found or not accessible"}
+
+        lead_error = _validate_lead_for_project(project_for_subtask)
+        if lead_error:
+            return {"error": lead_error}
+
+        action = _register_pending_action(
+            action_type="delete_subtask",
+            title="Delete subtask",
+            summary=f"Delete subtask {subtask_id_value}.",
+            payload={"subtask_id": subtask_id_value},
+            project_id_hint=project_for_subtask,
+        )
+        return {"confirmation_required": True, "pending_action": action}
+
     def propose_assign_sprint_item_tool(
-        sprint_id: str,
-        item_type: str,
-        item_id: str,
+        sprint_id: Optional[str] = None,
+        sprint_query: Optional[str] = None,
+        item_type: Optional[str] = None,
+        item_id: Optional[str] = None,
         project_id_arg: Optional[str] = None,
         include_subtasks: bool = False,
     ) -> Dict[str, Any]:
-        resolved_project_id = _resolve_project_arg(project_id_arg)
-        project_id_value = (resolved_project_id or "").strip()
-        sprint_id_value = (sprint_id or "").strip()
+        resolved_sprint = _resolve_sprint_for_action(
+            sprint_id_arg=sprint_id,
+            sprint_query_arg=sprint_query,
+            project_id_arg=(project_id_arg or "").strip() or None,
+        )
+        if resolved_sprint.get("error"):
+            return resolved_sprint
+
+        project_id_value = str(resolved_sprint.get("project_id") or "").strip()
+        sprint_id_value = str(resolved_sprint.get("sprint_id") or "").strip()
         item_type_value = (item_type or "").strip().lower()
         item_id_value = (item_id or "").strip()
 
@@ -1671,9 +2614,6 @@ def run_project_chat_agent(
             return {"error": "sprint_id, item_type and item_id are required"}
         if item_type_value not in {"story", "subtask"}:
             return {"error": "item_type must be story or subtask"}
-
-        if not _resolve_sprint_project(sprint_id_value, project_id_value):
-            return {"error": "Sprint not found for the specified project"}
 
         lead_error = _validate_lead_for_project(project_id_value)
         if lead_error:
@@ -1695,14 +2635,22 @@ def run_project_chat_agent(
         return {"confirmation_required": True, "pending_action": action}
 
     def propose_unassign_sprint_item_tool(
-        sprint_id: str,
-        item_type: str,
-        item_id: str,
+        sprint_id: Optional[str] = None,
+        sprint_query: Optional[str] = None,
+        item_type: Optional[str] = None,
+        item_id: Optional[str] = None,
         project_id_arg: Optional[str] = None,
     ) -> Dict[str, Any]:
-        resolved_project_id = _resolve_project_arg(project_id_arg)
-        project_id_value = (resolved_project_id or "").strip()
-        sprint_id_value = (sprint_id or "").strip()
+        resolved_sprint = _resolve_sprint_for_action(
+            sprint_id_arg=sprint_id,
+            sprint_query_arg=sprint_query,
+            project_id_arg=(project_id_arg or "").strip() or None,
+        )
+        if resolved_sprint.get("error"):
+            return resolved_sprint
+
+        project_id_value = str(resolved_sprint.get("project_id") or "").strip()
+        sprint_id_value = str(resolved_sprint.get("sprint_id") or "").strip()
         item_type_value = (item_type or "").strip().lower()
         item_id_value = (item_id or "").strip()
 
@@ -1710,9 +2658,6 @@ def run_project_chat_agent(
             return {"error": "sprint_id, item_type and item_id are required"}
         if item_type_value not in {"story", "subtask"}:
             return {"error": "item_type must be story or subtask"}
-
-        if not _resolve_sprint_project(sprint_id_value, project_id_value):
-            return {"error": "Sprint not found for the specified project"}
 
         lead_error = _validate_lead_for_project(project_id_value)
         if lead_error:
@@ -1955,9 +2900,39 @@ def run_project_chat_agent(
             ),
         ),
         StructuredTool.from_function(
+            func=propose_create_epic_tool,
+            name="propose_create_epic",
+            description="Propose creating a new epic in the current scoped project. This does not execute the change.",
+        ),
+        StructuredTool.from_function(
             func=propose_update_epic_tool,
             name="propose_update_epic",
-            description="Propose updating epic fields. This does not execute the change.",
+            description="Propose updating epic fields by epic_id or epic_query. This does not execute the change.",
+        ),
+        StructuredTool.from_function(
+            func=propose_delete_epic_tool,
+            name="propose_delete_epic",
+            description="Propose deleting an epic by epic_id or epic_query. This does not execute the change.",
+        ),
+        StructuredTool.from_function(
+            func=propose_create_sprint_tool,
+            name="propose_create_sprint",
+            description="Propose creating a sprint in the current scoped project. This does not execute the change.",
+        ),
+        StructuredTool.from_function(
+            func=propose_update_sprint_tool,
+            name="propose_update_sprint",
+            description="Propose updating a sprint by sprint_id or sprint_query. This does not execute the change.",
+        ),
+        StructuredTool.from_function(
+            func=propose_delete_sprint_tool,
+            name="propose_delete_sprint",
+            description="Propose deleting a sprint by sprint_id or sprint_query. This does not execute the change.",
+        ),
+        StructuredTool.from_function(
+            func=propose_create_user_story_tool,
+            name="propose_create_user_story",
+            description="Propose creating a user story in an epic by epic_id or epic_query. This does not execute the change.",
         ),
         StructuredTool.from_function(
             func=propose_update_subtask_tool,
@@ -1965,14 +2940,24 @@ def run_project_chat_agent(
             description="Propose updating subtask fields. This does not execute the change.",
         ),
         StructuredTool.from_function(
+            func=propose_create_subtask_tool,
+            name="propose_create_subtask",
+            description="Propose creating a subtask for a story by story_id or story_query. This does not execute the change.",
+        ),
+        StructuredTool.from_function(
+            func=propose_delete_subtask_tool,
+            name="propose_delete_subtask",
+            description="Propose deleting a subtask by subtask_id. This does not execute the change.",
+        ),
+        StructuredTool.from_function(
             func=propose_assign_sprint_item_tool,
             name="propose_assign_sprint_item",
-            description="Propose assigning a story or subtask to a sprint. This does not execute the change.",
+            description="Propose assigning a story or subtask to a sprint by sprint_id or sprint_query. This does not execute the change.",
         ),
         StructuredTool.from_function(
             func=propose_unassign_sprint_item_tool,
             name="propose_unassign_sprint_item",
-            description="Propose removing a story or subtask from a sprint. This does not execute the change.",
+            description="Propose removing a story or subtask from a sprint by sprint_id or sprint_query. This does not execute the change.",
         ),
         StructuredTool.from_function(
             func=find_delayed_user_stories_tool,
@@ -2067,7 +3052,9 @@ def run_project_chat_agent(
         "Never claim a mutation was executed from chat; say confirmation is required and wait for apply. "
         "Do not ask for free-text confirmation like 'reply yes/no'. "
         "Always generate a pending action via propose_* tools so confirmation happens with the UI buttons. "
+        "You can help with most planner UI operations, including creating, updating, deleting, assigning, moving, and sprint planning actions when matching tools exist. "
         "When a user references a story by title, short key, or description, pass that text as story_query instead of asking for story_id first. "
+        "When a user references an epic or sprint by name, prefer epic_query or sprint_query instead of asking for raw IDs first. "
         "Only ask for clarification when tool output indicates multiple matches. "
         "If data is missing, say so explicitly. "
         "When the user asks for metrics, compute them from tool output. "

@@ -110,6 +110,7 @@ class UpdateUserStoryAssigneeRequest(BaseModel):
     """Request model for assigning or reassigning a user story"""
     assigneeId: Optional[str] = None
     assignee: Optional[str] = None
+    assignee_email: Optional[str] = None
 
 
 class UserStoryDependencyItem(BaseModel):
