@@ -59,12 +59,18 @@ def _get_subtask_by_id(subtask_id: str, user_id: str, allow_member: bool = False
         if subtask_data.get("user_id") != user_id and not allow_member:
             return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
         if subtask_data.get("user_id") != user_id and allow_member:
-            story_id = subtask_data.get("user_story_id")
-            if not story_id:
-                return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
-            story_response = get_user_story_by_id(story_id, user_id, allow_member=True, user_email=user_email)
-            if not story_response.success:
-                return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
+            project_id = subtask_data.get("project_id")
+            if project_id:
+                access = get_project_access(project_id, user_id, user_email)
+                if not access.success:
+                    return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
+            else:
+                story_id = subtask_data.get("user_story_id")
+                if not story_id:
+                    return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
+                story_response = get_user_story_by_id(story_id, user_id, allow_member=True, user_email=user_email)
+                if not story_response.success:
+                    return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
 
         return ResponseModel(success=True, message="Subtask retrieved successfully", data=subtask_data)
     except Exception as e:
@@ -99,6 +105,10 @@ def _get_subtask_for_project(subtask_id: str, project_id: str, user_id: str, all
         return subtask_response
 
     subtask = subtask_response.data
+    direct_project_id = subtask.get("project_id")
+    if direct_project_id and direct_project_id == project_id:
+        return ResponseModel(success=True, message="Subtask retrieved successfully", data=subtask)
+
     story_id = subtask.get("user_story_id")
     if not story_id:
         return ResponseModel(success=False, message="Subtask missing user story association", data=None)
@@ -190,6 +200,8 @@ def create_sprint(
             return ResponseModel(success=False, message="name is required", data=None)
         if length_days is None:
             return ResponseModel(success=False, message="lengthDays is required", data=None)
+        if length_days <= 0:
+            return ResponseModel(success=False, message="lengthDays must be greater than 0", data=None)
 
         existing = FIRESTORE_CLIENT.collection(SPRINTS_COLLECTION).where(
             "project_id", "==", project_id
@@ -243,6 +255,8 @@ def update_sprint(
             return ResponseModel(success=False, message="Sprint does not belong to this project", data=None)
         if sprint_data.get("user_id") != user_id:
             return ResponseModel(success=False, message="Unauthorized: You don't own this sprint", data=None)
+        if length_days is not None and length_days <= 0:
+            return ResponseModel(success=False, message="lengthDays must be greater than 0", data=None)
 
         update_data: Dict[str, Any] = {"updated_at": _current_timestamp_iso()}
         if name is not None:
@@ -577,8 +591,20 @@ def get_sprint_items(
                 items_with_order.append((item_order, {
                     "type": "story",
                     "id": item_id,
+                    "item_id": item_id,
                     "title": title,
+                    "user_story_id": story.get("user_story_id"),
                     "epicName": epic_cache.get(epic_id, "") if epic_id else "",
+                    "source": "story",
+                    "storyId": item_id,
+                    "story_id": item_id,
+                    "status": story.get("status"),
+                    "assignee": story.get("assignee"),
+                    "startDate": story.get("startDate"),
+                    "createdDate": story.get("createdDate"),
+                    "created_at": story.get("created_at"),
+                    "effortHours": story.get("effortHours"),
+                    "effort_hours": story.get("effort_hours"),
                 }))
             elif item_type == "subtask":
                 subtask_response = _get_subtask_for_project(item_id, project_id, user_id, allow_member=allow_members, user_email=user_email)
@@ -599,8 +625,20 @@ def get_sprint_items(
                 items_with_order.append((item_order, {
                     "type": "subtask",
                     "id": item_id,
+                    "item_id": item_id,
                     "title": subtask.get("title", ""),
+                    "task_id": subtask.get("task_id"),
                     "storyTitle": story_title,
+                    "storyId": story_id,
+                    "story_id": story_id,
+                    "source": "story" if story_id else "project",
+                    "taskType": subtask.get("task_type") or subtask.get("type"),
+                    "task_type": subtask.get("task_type") or subtask.get("type"),
+                    "status": subtask.get("status"),
+                    "assignee": subtask.get("assignee"),
+                    "createdDate": subtask.get("createdDate"),
+                    "created_at": subtask.get("created_at"),
+                    "estimated_hours": subtask.get("estimated_hours"),
                 }))
 
         items_with_order.sort(key=lambda pair: pair[0])
@@ -648,6 +686,19 @@ def list_available_items(
                 for subtask in subtasks_response.data or []:
                     subtasks.append(subtask)
 
+        standalone_subtasks_docs = FIRESTORE_CLIENT.collection("subtasks").where(
+            "project_id", "==", project_id
+        ).get()
+        seen_subtask_ids = {str(subtask.get("id") or "") for subtask in subtasks}
+        for doc in standalone_subtasks_docs:
+            subtask_data = doc.to_dict()
+            if doc.id in seen_subtask_ids:
+                continue
+            if str(subtask_data.get("user_story_id") or "").strip():
+                continue
+            subtask_data["id"] = doc.id
+            subtasks.append(subtask_data)
+
         assignments = FIRESTORE_CLIENT.collection(SPRINT_ITEMS_COLLECTION).where(
             "project_id", "==", project_id
         ).get()
@@ -678,8 +729,20 @@ def list_available_items(
                 available_items.append({
                     "type": "story",
                     "id": story_id,
+                    "item_id": story_id,
                     "title": title,
+                    "user_story_id": story.get("user_story_id"),
                     "epicName": epic_name_map.get(story.get("epic_id"), ""),
+                    "source": "story",
+                    "storyId": story_id,
+                    "story_id": story_id,
+                    "status": story.get("status"),
+                    "assignee": story.get("assignee"),
+                    "startDate": story.get("startDate"),
+                    "createdDate": story.get("createdDate"),
+                    "created_at": story.get("created_at"),
+                    "effortHours": story.get("effortHours"),
+                    "effort_hours": story.get("effort_hours"),
                 })
 
         if "subtask" in normalized_types:
@@ -691,19 +754,33 @@ def list_available_items(
                     continue
                 story_id = subtask.get("user_story_id")
                 story = story_map.get(story_id) if story_id else None
-                if not story:
-                    continue
-                if epic_id and story.get("epic_id") != epic_id:
-                    continue
                 title = subtask.get("title") or subtask.get("description") or ""
                 if search_term and search_term not in title.lower():
                     continue
-                story_title = story.get("user_story") or story.get("user_story_id") or ""
+                if story and epic_id and story.get("epic_id") != epic_id:
+                    continue
+                story_title = (
+                    (story.get("user_story") or story.get("user_story_id") or "")
+                    if story
+                    else ""
+                )
                 available_items.append({
                     "type": "subtask",
                     "id": subtask_id,
+                    "item_id": subtask_id,
                     "title": title,
+                    "task_id": subtask.get("task_id"),
                     "storyTitle": story_title,
+                    "storyId": story_id,
+                    "story_id": story_id,
+                    "source": "story" if story else "project",
+                    "taskType": subtask.get("task_type") or subtask.get("type"),
+                    "task_type": subtask.get("task_type") or subtask.get("type"),
+                    "status": subtask.get("status"),
+                    "assignee": subtask.get("assignee"),
+                    "createdDate": subtask.get("createdDate"),
+                    "created_at": subtask.get("created_at"),
+                    "estimated_hours": subtask.get("estimated_hours"),
                 })
 
         return ResponseModel(success=True, message="Available items retrieved successfully", data=available_items)

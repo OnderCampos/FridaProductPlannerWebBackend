@@ -16,7 +16,7 @@ from src.intelligence.agents.epic_generation.epic_scope_analysis_agent import (
 from src.intelligence.agents.epic_generation.epic_synthesis_agent import (
     EPIC_SYNTHESIS_AGENT,
 )
-from src.intelligence.agents.json_executor import execute_json_agent
+from src.intelligence.agents.json_executor import execute_agent
 from src.schemas.user_data import UserData
 from src.services.azure_services import AzureChatService
 from src.services.setup.variables_setup import LLMOPS_API_KEY
@@ -133,7 +133,7 @@ def _scope_analysis_node(state: EpicGraphState) -> Dict[str, Any]:
     language = normalize_language(state.get("language"), default=get_default_llm_language())
 
     try:
-        raw_analysis = execute_json_agent(
+        raw_analysis = execute_agent(
             agent=EPIC_SCOPE_ANALYSIS_AGENT,
             prompt_kwargs={
                 "text": text_for_analysis,
@@ -219,7 +219,7 @@ def _brainstorm_roles_node(state: EpicGraphState) -> Dict[str, Any]:
         role_name = str(role_profile.get("role_name") or "Role")
         role_agent = build_epic_role_brainstorm_agent(role_name=role_name)
 
-        brainstorm_response = execute_json_agent(
+        brainstorm_response = execute_agent(
             agent=role_agent,
             prompt_kwargs={
                 "language": language,
@@ -263,7 +263,7 @@ def _synthesis_node(state: EpicGraphState) -> Dict[str, Any]:
     kb_context = state.get("kb_context", "")
 
     try:
-        final_response = execute_json_agent(
+        final_response = execute_agent(
             agent=EPIC_SYNTHESIS_AGENT,
             prompt_kwargs={
                 "language": language,

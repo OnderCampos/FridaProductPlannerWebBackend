@@ -9,6 +9,8 @@ import logging
 import secrets
 import hashlib
 
+from src.utils.authz.project_memberships import normalize_membership_role
+
 logger = logging.getLogger(__name__)
 
 # Invitation expires after 7 days
@@ -38,6 +40,7 @@ def create_invitation(
     email: str,
     role: str,
     seniority: str,
+    member_type: Optional[str] = None,
     invited_by_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -73,6 +76,7 @@ def create_invitation(
             "name": name,
             "role": role,
             "seniority": seniority,
+            "member_type": normalize_membership_role(member_type),
             "status": "Pending",
             "invited_by": invited_by,
             "invited_by_name": invited_by_name,
@@ -372,7 +376,8 @@ def accept_invitation(token: str, user_id: str) -> Optional[Dict[str, Any]]:
             name=invitation_data["name"],
             email=invitation_data["email"],
             role=invitation_data["role"],
-            seniority=invitation_data["seniority"]
+            seniority=invitation_data["seniority"],
+            member_type=invitation_data.get("member_type"),
         )
         
         # Update invitation status
@@ -398,7 +403,8 @@ def accept_invitation(token: str, user_id: str) -> Optional[Dict[str, Any]]:
             "project_name": project_name,
             "member_id": member_data["id"],
             "role": invitation_data["role"],
-            "seniority": invitation_data["seniority"]
+            "seniority": invitation_data["seniority"],
+            "member_type": normalize_membership_role(invitation_data.get("member_type")),
         }
         
     except Exception as e:

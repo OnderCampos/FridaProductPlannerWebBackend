@@ -17,6 +17,7 @@ from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.services.workflows.project_creation.common import current_timestamp_iso
 from src.utils.planning.epic_generation import generate_epics
 from src.utils.planning.epics import create_epic, get_epics_for_project
+from src.utils.planning.user_story_dependencies import generate_and_persist_user_story_dependencies
 from src.utils.planning.user_stories import create_multiple_user_stories
 
 logger = logging.getLogger(__name__)
@@ -334,7 +335,7 @@ def _create_epics_from_payload(
     return created_epics, epic_id_by_name
 
 
-def _create_user_stories_for_epics(
+async def _create_user_stories_for_epics(
     *,
     user_data: UserData,
     epic_id_by_name: Dict[str, str],
@@ -358,12 +359,31 @@ def _create_user_stories_for_epics(
             user_stories_list=stories_for_epic,
         )
         if stories_response.success and isinstance(stories_response.data, list):
-            created_stories.extend(stories_response.data)
+            saved_stories = stories_response.data
+            dependencies_response = await generate_and_persist_user_story_dependencies(
+                user_data=user_data,
+                epic_id=epic_id,
+                user_stories=saved_stories,
+            )
+            if (
+                dependencies_response.success
+                and isinstance(dependencies_response.data, dict)
+                and isinstance(dependencies_response.data.get("user_stories"), list)
+            ):
+                created_stories.extend(dependencies_response.data.get("user_stories") or [])
+            else:
+                if not dependencies_response.success:
+                    logger.warning(
+                        "Finalization saved user stories for epic %s without refreshed dependencies: %s",
+                        epic_id,
+                        dependencies_response.message,
+                    )
+                created_stories.extend(saved_stories)
 
     return created_stories
 
 
-def _create_extracted_epics_and_stories(
+async def _create_extracted_epics_and_stories(
     *,
     user_data: UserData,
     project_id: str,
@@ -382,7 +402,7 @@ def _create_extracted_epics_and_stories(
         return {"epics": created_epics, "user_stories": []}
 
     # Create user stories only for flows that expect them to be persisted here.
-    created_stories = _create_user_stories_for_epics(
+    created_stories = await _create_user_stories_for_epics(
         user_data=user_data,
         epic_id_by_name=epic_id_by_name,
         user_stories=user_stories,
@@ -457,7 +477,7 @@ async def _finalize_from_extracted_knowledge(
     creation_source = str(project.get("creation_source") or "").strip().lower()
 
     # Persist extracted epics and (only when appropriate) their user stories.
-    created_payload = _create_extracted_epics_and_stories(
+    created_payload = await _create_extracted_epics_and_stories(
         user_data=user_data,
         project_id=project_id,
         epics=normalized_epics,

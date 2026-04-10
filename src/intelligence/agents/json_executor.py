@@ -22,7 +22,7 @@ def parse_json_response(response_content: Any) -> Optional[Any]:
             return None
 
 
-def execute_json_agent(
+def execute_agent(
     agent: Agent,
     prompt_kwargs: Dict[str, Any],
     key: Optional[str] = None,

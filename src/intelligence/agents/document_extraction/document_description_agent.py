@@ -17,5 +17,5 @@ DOCUMENT_DESCRIPTION_AGENT = Agent(
     name="DocumentDescriptionAgent",
     task=DOCUMENT_DESCRIPTION_TASK,
     azure_deployment=_DOCUMENT_DESCRIPTION_DEPLOYMENT,
-    args=["text", "language"],
+    args=["epics", "language"],
 )

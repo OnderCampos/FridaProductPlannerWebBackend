@@ -5,6 +5,7 @@ import logging
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.schemas.response import ResponseModel
 from src.utils.authz.permissions import get_project_access
+from src.utils.firebase.identifier import get_next_EPIC_identifier
 
 
 def _current_timestamp_iso() -> str:
@@ -169,6 +170,7 @@ def create_epic(project_id: str, user_id: str, epic_data: Dict[str, Any]) -> Res
         epic_data = {
             "project_id": project_id,
             "user_id": user_id,
+            "epic_id": get_next_EPIC_identifier(),
             "name": epic_data.get("name"),
             "description": epic_data.get("description"),
             "labels": epic_data.get("labels"),

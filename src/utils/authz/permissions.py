@@ -8,20 +8,20 @@ from src.utils.authz.project_memberships import (
     derive_membership_role,
     get_project_membership,
     get_memberships_for_user,
+    is_management_membership_role,
+    normalize_membership_role,
     upsert_project_membership,
 )
-
-
-LEAD_ROLES = {"pm", "lead", "leader", "principal"}
-LEAD_SENIORITY = {"lead", "principal"}
-
 
 def _is_lead_member(member: Optional[Dict[str, Any]]) -> bool:
     if not member:
         return False
+    membership_role = normalize_membership_role(member.get("member_type") or member.get("role"), default="")
+    if membership_role:
+        return is_management_membership_role(membership_role)
     role = str(member.get("role") or "").strip().lower()
     seniority = str(member.get("seniority") or "").strip().lower()
-    return role in LEAD_ROLES or seniority in LEAD_SENIORITY
+    return derive_membership_role(role, seniority) == "leader"
 
 
 def _get_member_record(project_id: str, user_id: str, email: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -78,6 +78,7 @@ def get_project_access(project_id: str, user_id: str, email: Optional[str]) -> R
                 email=email,
                 role="leader",
                 project_role="owner",
+                project_seniority=None,
             )
         else:
             membership_record = _get_membership_record(project_id, user_id, email)
@@ -87,6 +88,7 @@ def get_project_access(project_id: str, user_id: str, email: Optional[str]) -> R
                     membership_role = derive_membership_role(
                         member_record.get("role"),
                         member_record.get("seniority"),
+                        member_record.get("member_type"),
                     )
                     membership_record = upsert_project_membership(
                         project_id=project_id,
@@ -94,6 +96,7 @@ def get_project_access(project_id: str, user_id: str, email: Optional[str]) -> R
                         email=email or member_record.get("email"),
                         role=membership_role,
                         project_role=member_record.get("role"),
+                        project_seniority=member_record.get("seniority"),
                         member_id=member_record.get("id") or member_record.get("member_id"),
                     )
 
@@ -103,13 +106,12 @@ def get_project_access(project_id: str, user_id: str, email: Optional[str]) -> R
         if not member_record and membership_record:
             member_record = membership_record
 
-        is_lead = is_owner or _is_lead_member(member_record) or _is_lead_member(membership_record)
-        if membership_record and not is_lead:
-            if derive_membership_role(
-                membership_record.get("project_role"),
-                membership_record.get("project_seniority"),
-            ) == "leader":
-                is_lead = True
+        membership_role = "leader" if is_owner else normalize_membership_role(
+            (membership_record or {}).get("role") or (member_record or {}).get("member_type"),
+            default="member",
+        )
+        is_lead = is_owner or is_management_membership_role(membership_role)
+        can_manage_member_types = is_owner or membership_role == "leader"
 
         return ResponseModel(
             success=True,
@@ -121,6 +123,8 @@ def get_project_access(project_id: str, user_id: str, email: Optional[str]) -> R
                 "is_owner": is_owner,
                 "is_member": bool(is_owner or membership_record or member_record),
                 "is_lead": is_lead,
+                "member_type": membership_role,
+                "can_manage_member_types": can_manage_member_types,
             },
         )
     except Exception as e:
@@ -153,10 +157,8 @@ def get_global_user_role(user_data: UserData) -> Dict[str, Any]:
         for membership in memberships:
             if member_id is None:
                 member_id = membership.get("member_id")
-            if _is_lead_member(membership) or derive_membership_role(
-                membership.get("project_role"),
-                membership.get("project_seniority"),
-            ) == "leader":
+            membership_role = normalize_membership_role(membership.get("role"), default="")
+            if is_management_membership_role(membership_role):
                 is_lead = True
 
     members_ref = FIRESTORE_CLIENT.collection("team_members")
@@ -235,7 +237,11 @@ def get_project_id_for_subtask(subtask_id: str) -> Optional[str]:
         subtask_doc = FIRESTORE_CLIENT.collection("subtasks").document(subtask_id).get()
         if not subtask_doc.exists:
             return None
-        story_id = subtask_doc.to_dict().get("user_story_id")
+        subtask_data = subtask_doc.to_dict()
+        project_id = subtask_data.get("project_id")
+        if project_id:
+            return project_id
+        story_id = subtask_data.get("user_story_id")
         if not story_id:
             return None
         return get_project_id_for_story(story_id)

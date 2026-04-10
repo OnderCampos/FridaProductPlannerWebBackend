@@ -31,89 +31,73 @@ def build_member_lookup(project_id: str) -> Dict[str, Dict[str, Dict[str, Any]]]
     return build_member_lookup_from_members(members)
 
 
-def _first_value(payload: Dict[str, Any], keys: tuple) -> Optional[Any]:
-    for key in keys:
-        if key in payload and payload.get(key) not in (None, ""):
-            return payload.get(key)
+def _get_story_field_value(payload: Dict[str, Any], field_key: str) -> Optional[str]:
+    fields = payload.get("fields")
+    if not isinstance(fields, list):
+        return None
+
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        key = str(field.get("key") or field.get("name") or "").strip()
+        if key != field_key:
+            continue
+        value = str(field.get("value") or "").strip()
+        if value:
+            return value
     return None
 
 
-def normalize_assignee_fields(
+def get_assignee_email(
+    payload: Dict[str, Any],
+    member_lookup: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+) -> Optional[str]:
+    assignee_email = str(payload.get("assignee_email") or "").strip()
+    if not assignee_email:
+        assignee_email = str(payload.get("assigneeEmail") or "").strip()
+    if not assignee_email:
+        assignee_email = str(_get_story_field_value(payload, "assignee_email") or "").strip()
+
+    if assignee_email:
+        return assignee_email
+
+    if not member_lookup:
+        return None
+
+    assignee_id = str(
+        payload.get("assigneeId")
+        or payload.get("assignee_id")
+        or payload.get("assigned_to")
+        or payload.get("assignedTo")
+        or ""
+    ).strip()
+    if not assignee_id:
+        return None
+
+    member = member_lookup.get("by_id", {}).get(assignee_id) or {}
+    member_email = str(member.get("email") or "").strip()
+    return member_email or None
+
+
+def ensure_assignee_email(
     payload: Dict[str, Any],
     member_lookup: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
-    assignee = _first_value(payload, ("assignee", "assignee_name", "assigneeName"))
-    raw_id = _first_value(payload, ("assignee_id", "assigneeId", "assigned_to", "assignedTo"))
-    assignee_email = _first_value(payload, ("assignee_email", "assigneeEmail"))
-
-    assignee_id = None
-    if raw_id is not None:
-        raw_id_str = str(raw_id)
-        if "@" in raw_id_str:
-            assignee_email = assignee_email or raw_id_str
-        else:
-            assignee_id = raw_id_str
-
-    member = None
-    if member_lookup:
-        if assignee_id and assignee_id in member_lookup["by_id"]:
-            member = member_lookup["by_id"][assignee_id]
-        elif assignee:
-            assignee_key = str(assignee).lower().strip()
-            member = member_lookup["by_email"].get(assignee_key) or member_lookup["by_name"].get(assignee_key)
-
-    if member:
-        if not assignee_id:
-            assignee_id = member.get("id") or assignee_id
-        member_name = member.get("name")
-        member_email = member.get("email")
-        if assignee not in (member_name, member_email):
-            assignee = member_name or member_email or assignee
-        assignee_email = assignee_email or member_email
-    else:
-        if not assignee and assignee_email:
-            assignee = assignee_email
-        if assignee_email is None and assignee and "@" in str(assignee):
-            assignee_email = str(assignee)
-
-    payload["assignee"] = assignee if assignee is not None else ""
-    payload["assignee_id"] = assignee_id
-
-    if assignee_id:
-        payload.setdefault("assigneeId", assignee_id)
+    assignee_email = get_assignee_email(payload, member_lookup)
+    payload["assignee_email"] = assignee_email
     if assignee_email:
-        payload["assignee_email"] = assignee_email
         payload.setdefault("assigneeEmail", assignee_email)
-
     return payload
 
 
 def assignee_matches(
     payload: Dict[str, Any],
-    assignee_id: Optional[str],
+    assignee_email: Optional[str],
     member_lookup: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
 ) -> bool:
-    if not assignee_id:
+    if not assignee_email:
         return True
 
-    normalized = normalize_assignee_fields(dict(payload), member_lookup)
-    if normalized.get("assignee_id") == assignee_id:
-        return True
-
-    if "@" in str(assignee_id):
-        assignee_email = str(assignee_id).lower()
-        if str(normalized.get("assignee_email") or "").lower() == assignee_email:
-            return True
-        if str(normalized.get("assignee") or "").lower() == assignee_email:
-            return True
-
-    if member_lookup and assignee_id in member_lookup.get("by_id", {}):
-        member = member_lookup["by_id"][assignee_id]
-        member_name = member.get("name")
-        member_email = member.get("email")
-        if normalized.get("assignee") in (member_name, member_email):
-            return True
-        if normalized.get("assignee_email") and normalized.get("assignee_email") == member_email:
-            return True
-
-    return False
+    current_assignee_email = str(get_assignee_email(payload, member_lookup) or "").strip().lower()
+    expected_assignee_email = str(assignee_email or "").strip().lower()
+    return bool(current_assignee_email) and current_assignee_email == expected_assignee_email

@@ -4,19 +4,47 @@ from datetime import datetime, timezone
 
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 
+MEMBERSHIP_ROLE_LEADER = "leader"
+MEMBERSHIP_ROLE_COLEADER = "coleader"
+MEMBERSHIP_ROLE_MEMBER = "member"
+MANAGEMENT_MEMBERSHIP_ROLES = {MEMBERSHIP_ROLE_LEADER, MEMBERSHIP_ROLE_COLEADER}
+
 
 def _current_timestamp_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def derive_membership_role(role: Optional[str], seniority: Optional[str]) -> str:
+def normalize_membership_role(role: Optional[str], default: str = MEMBERSHIP_ROLE_MEMBER) -> str:
+    role_value = (role or "").strip().lower()
+    if role_value in {
+        MEMBERSHIP_ROLE_LEADER,
+        MEMBERSHIP_ROLE_COLEADER,
+        MEMBERSHIP_ROLE_MEMBER,
+    }:
+        return role_value
+    return default
+
+
+def is_management_membership_role(role: Optional[str]) -> bool:
+    return normalize_membership_role(role) in MANAGEMENT_MEMBERSHIP_ROLES
+
+
+def derive_membership_role(
+    role: Optional[str],
+    seniority: Optional[str],
+    membership_role: Optional[str] = None,
+) -> str:
+    explicit_role = normalize_membership_role(membership_role, default="")
+    if explicit_role:
+        return explicit_role
+
     role_value = (role or "").strip().lower()
     seniority_value = (seniority or "").strip().lower()
     if role_value in {"pm", "lead", "leader", "principal"}:
-        return "leader"
+        return MEMBERSHIP_ROLE_LEADER
     if seniority_value in {"lead", "principal"}:
-        return "leader"
-    return "member"
+        return MEMBERSHIP_ROLE_LEADER
+    return MEMBERSHIP_ROLE_MEMBER
 
 
 def _membership_doc_id(project_id: str, user_id: Optional[str], email: Optional[str]) -> Optional[str]:
@@ -33,6 +61,7 @@ def upsert_project_membership(
     email: Optional[str],
     role: str,
     project_role: Optional[str] = None,
+    project_seniority: Optional[str] = None,
     member_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     if user_id and email and user_id.lower() == email.lower():
@@ -48,8 +77,9 @@ def upsert_project_membership(
         "project_id": project_id,
         "user_id": user_id,
         "email": email.lower() if isinstance(email, str) else email,
-        "role": role,
+        "role": normalize_membership_role(role),
         "project_role": project_role,
+        "project_seniority": project_seniority,
         "member_id": member_id,
         "updated_at": now,
     }

@@ -6,6 +6,7 @@ from src.schemas.user_data import UserData
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.utils.authz.project_memberships import upsert_project_membership
 from src.utils.authz.users import upsert_user_profile
+from src.utils.planning.members import create_team_member
 
 
 def current_timestamp_iso() -> str:
@@ -89,12 +90,24 @@ def create_project_record(
 
     doc_ref = FIRESTORE_CLIENT.collection("projects").add(project_data)
     project_id = doc_ref[1].id
+    owner_name = user_data.get_user_name() or owner_email
+    owner_avatar = "".join(part[0].upper() for part in owner_name.split()[:2] if part) or owner_email[:2].upper()
 
     upsert_user_profile(
         user_id=user_data.get_user_id(),
         email=owner_email,
-        name=owner_email,
+        name=owner_name,
         role="leader",
+    )
+    create_team_member(
+        project_id=project_id,
+        user_id=user_data.get_user_id(),
+        name=owner_name,
+        email=owner_email,
+        role="PM",
+        seniority="Lead",
+        avatar=owner_avatar,
+        member_type="leader",
     )
     upsert_project_membership(
         project_id=project_id,

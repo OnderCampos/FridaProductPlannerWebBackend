@@ -1,17 +1,17 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 
 
 class CreateSprintRequest(BaseModel):
     name: str
-    lengthDays: int
+    lengthDays: int = Field(..., gt=0)
     startDate: Optional[str] = None
     endDate: Optional[str] = None
 
 
 class UpdateSprintRequest(BaseModel):
     name: Optional[str] = None
-    lengthDays: Optional[int] = None
+    lengthDays: Optional[int] = Field(None, gt=0)
     startDate: Optional[str] = None
     endDate: Optional[str] = None
 

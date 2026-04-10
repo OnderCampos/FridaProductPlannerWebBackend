@@ -5,11 +5,55 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 from google.cloud import firestore
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
-from src.utils.authz.project_memberships import derive_membership_role, upsert_project_membership, delete_project_membership
+from src.utils.authz.project_memberships import derive_membership_role, upsert_project_membership, delete_project_membership, normalize_membership_role
 from src.utils.authz.users import upsert_user_profile
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _build_fallback_leader_member(project_id: str) -> Optional[Dict[str, Any]]:
+    project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
+    if not project_doc.exists:
+        return None
+
+    project_data = project_doc.to_dict() or {}
+    owner_user_id = project_data.get("user_id")
+    owner_email = str(project_data.get("projectLead") or "").strip().lower()
+    if not owner_user_id and not owner_email:
+        return None
+
+    user_doc = None
+    if owner_user_id:
+        user_doc = FIRESTORE_CLIENT.collection("users").document(owner_user_id).get()
+    if (not user_doc or not user_doc.exists) and owner_email:
+        user_matches = FIRESTORE_CLIENT.collection("users").where("email", "==", owner_email).get()
+        if user_matches:
+            user_doc = user_matches[0]
+
+    user_data = user_doc.to_dict() if user_doc and user_doc.exists else {}
+    owner_name = str(
+        user_data.get("name")
+        or project_data.get("owner_name")
+        or owner_email
+        or owner_user_id
+        or "Project Leader"
+    ).strip()
+    avatar = "".join(part[0].upper() for part in owner_name.split()[:2] if part) or owner_name[:2].upper()
+
+    return {
+        "id": f"leader-{project_id}",
+        "project_id": project_id,
+        "user_id": owner_user_id or owner_email,
+        "name": owner_name,
+        "email": owner_email or user_data.get("email"),
+        "role": "PM",
+        "seniority": "Lead",
+        "member_type": "leader",
+        "status": "Active",
+        "joined_date": project_data.get("created_at") or datetime.utcnow().isoformat() + "Z",
+        "avatar": avatar,
+    }
 
 
 def create_team_member(
@@ -19,7 +63,8 @@ def create_team_member(
     email: str,
     role: str,
     seniority: str,
-    avatar: Optional[str] = None
+    avatar: Optional[str] = None,
+    member_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new team member in Firestore.
@@ -53,6 +98,7 @@ def create_team_member(
             "email": email,
             "role": role,
             "seniority": seniority,
+            "member_type": normalize_membership_role(member_type),
             "status": "Active",
             "joined_date": datetime.utcnow().isoformat() + "Z",
             "avatar": avatar,
@@ -70,7 +116,7 @@ def create_team_member(
             name=name,
             member_id=member_id,
         )
-        membership_role = derive_membership_role(role, seniority)
+        membership_role = derive_membership_role(role, seniority, member_data.get("member_type"))
         membership_user_id = user_id
         if membership_user_id and email and membership_user_id.lower() == email.lower():
             membership_user_id = None
@@ -80,6 +126,7 @@ def create_team_member(
             email=email,
             role=membership_role,
             project_role=role,
+            project_seniority=seniority,
             member_id=member_id,
         )
         
@@ -129,7 +176,17 @@ def get_project_members(
             member_data.pop("created_at", None)
             member_data.pop("updated_at", None)
             members.append(member_data)
-        
+
+        has_leader = any(normalize_membership_role(member.get("member_type")) == "leader" for member in members)
+        if not has_leader:
+            fallback_leader = _build_fallback_leader_member(project_id)
+            if fallback_leader and (
+                (not status or fallback_leader.get("status") == status)
+                and (not role or fallback_leader.get("role") == role)
+                and (not seniority or fallback_leader.get("seniority") == seniority)
+            ):
+                members.append(fallback_leader)
+
         logger.info(f"Retrieved {len(members)} members for project {project_id}")
         return members
         
@@ -155,6 +212,13 @@ def get_member_by_id(project_id: str, member_id: str) -> Optional[Dict[str, Any]
         member_doc = member_ref.get()
         
         if not member_doc.exists:
+            fallback_leader = _build_fallback_leader_member(project_id)
+            if fallback_leader and (
+                fallback_leader.get("id") == member_id
+                or fallback_leader.get("user_id") == member_id
+                or fallback_leader.get("email") == str(member_id).strip().lower()
+            ):
+                return fallback_leader
             return None
         
         member_data = member_doc.to_dict()
@@ -254,7 +318,8 @@ def update_team_member(
     project_id: str,
     member_id: str,
     role: Optional[str] = None,
-    seniority: Optional[str] = None
+    seniority: Optional[str] = None,
+    member_type: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Update a team member's role or seniority.
@@ -291,6 +356,8 @@ def update_team_member(
             update_data["role"] = role
         if seniority is not None:
             update_data["seniority"] = seniority
+        if member_type is not None:
+            update_data["member_type"] = normalize_membership_role(member_type)
         
         # Update in Firestore
         member_ref.update(update_data)
@@ -305,6 +372,7 @@ def update_team_member(
         membership_role = derive_membership_role(
             updated_data.get("role"),
             updated_data.get("seniority"),
+            updated_data.get("member_type"),
         )
         membership_user_id = updated_data.get("user_id")
         membership_email = updated_data.get("email")
@@ -317,6 +385,7 @@ def update_team_member(
             email=membership_email,
             role=membership_role,
             project_role=updated_data.get("role"),
+            project_seniority=updated_data.get("seniority"),
             member_id=updated_data.get("id") or member_id,
         )
         
@@ -434,6 +503,11 @@ def format_team_member_response(member_data: Dict[str, Any]) -> Dict[str, Any]:
         "email": member_data.get("email"),
         "role": member_data.get("role"),
         "seniority": member_data.get("seniority"),
+        "memberType": derive_membership_role(
+            member_data.get("role"),
+            member_data.get("seniority"),
+            member_data.get("member_type"),
+        ),
         "status": member_data.get("status"),
         "joinedDate": member_data.get("joined_date") or member_data.get("joinedDate"),
         "avatar": member_data.get("avatar")

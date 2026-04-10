@@ -17,5 +17,5 @@ DOCUMENT_CHUNK_EXTRACTION_AGENT = Agent(
     name="DocumentChunkExtractionAgent",
     task=DOCUMENT_CHUNK_EXTRACTION_TASK,
     azure_deployment=_DOCUMENT_CHUNK_EXTRACTION_DEPLOYMENT,
-    args=["project_name", "project_description", "chunk_id", "text", "language"],
+    args=["project_name", "chunk_id", "text", "language"],
 )

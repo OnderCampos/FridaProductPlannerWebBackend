@@ -16,7 +16,7 @@ from src.utils.planning.members import get_project_members
 from src.utils.planning.assignees import (
     build_member_lookup_from_members,
     assignee_matches,
-    normalize_assignee_fields,
+    ensure_assignee_email,
 )
 from src.utils.authz.permissions import get_project_access
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
@@ -77,21 +77,89 @@ def _current_timestamp_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _build_story_backlog_item(story: dict, project_id: str, project_name: str, project_key: str, epic_name: str) -> dict:
+    fields = story.get("fields") or []
+    title = story.get("title") or _extract_field_value(fields, "title") or story.get("user_story") or story.get("user_story_id")
+    priority = story.get("priority") or _extract_field_value(fields, "priority")
+    story_points = story.get("storyPoints") or story.get("story_points") or _extract_field_value(fields, "storyPoints", "story_points", "storypoints")
+    due_date = story.get("dueDate") or story.get("due_date") or _extract_field_value(fields, "dueDate", "due_date", "duedate")
+    status = story.get("status") or _extract_field_value(fields, "status") or "To Do"
+    return {
+        "id": story.get("id"),
+        "user_story_id": story.get("user_story_id"),
+        "epic_id": story.get("epic_id"),
+        "epic_name": epic_name,
+        "story_id": story.get("id"),
+        "story_title": title,
+        "title": title,
+        "user_story": story.get("user_story"),
+        "status": status,
+        "priority": priority,
+        "storyPoints": story_points,
+        "dueDate": due_date,
+        "effort_hours": story.get("effort_hours") or story.get("effortHours"),
+        "assignee": story.get("assignee_email") or story.get("assignee"),
+        "project_id": project_id,
+        "project_name": project_name,
+        "project_key": project_key,
+    }
+
+
+def _build_subtask_backlog_item(
+    subtask: dict,
+    project_id: str,
+    project_name: str,
+    project_key: str,
+    epic_name: str = "",
+    story_id: Optional[str] = None,
+    story_title: Optional[str] = None,
+) -> dict:
+    return {
+        "id": subtask.get("id"),
+        "task_id": subtask.get("task_id"),
+        "epic_id": subtask.get("epic_id"),
+        "epic_name": epic_name or subtask.get("epic_name") or "",
+        "story_id": story_id,
+        "story_title": story_title,
+        "title": subtask.get("title") or subtask.get("description") or "Untitled task",
+        "status": subtask.get("status") or "To Do",
+        "estimated_hours": subtask.get("estimated_hours"),
+        "type": subtask.get("task_type") or subtask.get("type") or subtask.get("complexity"),
+        "created_at": subtask.get("created_at") or subtask.get("createdDate") or subtask.get("created_date"),
+        "assignee": subtask.get("assignee_email") or subtask.get("assignee"),
+        "project_id": project_id,
+        "project_name": project_name,
+        "project_key": project_key,
+        "source": subtask.get("source") or "project",
+    }
+
+
+def _get_epic_doc_map(epic_ids: set[str]) -> dict[str, dict]:
+    epic_map: dict[str, dict] = {}
+    for epic_id in epic_ids:
+        if not epic_id:
+            continue
+        epic_doc = FIRESTORE_CLIENT.collection("epics").document(epic_id).get()
+        if not epic_doc.exists:
+            continue
+        epic_data = epic_doc.to_dict() or {}
+        epic_data["id"] = epic_doc.id
+        epic_map[epic_doc.id] = epic_data
+    return epic_map
+
+
 @router.get(
     "/backlog",
     response_description="Get backlog items across projects",
 )
 async def get_backlog_route(
     assignee_email: Optional[str] = Query(None, alias="assignee_email", description="Assignee email"),
-    assigneeEmail: Optional[str] = Query(None, description="Assignee email"),
     user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
     Retrieves epics, stories, and subtasks for all projects owned by the user.
     Optionally filters by assignee email.
     """
-    resolved_email = assignee_email or assigneeEmail
-
     try:
         projects_response = get_all_projects_for_user(
             user_data.user_id,
@@ -107,6 +175,7 @@ async def get_backlog_route(
         backlog_epics = []
         backlog_stories = []
         backlog_subtasks = []
+        project_scopes = {}
 
         for project in projects_response.data or []:
             project_id = project.get("id") or project.get("project_id")
@@ -121,7 +190,7 @@ async def get_backlog_route(
                 continue
             is_lead = access.data.get("is_lead")
 
-            filter_email = resolved_email
+            filter_email = assignee_email
             if not is_lead:
                 filter_email = user_data.get_email()
 
@@ -130,64 +199,174 @@ async def get_backlog_route(
                 members = get_project_members(project_id)
             member_lookup = build_member_lookup_from_members(members)
 
+            project_scopes[project_id] = {
+                "project_id": project_id,
+                "project_name": project_name,
+                "project_key": project_key,
+                "filter_email": str(filter_email or "").strip().lower() or None,
+                "member_lookup": member_lookup,
+                "is_lead": is_lead,
+            }
+
+        filtered_project_scopes = {
+            project_id: scope
+            for project_id, scope in project_scopes.items()
+            if scope.get("filter_email")
+        }
+
+        if filtered_project_scopes:
+            epic_map_by_id: dict[str, dict] = {}
+            stories_by_id: dict[str, dict] = {}
+            queried_story_ids = set()
+            unique_filter_emails = {
+                str(scope.get("filter_email") or "").strip().lower()
+                for scope in filtered_project_scopes.values()
+                if str(scope.get("filter_email") or "").strip()
+            }
+
+            for filter_email in unique_filter_emails:
+                story_docs = list(FIRESTORE_CLIENT.collection("user_stories").where("assignee_email", "==", filter_email).get())
+                legacy_story_docs = FIRESTORE_CLIENT.collection("user_stories").where("assigneeEmail", "==", filter_email).get()
+                if legacy_story_docs:
+                    story_docs.extend(legacy_story_docs)
+                candidate_stories = []
+                unresolved_epic_ids = set()
+
+                for doc in story_docs or []:
+                    story = doc.to_dict() or {}
+                    story["id"] = doc.id
+                    epic_id = str(story.get("epic_id") or "").strip()
+                    if epic_id and epic_id not in epic_map_by_id:
+                        unresolved_epic_ids.add(epic_id)
+                    candidate_stories.append(story)
+
+                if unresolved_epic_ids:
+                    epic_map_by_id.update(_get_epic_doc_map(unresolved_epic_ids))
+
+                for story in candidate_stories:
+                    epic_id = str(story.get("epic_id") or "").strip()
+                    epic = epic_map_by_id.get(epic_id) or {}
+                    project_id = str(epic.get("project_id") or "").strip()
+                    if not project_id or project_id not in filtered_project_scopes:
+                        continue
+
+                    scope = filtered_project_scopes[project_id]
+                    ensure_assignee_email(story, scope["member_lookup"])
+                    if not assignee_matches(story, scope["filter_email"], scope["member_lookup"]):
+                        continue
+                    if story.get("id") in queried_story_ids:
+                        continue
+
+                    queried_story_ids.add(story.get("id"))
+                    stories_by_id[story.get("id")] = story
+                    backlog_stories.append(
+                        _build_story_backlog_item(
+                            story,
+                            project_id=project_id,
+                            project_name=scope["project_name"],
+                            project_key=scope["project_key"],
+                            epic_name=str(epic.get("name") or ""),
+                        )
+                    )
+
+            for project_id, scope in filtered_project_scopes.items():
+                subtask_docs = list(
+                    FIRESTORE_CLIENT.collection("subtasks")
+                    .where("project_id", "==", project_id)
+                    .where("assignee_email", "==", scope["filter_email"])
+                    .get()
+                )
+                legacy_subtask_docs = FIRESTORE_CLIENT.collection("subtasks") \
+                    .where("project_id", "==", project_id) \
+                    .where("assigneeEmail", "==", scope["filter_email"]) \
+                    .get()
+                if legacy_subtask_docs:
+                    subtask_docs.extend(legacy_subtask_docs)
+
+                missing_story_ids = set()
+
+                for doc in subtask_docs or []:
+                    subtask = doc.to_dict() or {}
+                    subtask["id"] = doc.id
+                    story_id = str(subtask.get("user_story_id") or "").strip()
+                    if story_id and story_id not in stories_by_id:
+                        missing_story_ids.add(story_id)
+
+                for story_id in missing_story_ids:
+                    story_doc = FIRESTORE_CLIENT.collection("user_stories").document(story_id).get()
+                    if not story_doc.exists:
+                        continue
+                    story = story_doc.to_dict() or {}
+                    story["id"] = story_doc.id
+                    stories_by_id[story_doc.id] = story
+                    epic_id = str(story.get("epic_id") or "").strip()
+                    if epic_id and epic_id not in epic_map_by_id:
+                        epic_map_by_id.update(_get_epic_doc_map({epic_id}))
+
+                for doc in subtask_docs or []:
+                    subtask = doc.to_dict() or {}
+                    subtask["id"] = doc.id
+                    ensure_assignee_email(subtask, scope["member_lookup"])
+                    if not assignee_matches(subtask, scope["filter_email"], scope["member_lookup"]):
+                        continue
+
+                    story_id = str(subtask.get("user_story_id") or "").strip() or None
+                    story = stories_by_id.get(story_id or "") or {}
+                    epic_id = str(
+                        subtask.get("epic_id")
+                        or story.get("epic_id")
+                        or ""
+                    ).strip()
+                    epic = epic_map_by_id.get(epic_id) or {}
+                    if epic and str(epic.get("project_id") or "").strip() != project_id:
+                        continue
+
+                    fields = story.get("fields") or []
+                    story_title = (
+                        story.get("title")
+                        or _extract_field_value(fields, "title")
+                        or story.get("user_story")
+                        or story.get("user_story_id")
+                    ) if story_id else None
+
+                    backlog_subtasks.append(
+                        _build_subtask_backlog_item(
+                            subtask,
+                            project_id=project_id,
+                            project_name=scope["project_name"],
+                            project_key=scope["project_key"],
+                            epic_name=str(epic.get("name") or subtask.get("epic_name") or ""),
+                            story_id=story_id,
+                            story_title=story_title,
+                        )
+                    )
+
+        for project_id, scope in project_scopes.items():
+            if scope.get("filter_email"):
+                continue
+
+            project_name = scope["project_name"]
+            project_key = scope["project_key"]
+            member_lookup = scope["member_lookup"]
+
             epics = get_epics_for_project(project_id, user_data.user_id)
             epic_name_map = {epic.get("id"): epic.get("name", "") for epic in epics}
 
-            for epic in epics:
-                normalize_assignee_fields(epic, member_lookup)
-                if filter_email and not assignee_matches(epic, filter_email, member_lookup):
-                    continue
-
-                backlog_epics.append({
-                    "id": epic.get("id"),
-                    "epic_id": epic.get("id"),
-                    "epic_name": epic.get("name"),
-                    "story_id": None,
-                    "story_title": None,
-                    "name": epic.get("name"),
-                    "description": epic.get("description"),
-                    "status": epic.get("status") or "To Do",
-                    "priority": epic.get("priority") or _extract_field_value(epic.get("fields"), "priority"),
-                    "storyPoints": epic.get("storyPoints") or epic.get("story_points") or _extract_field_value(epic.get("fields"), "storyPoints", "story_points", "storypoints"),
-                    "dueDate": epic.get("dueDate") or epic.get("due_date") or _extract_field_value(epic.get("fields"), "dueDate", "due_date", "duedate"),
-                    "assignee": epic.get("assignee_email") or epic.get("assignee"),
-                    "project_id": project_id,
-                    "project_name": project_name,
-                    "project_key": project_key,
-                })
 
             for epic in epics:
                 stories_response = get_user_stories_by_epic(epic.get("id"), user_data.user_id, allow_member=True)
                 stories = stories_response.data or []
                 for story in stories:
-                    normalize_assignee_fields(story, member_lookup)
-                    if filter_email and not assignee_matches(story, filter_email, member_lookup):
-                        continue
-
-                    fields = story.get("fields") or []
-                    title = story.get("title") or _extract_field_value(fields, "title") or story.get("user_story") or story.get("user_story_id")
-                    priority = story.get("priority") or _extract_field_value(fields, "priority")
-                    story_points = story.get("storyPoints") or story.get("story_points") or _extract_field_value(fields, "storyPoints", "story_points", "storypoints")
-                    due_date = story.get("dueDate") or story.get("due_date") or _extract_field_value(fields, "dueDate", "due_date", "duedate")
-                    status = story.get("status") or _extract_field_value(fields, "status") or "To Do"
-                    backlog_stories.append({
-                        "id": story.get("id"),
-                        "epic_id": story.get("epic_id"),
-                        "epic_name": epic_name_map.get(story.get("epic_id"), ""),
-                        "story_id": story.get("id"),
-                        "story_title": title,
-                        "title": title,
-                        "user_story": story.get("user_story"),
-                        "status": status,
-                        "priority": priority,
-                        "storyPoints": story_points,
-                        "dueDate": due_date,
-                        "effort_hours": story.get("effort_hours") or story.get("effortHours"),
-                        "assignee": story.get("assignee_email") or story.get("assignee"),
-                        "project_id": project_id,
-                        "project_name": project_name,
-                        "project_key": project_key,
-                    })
+                    ensure_assignee_email(story, member_lookup)
+                    backlog_stories.append(
+                        _build_story_backlog_item(
+                            story,
+                            project_id=project_id,
+                            project_name=project_name,
+                            project_key=project_key,
+                            epic_name=epic_name_map.get(story.get("epic_id"), ""),
+                        )
+                    )
 
                     story_id = story.get("id")
                     if not story_id:
@@ -201,26 +380,39 @@ async def get_backlog_route(
                     if not subtasks_response.success:
                         continue
                     for subtask in subtasks_response.data or []:
-                        normalize_assignee_fields(subtask, member_lookup)
-                        if filter_email and not assignee_matches(subtask, filter_email, member_lookup):
-                            continue
+                        ensure_assignee_email(subtask, member_lookup)
+                        fields = story.get("fields") or []
+                        story_title = story.get("title") or _extract_field_value(fields, "title") or story.get("user_story") or story.get("user_story_id")
+                        backlog_subtasks.append(
+                            _build_subtask_backlog_item(
+                                subtask,
+                                project_id=project_id,
+                                project_name=project_name,
+                                project_key=project_key,
+                                epic_name=epic_name_map.get(story.get("epic_id"), ""),
+                                story_id=story_id,
+                                story_title=story_title,
+                            )
+                        )
 
-                        backlog_subtasks.append({
-                            "id": subtask.get("id"),
-                            "epic_id": story.get("epic_id"),
-                            "epic_name": epic_name_map.get(story.get("epic_id"), ""),
-                            "story_id": story_id,
-                            "story_title": title,
-                            "title": subtask.get("title") or subtask.get("description"),
-                            "status": subtask.get("status") or "To Do",
-                            "estimated_hours": subtask.get("estimated_hours"),
-                            "type": subtask.get("type") or subtask.get("complexity"),
-                            "created_at": subtask.get("created_at") or subtask.get("createdDate") or subtask.get("created_date"),
-                            "assignee": subtask.get("assignee_email") or subtask.get("assignee"),
-                            "project_id": project_id,
-                            "project_name": project_name,
-                            "project_key": project_key,
-                        })
+            standalone_subtasks_docs = FIRESTORE_CLIENT.collection("subtasks").where(
+                "project_id", "==", project_id
+            ).get()
+            for doc in standalone_subtasks_docs:
+                subtask = doc.to_dict() or {}
+                if str(subtask.get("user_story_id") or "").strip():
+                    continue
+
+                subtask["id"] = doc.id
+                ensure_assignee_email(subtask, member_lookup)
+                backlog_subtasks.append(
+                    _build_subtask_backlog_item(
+                        subtask,
+                        project_id=project_id,
+                        project_name=project_name,
+                        project_key=project_key,
+                    )
+                )
 
         response = ResponseModel(
             success=True,
@@ -348,7 +540,7 @@ async def update_backlog_item_status(
     if not access.data.get("is_lead"):
         members = get_project_members(project_id)
         member_lookup = build_member_lookup_from_members(members)
-        normalize_assignee_fields(item_data, member_lookup)
+        ensure_assignee_email(item_data, member_lookup)
         if not assignee_matches(item_data, user_data.get_email(), member_lookup):
             return JSONResponse(
                 status_code=403,

@@ -254,7 +254,7 @@ async def _compose_document_with_agent(
     qa_history: List[Dict[str, str]],
 ) -> Dict[str, Any]:
     try:
-        from src.intelligence.agents.json_executor import execute_json_agent
+        from src.intelligence.agents.json_executor import execute_agent
         from src.intelligence.agents.document_generation.user_story_document_generation_agent import (
             USER_STORY_DOCUMENT_GENERATION_AGENT,
         )
@@ -263,7 +263,7 @@ async def _compose_document_with_agent(
         return current_document
 
     try:
-        raw = execute_json_agent(
+        raw = execute_agent(
             agent=USER_STORY_DOCUMENT_GENERATION_AGENT,
             prompt_kwargs={
                 "template_spec": DOCUMENT_TEMPLATE_SPEC,
@@ -295,7 +295,7 @@ async def _compose_document_tables_with_agent(
     qa_history: List[Dict[str, str]],
 ) -> Dict[str, Any]:
     try:
-        from src.intelligence.agents.json_executor import execute_json_agent
+        from src.intelligence.agents.json_executor import execute_agent
         from src.intelligence.agents.document_generation.user_story_document_table_agent import (
             USER_STORY_DOCUMENT_TABLE_AGENT,
         )
@@ -304,7 +304,7 @@ async def _compose_document_tables_with_agent(
         return current_document
 
     try:
-        raw = execute_json_agent(
+        raw = execute_agent(
             agent=USER_STORY_DOCUMENT_TABLE_AGENT,
             prompt_kwargs={
                 "project": _trim_project_for_agent(project),
