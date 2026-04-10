@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 import re
 from typing import List, Dict, Any, Optional
 import logging
+import traceback
 
 from src.services.notifications import NotificationService
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
@@ -198,16 +199,6 @@ def _normalize_string_list(value: Optional[Any]) -> List[str]:
             items.append(line)
     return items
 
-
-def _assignment_notification_result(sent: bool, status: str, reason: str, message: str) -> Dict[str, Any]:
-    return {
-        "sent": bool(sent),
-        "status": str(status),
-        "reason": str(reason),
-        "message": str(message),
-    }
-
-
 def _attach_story_sprint_assignment(story_data: Dict[str, Any], story_id: str) -> Dict[str, Any]:
     """Attach the assigned sprint ID for a story when present."""
     assignment_query = (
@@ -225,7 +216,15 @@ def _attach_story_sprint_assignment(story_data: Dict[str, Any], story_id: str) -
 
     return story_data
 
-
+"""
+---------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------
+USER STORY NOTIFICATIONS
+----------------------------------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------------------------------------------------
+"""
 def _maybe_send_user_story_assignment_notification(
     *,
     previous_story: Dict[str, Any],
@@ -237,7 +236,7 @@ def _maybe_send_user_story_assignment_notification(
     try:
         epic_id = str(updated_story.get("epic_id") or previous_story.get("epic_id") or "").strip()
         if not epic_id:
-            return _assignment_notification_result(
+            return NotificationService()._notification_result(
                 False,
                 "skipped",
                 "epic_missing",
@@ -246,7 +245,7 @@ def _maybe_send_user_story_assignment_notification(
 
         project_id = get_project_id_for_epic(epic_id)
         if not project_id:
-            return _assignment_notification_result(
+            return NotificationService()._notification_result(
                 False,
                 "skipped",
                 "project_missing",
@@ -260,7 +259,7 @@ def _maybe_send_user_story_assignment_notification(
         updated_assignee_name = str(updated_assignee.get("assignee") or "").strip()
         updated_assignee_id = str(updated_assignee.get("assignee_id") or "").strip()
         if not updated_assignee_name and not updated_assignee_id:
-            return _assignment_notification_result(
+            return NotificationService()._notification_result(
                 False,
                 "skipped",
                 "assignee_cleared",
@@ -270,18 +269,27 @@ def _maybe_send_user_story_assignment_notification(
         previous_email = str(previous_assignee.get("assignee_email") or "").strip().lower()
         updated_email = str(updated_assignee.get("assignee_email") or "").strip().lower()
         if not updated_email:
-            return _assignment_notification_result(
+            return NotificationService()._notification_result(
                 False,
                 "skipped",
                 "assignee_email_missing",
                 "Assignment email was not sent because the assigned member does not have a resolved email address.",
             )
         if updated_email == previous_email:
-            return _assignment_notification_result(
+            return NotificationService()._notification_result(
                 False,
                 "skipped",
                 "assignee_unchanged",
                 "Assignment email was not sent because the assignee did not change.",
+            )
+
+        actor_email = str(user_email or "").strip().lower()
+        if actor_email and updated_email == actor_email:
+            return NotificationService()._notification_result(
+                False,
+                "skipped",
+                "self_assigned",
+                "Assignment email was not sent because the user assigned the story to themselves.",
             )
 
         project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
@@ -314,7 +322,7 @@ def _maybe_send_user_story_assignment_notification(
                 or "A FridaPlatform administrator"
             ).strip()
 
-        NotificationService().send_user_story_assignment(
+        NotificationService().try_send_user_story_assignment(
             assignee_name=assignee_name,
             assignee_email=updated_email,
             project_name=project_name,
@@ -323,20 +331,123 @@ def _maybe_send_user_story_assignment_notification(
             story_reference=story_reference,
             assigned_by_name=actor_name,
         )
-        return _assignment_notification_result(
+        return NotificationService()._notification_result(
             True,
             "sent",
             "sent",
             f"Assignment email sent to {updated_email}.",
         )
     except Exception:
-        return _assignment_notification_result(
+        return NotificationService()._notification_result(
             False,
             "failed",
             "notification_provider_failed",
             "Assignment email was not sent because the notification provider failed.",
         )
 
+def _maybe_send_user_story_updated_notification(
+    *,
+    previous_story: Dict[str, Any],
+    updated_story: Dict[str, Any],
+    user_id: str,
+    user_email: Optional[str] = None,
+    user_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        fields_to_watch = {
+            "status": "Status",
+            "effortHours": "Effort Hours",
+            "storyPoints": "Story Points",
+            "priority": "Priority"
+        }
+
+        changes = {}
+        for db_key, display_name in fields_to_watch.items():
+            old_val = str(previous_story.get(db_key) or "N/A").strip()
+            new_val = str(updated_story.get(db_key) or "N/A").strip()
+
+            if old_val != new_val and old_val.lower() != new_val.lower():
+                changes[display_name] = {"old": old_val, "new": new_val}
+
+        if not changes:
+            return NotificationService()._notification_result(False, "skipped", "no_changes", "No relevant fields were changed")
+
+        # Get epic id to find the project
+        epic_id = str(updated_story.get("epic_id") or previous_story.get("epic_id") or "").strip()
+        if not epic_id:
+            return NotificationService()._notification_result(False, "skipped", "epic_missing", "Epic ID is missing.")
+
+        epic_doc = FIRESTORE_CLIENT.collection("epics").document(epic_id).get()
+        epic_name = ""
+        if epic_doc.exists:
+            epic_data = epic_doc.to_dict() or {}
+            epic_name = str(epic_data.get("epic") or epic_data.get("name") or "").strip()
+
+        project_id = get_project_id_for_epic(epic_id)
+        if not project_id:
+            return NotificationService()._notification_result(False, "skipped", "project_missing", "Project missing")
+
+        # Extract project document
+        project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
+        if not project_doc.exists:
+            return NotificationService()._notification_result(False, "skipped", "project_not_found", "Project not found")
+
+        project_data = project_doc.to_dict() or {}
+        project_name = str(project_data.get("name") or "").strip()
+
+        # Get project leader
+        leader_email = project_data.get("projectLead", "")
+        leader_id = project_data.get("user_id", "")
+        leader_doc = FIRESTORE_CLIENT.collection("users").document(leader_id).get()
+        if not leader_doc.exists:
+            return NotificationService()._notification_result(False, "skipped", "admin_not_found", "Admin Project not found")
+
+        leader_data = leader_doc.to_dict() or {}
+        leader_name = leader_data.get("name", "")
+
+        # If the leader has made the change , we do not send the email
+        if user_email and user_email.lower() == leader_email.lower():
+            return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
+
+        # Get who has made the change
+        user_story_title = str(updated_story.get("user_story") or "").strip()
+        actor_name = str(user_name or user_email or "A User").strip()
+        if not actor_name:
+            actor_profile = get_user_profile(user_id=user_id, email=user_email)
+            actor_name = str(
+                (actor_profile or {}).get("name")
+                or (actor_profile or {}).get("email")
+                or user_email
+                or user_id
+                or "A FridaPlatform administrator"
+            ).strip()
+
+        NotificationService().try_send_user_story_updated(
+            leader_email=leader_email,
+            leader_name=leader_name,
+            changer_name=actor_name,
+            project_name=project_name,
+            epic_name=epic_name,
+            story_title=user_story_title,
+            changes=changes
+        )
+
+        return NotificationService()._notification_result(
+            True, 
+            "sent", 
+            "sent", 
+            f"Update email sent to {leader_email} with changes: {list(changes.keys())}"
+        )
+    except Exception as e:
+        print(f"ERROR EN NOTIFICACIÓN DE STATUS: {e}")
+        traceback.print_exc()
+
+        return NotificationService()._notification_result(
+            False,
+            "failed",
+            "notification_provider_failed",
+            "Assignment email was not sent because the notification provider failed.",
+        )
 
 def create_user_story(epic_id: str, user_id: str, user_story_data: Dict[str, Any], template_data: Dict[str, Any] = None) -> ResponseModel:
     """
@@ -885,6 +996,15 @@ def update_user_story_fields(
             user_name=user_name,
         )
         final_data["assignment_notification"] = assignment_notification
+
+        updated_notification = _maybe_send_user_story_updated_notification(
+            previous_story=previous_story_data,
+            updated_story=final_data,
+            user_id=user_id,
+            user_email=user_email,
+            user_name=user_name
+        )
+        final_data["updated_notification"] = updated_notification
 
         return ResponseModel(
             success=True, 

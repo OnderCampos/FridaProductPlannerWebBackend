@@ -1,16 +1,19 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
-from typing import Optional
+from typing import Any, Dict, Optional
 from datetime import datetime, timezone
 import logging
+import traceback
 
 from src.schemas.resources_request import BacklogStatusUpdateRequest
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
+from src.services.notifications import NotificationService
 from src.utils.authz.auth import get_current_user
+from src.utils.authz.users import get_user_profile
 from src.utils.planning.projects import get_all_projects_for_user
 from src.utils.planning.epics import get_epics_for_project
-from src.utils.planning.user_stories import get_user_stories_by_epic
+from src.utils.planning.user_stories import _maybe_send_user_story_updated_notification, get_user_stories_by_epic
 from src.utils.planning.subtask_generation import get_subtasks_by_user_story
 from src.utils.planning.members import get_project_members
 from src.utils.planning.assignees import (
@@ -76,6 +79,99 @@ def _status_from_message(message: str) -> int:
 def _current_timestamp_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _maybe_send_subtask_updated_notification(
+    *,
+    previous_subtask: Dict[str, Any],
+    updated_subtask: Dict[str, Any],
+    user_id: str,
+    user_email: Optional[str] = None,
+    user_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        fields_to_watch = {
+            "status": "Status"
+        }
+
+        changes = {}
+        for db_key, display_name in fields_to_watch.items():
+            old_val = str(previous_subtask.get(db_key) or "N/A").strip()
+            new_val = str(updated_subtask.get(db_key) or "N/A").strip()
+
+            if old_val != new_val and old_val.lower() != new_val.lower():
+                changes[display_name] = {"old": old_val, "new": new_val}
+
+        if not changes:
+            return NotificationService()._notification_result(False, "skipped", "no_changes", "No relevant fields were changed")
+
+        story_id = str(updated_subtask.get("user_story_id") or previous_subtask.get("user_story_id") or "").strip()
+        if not story_id:
+            return NotificationService()._notification_result(False, "skipped", "story_missing", "User Story ID is missing in subtask.")
+
+        story_doc = FIRESTORE_CLIENT.collection("user_stories").document(story_id).get()
+        if not story_doc.exists:
+            return NotificationService()._notification_result(False, "skipped", "story_not_found", "Parent Story not found.")
+        
+        story_data = story_doc.to_dict() or {}
+        parent_story_title = str(story_data.get("user_story") or story_data.get("title") or "").strip()
+        epic_id = str(story_data.get("epic_id") or "").strip()
+
+        if not epic_id:
+            return NotificationService()._notification_result(False, "skipped", "epic_missing", "Epic ID is missing in parent story.")
+
+        epic_doc = FIRESTORE_CLIENT.collection("epics").document(epic_id).get()
+        epic_name = ""
+        project_id = ""
+        if epic_doc.exists:
+            epic_data = epic_doc.to_dict() or {}
+            epic_name = str(epic_data.get("epic") or epic_data.get("name") or "").strip()
+            project_id = str(epic_data.get("project_id") or "").strip()
+
+        if not project_id:
+            return NotificationService()._notification_result(False, "skipped", "project_missing", "Project ID missing in epic.")
+
+        project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
+        if not project_doc.exists:
+            return NotificationService()._notification_result(False, "skipped", "project_not_found", "Project not found")
+
+        project_data = project_doc.to_dict() or {}
+        project_name = str(project_data.get("name") or "").strip()
+        leader_email = project_data.get("projectLead", "")
+
+        leader_id = project_data.get("user_id", "")
+        leader_doc = FIRESTORE_CLIENT.collection("users").document(leader_id).get()
+        if not leader_doc.exists:
+            return NotificationService()._notification_result(False, "skipped", "admin_not_found", "Admin Project not found")
+
+        # If the leader has made the change , we do not send the email
+        if user_email and user_email.lower() == leader_email.lower():
+                return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
+
+        leader_data = leader_doc.to_dict() or {}
+        leader_name = leader_data.get("name", "")
+
+        actor_name = str(user_name or user_email or "A User").strip()
+        if not actor_name or actor_name == "None":
+            actor_profile = get_user_profile(user_id=user_id, email=user_email)
+            actor_name = str((actor_profile or {}).get("name") or user_email or "A User").strip()
+
+        subtask_title = str(updated_subtask.get("title") or "").strip()
+        display_title = f"[Subtask] {subtask_title} (De: {parent_story_title})"
+
+        NotificationService().try_send_subtask_updated(
+            leader_email=leader_email, 
+            leader_name=leader_name,               
+            changer_name=actor_name,
+            project_name=project_name,
+            epic_name=epic_name,
+            story_title=display_title,
+            changes=changes
+        )
+
+        return NotificationService()._notification_result(True, "sent", "sent", f"Subtask update email sent to {leader_email}.")
+    except Exception as e:
+        print(f"ERROR EN NOTIFICACIÓN DE SUBTAREA: {e}")
+        traceback.print_exc()
+        return NotificationService()._notification_result(False, "failed", "error", "Subtask notification failed.")
 
 @router.get(
     "/backlog",
@@ -370,6 +466,28 @@ async def update_backlog_item_status(
             update_data["completed_date"] = None
 
     item_ref.update(update_data)
+
+    updated_item_data = {**item_data, **update_data}
+
+    try:
+        if normalized_type == "story":
+            _maybe_send_user_story_updated_notification(
+                previous_story=item_data,
+                updated_story=updated_item_data,
+                user_id=user_data.get_user_id(),
+                user_email=user_data.get_email(),
+                user_name=user_data.get_user_name()
+            )
+        elif normalized_type == "subtask":
+            _maybe_send_subtask_updated_notification(
+                previous_subtask=item_data,
+                updated_subtask=updated_item_data,
+                user_id=user_data.get_user_id(),
+                user_email=user_data.get_email(),
+                user_name=user_data.get_user_name()
+            )
+    except Exception as e:
+        logging.error(f"Error disparando notificación desde backlog: {e}")
 
     return JSONResponse(
         status_code=200,

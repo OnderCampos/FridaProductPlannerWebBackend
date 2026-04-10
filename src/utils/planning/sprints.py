@@ -2,8 +2,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 
+from src.services.notifications import NotificationService
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.schemas.response import ResponseModel
+from src.utils.authz.users import get_user_profile
 from src.utils.planning.projects import get_project_for_user
 from src.utils.authz.permissions import get_project_access
 from src.utils.planning.user_stories import get_user_story_by_id, get_user_stories_by_epic
@@ -24,7 +26,6 @@ def _normalize_sprint_payload(sprint_data: Dict[str, Any]) -> Dict[str, Any]:
         sprint_data["lengthDays"] = sprint_data.get("length_days")
     return sprint_data
 
-
 def _get_project_or_error(project_id: str, user_id: str, allow_members: bool = False, user_email: Optional[str] = None) -> ResponseModel:
     if allow_members:
         access = get_project_access(project_id, user_id, user_email)
@@ -34,6 +35,115 @@ def _get_project_or_error(project_id: str, user_id: str, allow_members: bool = F
         return ResponseModel(success=True, message="Project access granted", data=project_data)
     return get_project_for_user(project_id, user_id)
 
+def _maybe_sprint_assignment_notification(
+    *,
+    project_id: str,
+    item_type: str,
+    item_id: str,
+    old_sprint_id: Optional[str] = None,
+    new_sprint_id: Optional[str] = None,
+    user_id: str,
+    user_email: Optional[str] = None,
+    user_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        if old_sprint_id == new_sprint_id:
+            return NotificationService()._notification_result(False, "skipped", "sprint_unchanged", "Sprint assignment did not change.")
+
+        old_sprint_name = "Backlog"
+        if old_sprint_id:
+            old_sprint_doc = FIRESTORE_CLIENT.collection("sprints").document(old_sprint_id).get()
+            old_sprint_name = old_sprint_doc.to_dict().get("name", "Sprint") if old_sprint_doc.exists else "Backlog"
+
+        new_sprint_name = "Backlog"
+        if new_sprint_id:
+            new_sprint_doc = FIRESTORE_CLIENT.collection("sprints").document(new_sprint_id).get()
+            new_sprint_name = new_sprint_doc.to_dict().get("name", "Sprint") if new_sprint_doc.exists else "Backlog"
+
+        project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
+        if not project_doc.exists:
+            return NotificationService()._notification_result(False, "skipped", "project_missing", "Project not found")
+
+        project_data = project_doc.to_dict() or {}
+        project_name = project_data.get("name" or "").strip()
+        leader_email = project_data.get("projectLead", "")
+
+        leader_id = project_data.get("user_id", "")
+        leader_doc = FIRESTORE_CLIENT.collection("users").document(leader_id).get()
+        if not leader_doc.exists:
+            return NotificationService()._notification_result(False, "skipped", "admin_not_found", "Admin Project not found")
+
+        leader_data = leader_doc.to_dict() or {}
+        leader_name = leader_data.get("name", "")
+
+        # If the leader has made the change , we do not send the email
+        if user_email and user_email.lower() == leader_email.lower():
+                return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
+
+        collection_name = "user_stories" if item_type.lower() == "story" else "subtasks"
+        item_doc = FIRESTORE_CLIENT.collection(collection_name).document(item_id).get()
+
+        item_title = "Unknown Item"
+        epic_name = "N/A"
+
+        if item_doc.exists:
+            item_data = item_doc.to_dict()
+            item_title = str(item_data.get("user_story") or "").strip()
+
+            # If it is a story, we get its epic_id
+            epic_id = item_data.get("epic_id")
+            if epic_id:
+                epic_doc = FIRESTORE_CLIENT.collection("epics").document(epic_id).get()
+                
+                if epic_doc.exists:
+                    epic_data = epic_doc.to_dict() or {}
+                    epic_name = str(epic_data.get("name") or "").strip()
+
+        user_story_item = ""
+        if item_type.lower() == "story":
+            user_story_item = "User Story"
+
+        display_title = f"[{user_story_item.capitalize()}] {item_title}"
+
+        actor_name = str(user_name or user_email or "A User").strip()
+        if not actor_name or actor_name == "None":
+            actor_profile = get_user_profile(user_id=user_id, email=user_email)
+            actor_name = str(
+                (actor_profile or {}).get("name")
+                or (actor_profile or {}).get("email")
+                or user_email
+                or user_id
+                or "A FridaPlatform administrator"
+            ).strip()
+
+        NotificationService().try_send_sprint_assignment(
+            leader_email=leader_email, 
+            leader_name=leader_name,               
+            changer_name=actor_name,
+            project_name=project_name,
+            epic_name=epic_name,
+            item_title=display_title,     
+            old_sprint_name=old_sprint_name,
+            new_sprint_name=new_sprint_name
+        )
+
+        return NotificationService()._notification_result(
+            True, 
+            "sent", 
+            "sent", 
+            f"Sprint assignment email sent to {leader_email}."
+        )
+    except Exception as e:
+        import traceback
+        print(f"🔥 ERROR EN NOTIFICACIÓN DE SPRINT: {e}")
+        traceback.print_exc()
+
+        return NotificationService()._notification_result(
+            False,
+            "failed",
+            "notification_provider_failed",
+            "Sprint assignment email failed."
+        )
 
 def _get_sprint_doc(sprint_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     sprint_ref = FIRESTORE_CLIENT.collection(SPRINTS_COLLECTION).document(sprint_id)
@@ -383,6 +493,8 @@ def assign_item_to_sprint(
     sprint_id: str,
     project_id: str,
     user_id: str,
+    user_email: str,
+    user_name: str,
     item_type: str,
     item_id: str,
     include_subtasks: bool = False,
@@ -419,7 +531,9 @@ def assign_item_to_sprint(
             'item_id', '==', item_id
         ).get()
 
+        old_sprint_id = None
         for doc in existing_assigments:
+            old_sprint_id = doc.to_dict().get("sprint_id")
             doc.reference.delete()
 
         # Calculate order and create new assign
@@ -457,9 +571,26 @@ def assign_item_to_sprint(
                     # Llamada recursiva o directa para asignar cada subtarea al mismo sprint
                     # Usamos recursividad simple para mantener la lógica de 'order'
                     assign_item_to_sprint(
-                        sprint_id, project_id, user_id,
-                        "subtask", subtask["id"], include_subtasks=False
+                        sprint_id, 
+                        project_id, 
+                        user_id, 
+                        user_email, 
+                        user_name,
+                        "subtask", 
+                        subtask["id"], include_subtasks=False
                     )
+
+        assigment_sprint_notification = _maybe_sprint_assignment_notification(
+            project_id=project_id,
+            item_type=normalized_type,
+            item_id=item_id,
+            old_sprint_id=old_sprint_id,
+            new_sprint_id=sprint_id,
+            user_id=user_id,
+            user_email=user_email,
+            user_name=user_name
+        )
+        assignment_data["assigment_sprint_notification"] = assigment_sprint_notification
 
         return ResponseModel(
             success=True,
@@ -478,6 +609,8 @@ def unassign_item_from_sprint(
     sprint_id: str,
     project_id: str,
     user_id: str,
+    user_email: str,
+    user_name: str,
     item_type: str,
     item_id: str,
 ) -> ResponseModel:
@@ -514,15 +647,25 @@ def unassign_item_from_sprint(
             doc.reference.delete()
             deleted += 1
 
+        unassign_item_notification = _maybe_sprint_assignment_notification(
+            project_id=project_id,
+            item_type=normalized_type,
+            item_id=item_id,
+            old_sprint_id=sprint_id,  
+            new_sprint_id=None,       
+            user_id=user_id,
+            user_email=user_email,
+            user_name=user_name
+        )
+
         return ResponseModel(
             success=True,
             message="Item unassigned successfully",
-            data={"deleted_count": deleted},
+            data={"deleted_count": deleted, "unassign_item_notification": unassign_item_notification},
         )
     except Exception as e:
         logging.error(f"Error unassigning item from sprint {sprint_id}: {e}")
         return ResponseModel(success=False, message=f"Error unassigning item: {str(e)}", data=None)
-
 
 def get_sprint_items(
     sprint_id: str,
