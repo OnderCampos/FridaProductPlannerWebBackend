@@ -15,9 +15,13 @@ from src.utils.core.general import get_code_block
 from src.utils.planning.epics import get_epic_by_id, get_epics_for_project
 from src.utils.planning.user_stories import get_user_stories_by_epic, get_user_story_by_id
 from src.utils.firebase.identifier import get_next_TK_identifier
+from src.schemas.workflow_status import (
+    WORKFLOW_STATUS_VALUES,
+    coerce_workflow_status,
+    normalize_workflow_status,
+)
 
-TASK_TYPE_VALUES = {"Implementation", "Bug", "Refactor"}
-TASK_STATUS_VALUES = ["To Do", "In Progress", "Testing", "Done", "Rework", "Blocked"]
+TASK_TYPE_VALUES = {"Implementation", "Bug", "Refactor", "Research"}
 LEGACY_TASK_TYPE_MAP = {
     "development": "Implementation",
     "testing": "Implementation",
@@ -27,6 +31,7 @@ LEGACY_TASK_TYPE_MAP = {
     "implementation": "Implementation",
     "bug": "Bug",
     "refactor": "Refactor",
+    "research": "Research",
 }
 
 TASK_ESTIMATION_PROMPT = """
@@ -54,7 +59,10 @@ Rules:
 """.strip()
 
 TASK_TIPS_PROMPT = """
-You are a senior software engineer creating implementation guidance for a single software task.
+You are a senior software engineer creating conceptual guidance for a single software task.
+
+You do NOT have access to the project's source code, repository, runtime, logs, or database.
+Your guidance must stay high-level and discovery-oriented.
 
 Project tech stack: {tech_stack}
 Task type: {task_type}
@@ -65,16 +73,50 @@ Write Markdown only.
 
 Required structure:
 ## Problem Summary
-## Possible Solutions
-## Recommended Approach
-## Implementation Notes
+## Where to Start
+## What to Research
+## Conceptual Approaches
 ## Risks and Edge Cases
 
 Rules:
-- Be practical and implementation-oriented.
-- Focus on likely solution options and useful development guidance.
+- Be practical, but stay conceptual.
+- Focus on how an engineer should frame the problem before coding.
+- Suggest first steps, useful questions, and topics to investigate.
+- If mentioning the tech stack, keep it at the level of areas to inspect or documentation to review.
+- Do not claim knowledge of specific files, functions, components, endpoints, schemas, or current code behavior unless explicitly stated in the task title or description.
+- Do not provide code, pseudocode, exact implementation steps, or instructions that assume direct codebase access.
 - Use bullets where appropriate.
 - Do not wrap the response in code fences.
+""".strip()
+
+PROJECT_TASK_BATCH_PROMPT = """
+You are a project planning agent.
+
+Your job is to read freeform planning text and identify the independent project tasks that should be created from it.
+
+Input text:
+{source_text}
+
+Return only valid JSON with this shape:
+{{
+  "tasks": [
+    {{
+      "title": "Short action-oriented title",
+      "description": "Clear scope for the task",
+      "task_type": "Implementation" | "Bug" | "Research" | "Refactor"
+    }}
+  ]
+}}
+
+Rules:
+- Create 1 to 10 tasks.
+- Each task must be independent enough to track on a task board.
+- Use concise, concrete titles.
+- Keep descriptions practical and implementation-oriented, but not overly detailed.
+- Infer the most appropriate `task_type` for each task.
+- Do not create duplicate tasks.
+- Do not include IDs, estimates, assignees, status, or dependencies.
+- Return JSON only.
 """.strip()
 
 
@@ -126,7 +168,7 @@ def _serialize_subtask(subtask_data: Dict[str, Any], subtask_id: Optional[str] =
     serialized["task_type"] = task_type
     serialized["task_id"] = str(serialized.get("task_id") or "").strip()
     serialized["type"] = task_type
-    serialized["status"] = str(serialized.get("status") or "To Do")
+    serialized["status"] = coerce_workflow_status(serialized.get("status"), default="To Do")
     serialized["dependencies"] = serialized.get("dependencies") or []
     serialized["estimated_hours"] = serialized.get("estimated_hours", 0)
     serialized["complexity"] = serialized.get("complexity") or "Medium"
@@ -206,19 +248,23 @@ async def _generate_project_task_tips(
     fallback = (
         "## Problem Summary\n"
         f"- {fallback_title}\n\n"
-        "## Possible Solutions\n"
-        "- Break the work into small implementation steps.\n"
-        "- Review the affected data flow, UI states, API contracts, and the project tech stack before coding.\n\n"
-        "## Recommended Approach\n"
-        "- Implement the smallest working end-to-end slice first.\n"
-        "- Add validation, errors, and edge-case handling close to the changed boundary.\n\n"
-        "## Implementation Notes\n"
-        f"- Task type: {task_type}\n"
-        f"- Project tech stack: {tech_stack_text}\n"
-        f"- Description context: {fallback_description}\n\n"
+        "## Where to Start\n"
+        "- Clarify the expected outcome, who uses it, and what success looks like.\n"
+        "- Identify the product area, workflow, or user journey most affected by this task.\n"
+        f"- Use the task type ({task_type}) and the project tech stack ({tech_stack_text}) to decide which area to inspect first.\n\n"
+        "## What to Research\n"
+        "- Existing product behavior and current limitations related to this task.\n"
+        "- Relevant framework, library, or platform documentation tied to the affected area.\n"
+        "- Similar patterns already used elsewhere in the product, if any.\n"
+        "- Constraints around validation, permissions, loading states, failures, and empty states.\n\n"
+        "## Conceptual Approaches\n"
+        "- Break the work into a small discovery phase and a small delivery phase.\n"
+        "- Prefer the smallest change that resolves the user problem without expanding scope.\n"
+        f"- Use this description as context while validating assumptions: {fallback_description}\n\n"
         "## Risks and Edge Cases\n"
         "- Ambiguous scope can lead to rework.\n"
-        "- Check permissions, empty states, and invalid input paths.\n"
+        "- Hidden dependencies may exist in adjacent flows or shared data.\n"
+        "- Permissions, invalid inputs, empty states, and failure handling should be verified early.\n"
     )
 
     try:
@@ -236,6 +282,116 @@ async def _generate_project_task_tips(
     except Exception as exc:
         logging.warning(f"Falling back to default task tips for '{title}': {exc}")
         return fallback
+
+
+async def _generate_project_tasks_from_text(
+    user_data: UserData,
+    source_text: str,
+) -> List[Dict[str, str]]:
+    cleaned_text = str(source_text or "").strip()
+    if not cleaned_text:
+        return []
+
+    fallback_task = {
+        "title": "Review and break down request",
+        "description": cleaned_text[:500],
+        "task_type": "Implementation",
+    }
+
+    try:
+        azure_services = AzureChatService(LLMOPS_API_KEY, user_data, None)
+        raw = await azure_services.simple_completion(
+            PROJECT_TASK_BATCH_PROMPT.format(source_text=cleaned_text)
+        )
+        payload_text = get_code_block(raw) or raw
+        try:
+            parsed = json.loads(payload_text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", payload_text, re.DOTALL)
+            parsed = json.loads(match.group(0)) if match else {}
+
+        tasks = parsed.get("tasks") if isinstance(parsed, dict) else None
+        if not isinstance(tasks, list):
+            return [fallback_task]
+
+        normalized_tasks: List[Dict[str, str]] = []
+        seen_titles = set()
+        for task in tasks[:10]:
+            if not isinstance(task, dict):
+                continue
+            title = str(task.get("title") or "").strip()
+            description = str(task.get("description") or "").strip()
+            task_type = _normalize_task_type(task.get("task_type"))
+            if not title:
+                continue
+            dedupe_key = title.lower()
+            if dedupe_key in seen_titles:
+                continue
+            seen_titles.add(dedupe_key)
+            normalized_tasks.append(
+                {
+                    "title": title,
+                    "description": description,
+                    "task_type": task_type,
+                }
+            )
+
+        return normalized_tasks or [fallback_task]
+    except Exception as exc:
+        logging.warning(f"Falling back to single batch task for source text: {exc}")
+        return [fallback_task]
+
+
+async def _build_project_task_document(
+    project_id: str,
+    user_data: UserData,
+    task_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    now = _current_timestamp_iso()
+    task_identifier = get_next_TK_identifier()
+    order = int(task_identifier.split("-")[1])
+
+    normalized_task_type = _normalize_task_type(task_data.get("task_type") or task_data.get("type"))
+    title = str(task_data.get("title") or "").strip()
+    description = str(task_data.get("description") or "").strip()
+    tech_stack = _get_project_tech_stack(project_id)
+    estimated_fields = await _estimate_project_task_fields(
+        user_data=user_data,
+        title=title,
+        description=description,
+        task_type=normalized_task_type,
+    )
+    tips_markdown = await _generate_project_task_tips(
+        user_data=user_data,
+        title=title,
+        description=description,
+        task_type=normalized_task_type,
+        tech_stack=tech_stack,
+    )
+    return {
+        "project_id": project_id,
+        "user_id": user_data.get_user_id(),
+        "source": "project",
+        "task_id": task_identifier,
+        "title": title,
+        "description": description,
+        "order": order,
+        "estimated_hours": estimated_fields["estimated_hours"],
+        "complexity": estimated_fields["complexity"],
+        "tips_markdown": tips_markdown,
+        "dependencies": task_data.get("dependencies", []),
+        "task_type": normalized_task_type,
+        "type": normalized_task_type,
+        "status": coerce_workflow_status(task_data.get("status"), default="To Do"),
+        "completed_date": None,
+        "created_at": now,
+        "updated_at": now,
+        "assignee": task_data.get("assignee", ""),
+        "assigneeId": task_data.get("assigneeId"),
+        "assigneeEmail": task_data.get("assigneeEmail"),
+        "assignee_email": task_data.get("assignee_email") or task_data.get("assigneeEmail"),
+        "assigned_to": task_data.get("assigned_to"),
+    }
 
 
 def _attach_sprint_ids(tasks: List[Dict[str, Any]]) -> None:
@@ -594,56 +750,10 @@ def list_tasks_for_project(
 
 async def create_project_task(project_id: str, user_data: UserData, task_data: Dict[str, Any]) -> ResponseModel:
     try:
-        now = _current_timestamp_iso()
-
-        task_identifier = get_next_TK_identifier()
-        order = int(task_identifier.split("-")[1])
-
-        normalized_task_type = _normalize_task_type(task_data.get("task_type") or task_data.get("type"))
-        title = str(task_data.get("title") or "").strip()
-        description = str(task_data.get("description") or "").strip()
-        tech_stack = _get_project_tech_stack(project_id)
-        estimated_fields = await _estimate_project_task_fields(
-            user_data=user_data,
-            title=title,
-            description=description,
-            task_type=normalized_task_type,
-        )
-        tips_markdown = await _generate_project_task_tips(
-            user_data=user_data,
-            title=title,
-            description=description,
-            task_type=normalized_task_type,
-            tech_stack=tech_stack,
-        )
-        new_task = {
-            "project_id": project_id,
-            "user_id": user_data.get_user_id(),
-            "source": "project",
-            "task_id": task_identifier,
-            "title": title,
-            "description": description,
-            "order": order,
-            "estimated_hours": estimated_fields["estimated_hours"],
-            "complexity": estimated_fields["complexity"],
-            "tips_markdown": tips_markdown,
-            "dependencies": task_data.get("dependencies", []),
-            "task_type": normalized_task_type,
-            "type": normalized_task_type,
-            "status": task_data.get("status", "To Do"),
-            "completed_date": None,
-            "created_at": now,
-            "updated_at": now,
-            "assignee": task_data.get("assignee", ""),
-            "assigneeId": task_data.get("assigneeId"),
-            "assigneeEmail": task_data.get("assigneeEmail"),
-            "assignee_email": task_data.get("assignee_email") or task_data.get("assigneeEmail"),
-            "assigned_to": task_data.get("assigned_to"),
-        }
-
-        if not new_task["title"]:
+        if not str(task_data.get("title") or "").strip():
             return ResponseModel(success=False, message="title is required", data=None)
 
+        new_task = await _build_project_task_document(project_id, user_data, task_data)
         doc_ref = FIRESTORE_CLIENT.collection("subtasks").add(new_task)
         task = _serialize_subtask(new_task, doc_ref[1].id)
         return ResponseModel(success=True, message="Task created successfully", data=task)
@@ -652,13 +762,43 @@ async def create_project_task(project_id: str, user_data: UserData, task_data: D
         return ResponseModel(success=False, message=f"Error creating project task: {str(e)}", data=None)
 
 
+async def batch_create_project_tasks_from_text(
+    project_id: str,
+    user_data: UserData,
+    source_text: str,
+) -> ResponseModel:
+    try:
+        generated_tasks = await _generate_project_tasks_from_text(user_data, source_text)
+        created_tasks: List[Dict[str, Any]] = []
+
+        for generated_task in generated_tasks:
+            if not str(generated_task.get("title") or "").strip():
+                continue
+            new_task = await _build_project_task_document(project_id, user_data, generated_task)
+            doc_ref = FIRESTORE_CLIENT.collection("subtasks").add(new_task)
+            created_tasks.append(_serialize_subtask(new_task, doc_ref[1].id))
+
+        if not created_tasks:
+            return ResponseModel(success=False, message="No tasks could be created from the provided text", data=None)
+
+        return ResponseModel(
+            success=True,
+            message=f"Created {len(created_tasks)} tasks from text",
+            data=created_tasks,
+        )
+    except Exception as e:
+        logging.error(f"Error batch creating project tasks: {e}")
+        return ResponseModel(success=False, message=f"Error batch creating project tasks: {str(e)}", data=None)
+
+
 def update_subtask_status(subtask_id: str, user_id: str, status: str, completed_date: str = None) -> ResponseModel:
     try:
-        if status not in TASK_STATUS_VALUES:
+        canonical_status = normalize_workflow_status(status)
+        if canonical_status is None:
             return ResponseModel(
                 success=False,
                 message="Invalid status value",
-                data={"valid_statuses": TASK_STATUS_VALUES},
+                data={"valid_statuses": WORKFLOW_STATUS_VALUES},
             )
 
         subtask_ref = FIRESTORE_CLIENT.collection("subtasks").document(subtask_id)
@@ -672,9 +812,9 @@ def update_subtask_status(subtask_id: str, user_id: str, status: str, completed_
 
         now = _current_timestamp_iso()
         update_data = {
-            "status": status,
+            "status": canonical_status,
             "updated_at": now,
-            "completed_date": completed_date if status == "Done" and completed_date else (now if status == "Done" else None),
+            "completed_date": completed_date if canonical_status == "Done" and completed_date else (now if canonical_status == "Done" else None),
         }
 
         subtask_ref.update(update_data)
@@ -864,7 +1004,7 @@ def create_subtask_for_user_story(story_id: str, user_id: str, subtask_data: Dic
             "dependencies": subtask_data.get("dependencies", []),
             "task_type": task_type,
             "type": task_type,
-            "status": subtask_data.get("status", "To Do"),
+            "status": coerce_workflow_status(subtask_data.get("status"), default="To Do"),
             "completed_date": None,
             "created_at": now,
             "updated_at": now,
@@ -889,6 +1029,88 @@ def create_subtask_for_user_story(story_id: str, user_id: str, subtask_data: Dic
         return ResponseModel(success=True, message="Subtask created successfully", data=serialized)
     except Exception as e:
         logging.error(f"Error creating subtask: {e}")
+        return ResponseModel(success=False, message=f"Error creating subtask: {str(e)}", data=None)
+
+
+async def create_subtask_for_user_story_with_agent(
+    story_id: str,
+    user_data: UserData,
+    subtask_data: Dict[str, Any],
+) -> ResponseModel:
+    try:
+        story_context = _build_story_context(story_id, user_data.get_user_id())
+        project_id = str(story_context.get("project_id") or "").strip()
+        if not project_id:
+            return ResponseModel(success=False, message="Project not found for user story", data=None)
+
+        existing_subtasks_query = FIRESTORE_CLIENT.collection("subtasks").where("user_story_id", "==", story_id).get()
+        current_orders = [doc.to_dict().get("order", 0) for doc in existing_subtasks_query]
+        next_order = max(current_orders, default=0) + 1
+
+        now = _current_timestamp_iso()
+        task_identifier = get_next_TK_identifier()
+        task_type = _normalize_task_type(subtask_data.get("task_type") or subtask_data.get("type"))
+        title = str(subtask_data.get("title") or "").strip()
+        description = str(subtask_data.get("description") or "").strip()
+
+        if not title:
+            return ResponseModel(success=False, message="title is required", data=None)
+
+        tech_stack = _get_project_tech_stack(project_id)
+        estimated_fields = await _estimate_project_task_fields(
+            user_data=user_data,
+            title=title,
+            description=description,
+            task_type=task_type,
+        )
+        tips_markdown = await _generate_project_task_tips(
+            user_data=user_data,
+            title=title,
+            description=description,
+            task_type=task_type,
+            tech_stack=tech_stack,
+        )
+
+        new_subtask = {
+            "user_story_id": story_id,
+            "user_id": user_data.get_user_id(),
+            "project_id": project_id,
+            "source": "story",
+            "task_id": task_identifier,
+            "title": title,
+            "order": next_order,
+            "description": description,
+            "estimated_hours": estimated_fields["estimated_hours"],
+            "complexity": estimated_fields["complexity"],
+            "tips_markdown": tips_markdown,
+            "dependencies": subtask_data.get("dependencies", []),
+            "task_type": task_type,
+            "type": task_type,
+            "status": coerce_workflow_status(subtask_data.get("status"), default="To Do"),
+            "completed_date": None,
+            "created_at": now,
+            "updated_at": now,
+            "assignee": subtask_data.get("assignee", ""),
+            "assigneeId": subtask_data.get("assigneeId"),
+            "assigneeEmail": subtask_data.get("assigneeEmail"),
+            "assignee_email": subtask_data.get("assignee_email") or subtask_data.get("assigneeEmail"),
+            "assigned_to": subtask_data.get("assigned_to"),
+        }
+
+        doc_ref = FIRESTORE_CLIENT.collection("subtasks").add(new_subtask)
+        serialized = _serialize_subtask(
+            {
+                **new_subtask,
+                "story_title": story_context.get("story_title", ""),
+                "epic_id": story_context.get("epic_id", ""),
+                "epic_name": story_context.get("epic_name", ""),
+            },
+            doc_ref[1].id,
+        )
+
+        return ResponseModel(success=True, message="Subtask created successfully", data=serialized)
+    except Exception as e:
+        logging.error(f"Error creating agent-backed subtask: {e}")
         return ResponseModel(success=False, message=f"Error creating subtask: {str(e)}", data=None)
 
 

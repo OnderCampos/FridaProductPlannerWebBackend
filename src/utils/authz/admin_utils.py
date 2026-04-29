@@ -4,6 +4,7 @@ from fastapi import HTTPException
 import requests
 import random
 import string
+from types import SimpleNamespace
 from firebase_admin import auth
 from datetime import datetime, timedelta
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
@@ -23,6 +24,35 @@ REGISTRATION_STATUS = {
 }
 # Make it immutable
 REGISTRATION_STATUS = dict(REGISTRATION_STATUS)  # Python equivalent of Object.freeze
+
+
+def get_firebase_user_by_email(email: str):
+    """
+    Returns the Firebase user record for the provided email, or None when it does not exist.
+    """
+    clean_email = str(email or "").strip().lower()
+    if not clean_email:
+        return None
+
+    try:
+        return auth.get_user_by_email(clean_email)
+    except auth.UserNotFoundError:
+        return None
+    except Exception as exc:
+        logging.error(f"Failed to get Firebase user by email {clean_email}: {exc}")
+        raise
+
+
+def _normalize_user_data_payload(user_data):
+    if isinstance(user_data, dict):
+        return SimpleNamespace(**user_data)
+    return user_data
+
+
+def _get_user_data_value(user_data, key: str, default=None):
+    if isinstance(user_data, dict):
+        return user_data.get(key, default)
+    return getattr(user_data, key, default)
 
 
 
@@ -74,15 +104,20 @@ async def create_firebase_user(user_data) -> ResponseModel:
         ResponseModel: Result of the user creation attempt.
     """
     try:
-        email = user_data.email
-        password = user_data.password
-        team_id = user_data.team_id
+        user_data = _normalize_user_data_payload(user_data)
+        email = _get_user_data_value(user_data, "email")
+        password = _get_user_data_value(user_data, "password")
+        team_id = _get_user_data_value(user_data, "team_id")
+        name = _get_user_data_value(user_data, "name")
+        role = _get_user_data_value(user_data, "role")
+        seniority = _get_user_data_value(user_data, "seniority")
         print("Hello", email)
-        user = auth.create_user(email=email, password=password)
+        user = auth.create_user(email=email, password=password, display_name=name)
 
         # Add a document to the 'user_team' collection
-        user_team_ref = FIRESTORE_CLIENT.collection("user_team").document()
-        user_team_ref.set({"user_id": user.uid, "team_id": team_id})
+        if team_id:
+            user_team_ref = FIRESTORE_CLIENT.collection("user_team").document()
+            user_team_ref.set({"user_id": user.uid, "team_id": team_id})
 
         # Add a document to the 'configuration' collection
         configuration_ref = FIRESTORE_CLIENT.collection("configuration").document()
@@ -107,24 +142,24 @@ async def create_firebase_user(user_data) -> ResponseModel:
         )
         user_info_ref.set(
             {
-                "name": user_data["name"] if "name" in user_data else "",
-                "role": user_data["role"] if "role" in user_data else "",
-                "seniority": user_data["seniority"] if "seniority" in user_data else "",
+                "name": name or "",
+                "role": role or "",
+                "seniority": seniority or "",
             }
         )
 
         upsert_user_profile(
             user_id=user.uid,
             email=email,
-            name=user_data["name"] if "name" in user_data else "",
-            role=user_data["role"] if "role" in user_data else None,
+            name=name or "",
+            role=role or None,
         )
 
         print(f"Created new user: {email}")
         return ResponseModel(
             success=True,
             message="User created successfully",
-            data={"email": email, "status": "success"},
+            data={"email": email, "status": "success", "user_id": user.uid},
         )
     except Exception as e:
         print(

@@ -247,6 +247,64 @@ def _normalize_number(value: Any, default: float = 0) -> float:
         return default
 
 
+_IMPLEMENTATION_DETAIL_PATTERNS = [
+    r"\bapi\b",
+    r"\bendpoints?\b",
+    r"\bhttp\b",
+    r"\bjson\b",
+    r"\bsql\b",
+    r"\bdatabase\b",
+    r"\bschema\b",
+    r"\btable\b",
+    r"\bquery\b",
+    r"\bbackend\b",
+    r"\bfrontend\b",
+    r"\breact\b",
+    r"\bangular\b",
+    r"\bvue\b",
+    r"\bpython\b",
+    r"\bfastapi\b",
+    r"\bflask\b",
+    r"\bdjango\b",
+    r"\bnode\.?js\b",
+    r"\btypescript\b",
+    r"\bjavascript\b",
+    r"\bclass(?:es)?\b",
+    r"\bmethod(?:s)?\b",
+    r"\bfunction(?:s)?\b",
+    r"\bimplement(?:ation|ed|ing)?\b",
+    r"\bcode\b",
+    r"\blibrary\b",
+    r"\bframework\b",
+]
+
+
+def _looks_like_implementation_detail(text: Any) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    lowered = value.lower()
+    for pattern in _IMPLEMENTATION_DETAIL_PATTERNS:
+        if re.search(pattern, lowered):
+            return True
+    return False
+
+
+def _sanitize_functional_story_text(text: Any) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    if _looks_like_implementation_detail(value):
+        return ""
+    return value
+
+
+def _sanitize_functional_bullets(value: Any) -> List[str]:
+    bullets = _normalize_bullets(value)
+    sanitized = [bullet for bullet in bullets if not _looks_like_implementation_detail(bullet)]
+    return sanitized
+
+
 def _extract_role_from_user_story(user_story: str) -> str:
     text = str(user_story or "").strip()
     if not text:
@@ -604,8 +662,8 @@ def _normalize_user_stories(raw_stories: Any, epic_names: List[str]) -> List[Dic
         else:
             epic_name = epic_lookup[epic_key]
 
-        user_story = str(item.get("user_story") or "").strip()
-        description = str(item.get("description") or "").strip()
+        user_story = _sanitize_functional_story_text(item.get("user_story"))
+        description = _sanitize_functional_story_text(item.get("description"))
         if not user_story:
             continue
 
@@ -618,13 +676,13 @@ def _normalize_user_stories(raw_stories: Any, epic_names: List[str]) -> List[Dic
             dependencies = []
         dependencies = [_slugify(str(dep).strip())[:40] for dep in dependencies if str(dep).strip()]
 
-        acceptance_criteria = _normalize_bullets(
+        acceptance_criteria = _sanitize_functional_bullets(
             item.get("acceptanceCriteria") or item.get("acceptance_criteria")
         )
         if not acceptance_criteria:
             acceptance_criteria = ["Not provided."]
 
-        out_of_scope = _normalize_bullets(item.get("outOfScope") or item.get("out_of_scope"))
+        out_of_scope = _sanitize_functional_bullets(item.get("outOfScope") or item.get("out_of_scope"))
         if not out_of_scope:
             out_of_scope = ["N/A"]
 
@@ -699,7 +757,7 @@ def _normalize_story_candidates(value: Any) -> List[Dict[str, Any]]:
     for index, item in enumerate(value, start=1):
         if not isinstance(item, dict):
             continue
-        user_story = str(item.get("user_story") or "").strip()
+        user_story = _sanitize_functional_story_text(item.get("user_story"))
         if not user_story:
             continue
 
@@ -723,11 +781,11 @@ def _normalize_story_candidates(value: Any) -> List[Dict[str, Any]]:
             {
                 "story_key": story_key,
                 "user_story": user_story,
-                "description": str(item.get("description") or "").strip(),
-                "acceptanceCriteria": _normalize_bullets(
+                "description": _sanitize_functional_story_text(item.get("description")),
+                "acceptanceCriteria": _sanitize_functional_bullets(
                     item.get("acceptanceCriteria") or item.get("acceptance_criteria")
                 ),
-                "outOfScope": _normalize_bullets(item.get("outOfScope") or item.get("out_of_scope")),
+                "outOfScope": _sanitize_functional_bullets(item.get("outOfScope") or item.get("out_of_scope")),
                 "dependencies": [_slugify(dep)[:40] for dep in _normalize_list(item.get("dependencies"))],
                 "effortHours": _normalize_number(item.get("effortHours"), default=0),
                 "roles": roles,

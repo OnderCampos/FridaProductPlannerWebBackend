@@ -144,9 +144,6 @@ VALID_ITEM_STATUSES = {
     "In Review",
     "Stopped",
     "Done",
-    "Testing",
-    "Rework",
-    "Blocked",
 }
 
 
@@ -162,11 +159,11 @@ def _normalize_item_status(status_value: Any) -> Optional[str]:
         "inprogress": "In Progress",
         "in review": "In Review",
         "inreview": "In Review",
+        "testing": "In Review",
         "stopped": "Stopped",
+        "blocked": "Stopped",
         "done": "Done",
-        "testing": "Testing",
-        "rework": "Rework",
-        "blocked": "Blocked",
+        "rework": "In Progress",
     }
     status = status_map.get(normalized)
     if status in VALID_ITEM_STATUSES:

@@ -354,6 +354,62 @@ class NotificationService:
         )
         return self.send_mail(message)
 
+    def send_account_created(
+        self,
+        *,
+        account_name: str,
+        account_email: str,
+        password: str,
+    ) -> dict | str | None:
+        """
+        Sends an email notifying a newly provisioned user that their account was created.
+        """
+        clean_account_name = account_name.strip() or account_email
+        login_url = f"{self.frontend_base_url}/login" if self.frontend_base_url else ""
+
+        subject = "Your Product Planner account was created"
+        body_lines = [
+            f"Hello {clean_account_name},",
+            "",
+            "A Product Planner account was created for you.",
+            f"Email: {account_email}",
+            f"Password: {password}",
+            "",
+            "Please sign in and change your password as soon as possible.",
+        ]
+        if login_url:
+            body_lines.extend(["", f"Sign in to Product Planner: {login_url}"])
+
+        html_parts = [
+            f"<p>Hello {escape(clean_account_name)},</p>",
+            "<p>A Product Planner account was created for you.</p>",
+            "<div style='background-color: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; border-left: 3px solid #16e0d0; margin-top: 16px;'>",
+            f"<p style='margin: 0 0 8px; color: #eaf2ff;'><strong>Email:</strong> {escape(account_email)}</p>",
+            f"<p style='margin: 0; color: #eaf2ff;'><strong>Password:</strong> {escape(password)}</p>",
+            "</div>",
+            "<p>Please sign in and change your password as soon as possible.</p>",
+        ]
+        if login_url:
+            html_parts.append(
+                "<div style='text-align: center; margin: 35px 0 20px;'>"
+                f"<a href=\"{escape(login_url)}\" style=\"display: inline-block; padding: 14px 28px; "
+                "background-color: #16e0d0; color: #051327; text-decoration: none; "
+                "border-radius: 6px; font-weight: 600; font-size: 14px;\">"
+                "Open Product Planner"
+                "</a></div>"
+            )
+
+        final_html = self.build_email_template("".join(html_parts))
+
+        message = NotificationMessage(
+            to=[account_email],
+            subject=subject,
+            body="\n".join(body_lines),
+            html_body=final_html,
+            is_html=True,
+        )
+        return self.send_mail(message)
+
     def try_send_project_invitation(self, **kwargs) -> bool:
         """
         Tries to send a project invitation notification, returning True if successful or False if an error occurs.
@@ -364,6 +420,17 @@ class NotificationService:
             return True
         except Exception:
             logger.exception("Failed to send project invitation notification")
+            return False
+
+    def try_send_account_created(self, **kwargs) -> bool:
+        """
+        Tries to send an account created notification, returning True if successful or False if an error occurs.
+        """
+        try:
+            self.send_account_created(**kwargs)
+            return True
+        except Exception:
+            logger.exception("Failed to send account created notification")
             return False
 
     def try_send_project_member_added(self, **kwargs) -> bool:

@@ -1,5 +1,6 @@
 from pydantic import BaseModel
 from typing import Optional, List
+from src.schemas.workflow_status import WorkflowStatus
 
 
 class GetProjectsRequest(BaseModel):
@@ -190,7 +191,7 @@ class EpicCreateRequest(BaseModel):
     technologies: Optional[List[str]] = None
     keywords: Optional[List[str]] = None
     priority: Optional[str] = None
-    status: Optional[str] = None
+    status: Optional[WorkflowStatus] = None
     storyPoints: Optional[float] = None
 
 
@@ -203,7 +204,7 @@ class EpicUpdateRequest(BaseModel):
     technologies: Optional[List[str]] = None
     keywords: Optional[List[str]] = None
     priority: Optional[str] = None
-    status: Optional[str] = None
+    status: Optional[WorkflowStatus] = None
     storyPoints: Optional[float] = None
 
 
@@ -211,4 +212,4 @@ class BacklogStatusUpdateRequest(BaseModel):
     """Request model for updating backlog item status"""
     item_type: str
     item_id: str
-    status: str
+    status: WorkflowStatus
