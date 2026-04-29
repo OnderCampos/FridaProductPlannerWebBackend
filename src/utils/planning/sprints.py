@@ -116,7 +116,7 @@ def _maybe_sprint_assignment_notification(
                 or "A FridaPlatform administrator"
             ).strip()
 
-        NotificationService().try_send_sprint_assignment(
+        sent = NotificationService().try_send_sprint_assignment(
             leader_email=leader_email, 
             leader_name=leader_name,               
             changer_name=actor_name,
@@ -126,6 +126,14 @@ def _maybe_sprint_assignment_notification(
             old_sprint_name=old_sprint_name,
             new_sprint_name=new_sprint_name
         )
+
+        if not sent:
+            return NotificationService()._notification_result(
+                False,
+                "failed",
+                "notification_provider_failed",
+                "Sprint assignment email failed."
+            )
 
         return NotificationService()._notification_result(
             True, 

@@ -48,7 +48,7 @@ from src.utils.planning.assignees import build_member_lookup
 from src.utils.planning.members import get_member_by_id
 from src.utils.planning.subtask_generation import (
     generate_subtasks_for_user_story,
-    create_subtask_for_user_story,
+    create_subtask_for_user_story_with_agent,
     get_subtasks_by_user_story,
     update_subtask_status,
     update_subtask_fields,
@@ -1040,7 +1040,7 @@ async def create_subtask_route(
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
         subtask_data = await request.json()
-        response = create_subtask_for_user_story(story_id, user_data.get_user_id(), subtask_data)
+        response = await create_subtask_for_user_story_with_agent(story_id, user_data, subtask_data)
 
         return JSONResponse(
             status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
@@ -1105,10 +1105,9 @@ async def update_subtask_status_route(
     Valid status values:
     - "To Do"
     - "In Progress"
-    - "Testing"
+    - "In Review"
+    - "Stopped"
     - "Done"
-    - "Rework"
-    - "Blocked"
     
     Request body:
     {

@@ -77,6 +77,7 @@ from src.utils.ai.project_creation_source_spec import generate_spec_from_source
 
 from src.utils.authz.permissions import get_project_access, get_global_user_role
 from src.utils.authz.project_memberships import normalize_membership_role
+from src.utils.authz.admin_utils import create_firebase_user, get_firebase_user_by_email
 from src.utils.planning.members import (
     get_project_members as get_team_members,
     create_team_member,
@@ -102,6 +103,7 @@ from src.utils.planning.invitations import (
 router = APIRouter()
 logger = logging.getLogger(__name__)
 notification_service = NotificationService()
+SOFTTEK_EMAIL_DOMAIN = "@softtek.com"
 
 
 def _derive_project_name(description: str) -> str:
@@ -151,6 +153,72 @@ def _requester_member_type(access_data: Optional[dict]) -> str:
     if (access_data or {}).get("is_owner"):
         return "leader"
     return normalize_membership_role((access_data or {}).get("member_type"))
+
+
+def _normalize_email(value: Optional[str]) -> str:
+    return str(value or "").strip().lower()
+
+
+def _is_softtek_email(email: Optional[str]) -> bool:
+    return _normalize_email(email).endswith(SOFTTEK_EMAIL_DOMAIN)
+
+
+def _derive_account_username(email: Optional[str]) -> str:
+    clean_email = _normalize_email(email)
+    local_part = clean_email.split("@", 1)[0] if clean_email else ""
+    return local_part or "user"
+
+
+async def _ensure_invited_account_if_needed(
+    *,
+    email: str,
+    name: str,
+    role: str,
+    seniority: str,
+    team_id: Optional[str],
+) -> dict:
+    clean_email = _normalize_email(email)
+    existing_user = get_firebase_user_by_email(clean_email)
+    if existing_user:
+        return {
+            "created": False,
+            "user_id": existing_user.uid,
+            "username": _derive_account_username(clean_email),
+            "password": None,
+        }
+
+    if not _is_softtek_email(clean_email):
+        return {
+            "created": False,
+            "user_id": None,
+            "username": _derive_account_username(clean_email),
+            "password": None,
+        }
+
+    account_username = _derive_account_username(clean_email)
+    creation_response = await create_firebase_user(
+        {
+            "email": clean_email,
+            "password": account_username,
+            "team_id": team_id,
+            "name": name,
+            "role": role,
+            "seniority": seniority,
+        }
+    )
+    if not creation_response.success:
+        raise HTTPException(status_code=500, detail="Failed to auto-create invited account")
+
+    created_user_id = None
+    if isinstance(creation_response.data, dict):
+        created_user_id = creation_response.data.get("user_id")
+
+    return {
+        "created": True,
+        "user_id": created_user_id,
+        "username": account_username,
+        "password": account_username,
+    }
 
 @router.get(
     "/{project_id}",
@@ -459,9 +527,23 @@ async def add_project_member_route(
             initials = "".join([part[0].upper() for part in parts[:2]])
             avatar = initials
 
+        account_provisioning = await _ensure_invited_account_if_needed(
+            email=req.email,
+            name=req.name,
+            role=req.role,
+            seniority=req.seniority,
+            team_id=user_data.get_team_id(),
+        )
+        if account_provisioning.get("created"):
+            notification_service.try_send_account_created(
+                account_name=req.name,
+                account_email=_normalize_email(req.email),
+                password=account_provisioning.get("password") or "",
+            )
+
         created_member = create_team_member(
             project_id=project_id,
-            user_id=None,
+            user_id=account_provisioning.get("user_id"),
             name=req.name,
             email=req.email,
             role=req.role,
@@ -1146,6 +1228,20 @@ async def invite_project_member_route(
         if member_type == "coleader" and not access.data.get("can_manage_member_types"):
             raise HTTPException(status_code=403, detail="Forbidden: Only the leader can assign coleaders")
 
+        account_provisioning = await _ensure_invited_account_if_needed(
+            email=email,
+            name=name,
+            role=role,
+            seniority=seniority,
+            team_id=user_data.get_team_id(),
+        )
+        if account_provisioning.get("created"):
+            notification_service.try_send_account_created(
+                account_name=name,
+                account_email=_normalize_email(email),
+                password=account_provisioning.get("password") or "",
+            )
+
         invitation = create_invitation(
             project_id=project_id,
             invited_by=user_data.user_id,
@@ -1168,6 +1264,12 @@ async def invite_project_member_route(
             seniority=seniority,
             expires_at=invitation.get("expiresDate") or invitation.get("expires_date"),
         )
+        invitation["accountCreated"] = bool(account_provisioning.get("created"))
+        if account_provisioning.get("created"):
+            invitation["generatedCredentials"] = {
+                "email": _normalize_email(email),
+                "password": account_provisioning.get("password"),
+            }
 
         return JSONResponse(
             status_code=201,
@@ -1306,6 +1408,17 @@ async def resend_project_invitation_route(
         updated_invitation, plain_token = resent
         payload = _normalize_invitation_payload(updated_invitation)
         payload["invitation_token"] = plain_token
+        project_name = str((access.data or {}).get("project", {}).get("name") or "").strip() or "your project"
+        inviter_name = user_data.get_user_name() or user_data.get_email() or "A FridaPlatform administrator"
+        notification_service.try_send_project_invitation(
+            invitee_name=str(payload.get("name") or "").strip() or str(payload.get("email") or "").strip(),
+            invitee_email=str(payload.get("email") or "").strip(),
+            project_name=project_name,
+            inviter_name=inviter_name,
+            role=str(payload.get("role") or "").strip(),
+            seniority=str(payload.get("seniority") or "").strip(),
+            expires_at=payload.get("expiresDate") or payload.get("expires_date"),
+        )
 
         return JSONResponse(
             status_code=200,

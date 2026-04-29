@@ -11,6 +11,7 @@ from src.utils.authz.permissions import get_project_access, get_project_id_for_e
 from src.utils.authz.users import get_user_profile
 from src.utils.planning.assignees import build_member_lookup, ensure_assignee_email
 from src.utils.firebase.identifier import get_next_US_identifier
+from src.schemas.workflow_status import WORKFLOW_STATUS_VALUES, normalize_workflow_status
 
 
 def _current_timestamp_iso() -> str:
@@ -329,7 +330,7 @@ def _maybe_send_user_story_assignment_notification(
                 or "A FridaPlatform administrator"
             ).strip()
 
-        NotificationService().try_send_user_story_assignment(
+        sent = NotificationService().try_send_user_story_assignment(
             assignee_name=assignee_name,
             assignee_email=updated_email,
             project_name=project_name,
@@ -338,6 +339,13 @@ def _maybe_send_user_story_assignment_notification(
             story_reference=story_reference,
             assigned_by_name=actor_name,
         )
+        if not sent:
+            return NotificationService()._notification_result(
+                False,
+                "failed",
+                "notification_provider_failed",
+                "Assignment email was not sent because the notification provider failed.",
+            )
         return NotificationService()._notification_result(
             True,
             "sent",
@@ -429,7 +437,7 @@ def _maybe_send_user_story_updated_notification(
                 or "A FridaPlatform administrator"
             ).strip()
 
-        NotificationService().try_send_user_story_updated(
+        sent = NotificationService().try_send_user_story_updated(
             leader_email=leader_email,
             leader_name=leader_name,
             changer_name=actor_name,
@@ -438,6 +446,14 @@ def _maybe_send_user_story_updated_notification(
             story_title=user_story_title,
             changes=changes
         )
+
+        if not sent:
+            return NotificationService()._notification_result(
+                False,
+                "failed",
+                "notification_provider_failed",
+                "Update email was not sent because the notification provider failed.",
+            )
 
         return NotificationService()._notification_result(
             True, 
@@ -959,23 +975,12 @@ def update_user_story_fields(
 
         incoming_status = filtered_update.get("status")
         if isinstance(incoming_status, str):
-            normalized_status = incoming_status.strip().lower().replace("_", " ")
-            status_map = {
-                "todo": "To Do",
-                "to do": "To Do",
-                "in progress": "In Progress",
-                "inprogress": "In Progress",
-                "in review": "In Review",
-                "inreview": "In Review",
-                "stopped": "Stopped",
-                "done": "Done",
-            }
-            canonical_status = status_map.get(normalized_status)
+            canonical_status = normalize_workflow_status(incoming_status)
             if canonical_status is None:
                 return ResponseModel(
                     success=False,
                     message="Invalid status value",
-                    data={"valid_statuses": ["To Do", "In Progress", "In Review", "Stopped", "Done"]},
+                    data={"valid_statuses": WORKFLOW_STATUS_VALUES},
                 )
             filtered_update["status"] = canonical_status
             incoming_status = canonical_status

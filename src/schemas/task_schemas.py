@@ -1,6 +1,7 @@
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
+from src.schemas.workflow_status import WorkflowStatus
 
 
 class CreateTaskRequest(BaseModel):
@@ -12,8 +13,12 @@ class CreateTaskRequest(BaseModel):
     assignee: Optional[str] = None
 
 
+class BatchCreateTasksRequest(BaseModel):
+    source_text: str = Field(..., min_length=1)
+
+
 class UpdateTaskStatusRequest(BaseModel):
-    status: str
+    status: WorkflowStatus
     completed_date: Optional[str] = None
 
 

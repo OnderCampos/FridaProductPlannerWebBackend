@@ -31,7 +31,7 @@ Rules:
 - Output JSON only, no markdown.
 - "epic" must match one of the provided epic names exactly.
 - "user_story" must follow the format: "As a [role], I need [capability], so that [value]."
-- "description" should add concrete details about the story.
+- "description" should add concrete functional details about the story.
 - "acceptanceCriteria" must be 3-6 short, testable bullet points.
 - "outOfScope" must be 1-4 bullet points (use ["N/A"] if truly none).
 - "user_story_id" should be a short, stable identifier (snake_case).
@@ -42,6 +42,8 @@ Rules:
 - Prefer 2-5 atomic user stories per epic when an epic contains multiple user actions, flows, screens, integrations, or business outcomes.
 - Do NOT collapse an entire epic into a single generic user story when the source document describes separable capabilities.
 - Only return a single user story for an epic if the document truly supports only one atomic story for that epic.
+- Keep all story content at the product/functionality level. Do not include code solutions, implementation steps, architecture, endpoints, database/schema details, libraries, frameworks, or developer instructions.
+- If the source document contains technical solution text, convert it into the user-visible or business-visible capability instead of repeating the implementation detail.
 - Do not include extra top-level keys or extra fields in stories.
 - Keep all human-readable values in {language}.
 """

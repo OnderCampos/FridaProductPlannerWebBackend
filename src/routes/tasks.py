@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 
 from src.schemas.response import ResponseModel
 from src.schemas.task_schemas import (
+    BatchCreateTasksRequest,
     CreateTaskRequest,
     UpdateTaskFieldsRequest,
     UpdateTaskStatusRequest,
@@ -13,6 +14,7 @@ from src.utils.authz.permissions import get_project_access
 from src.utils.planning.assignees import build_member_lookup
 from src.utils.planning.members import get_member_by_id
 from src.utils.planning.subtask_generation import (
+    batch_create_project_tasks_from_text,
     create_project_task,
     delete_subtasks_by_user_story,
     get_subtask_by_id,
@@ -120,6 +122,27 @@ async def create_task_route(
         project_id=project_id,
         user_data=user_data,
         task_data=req.model_dump(),
+    )
+    return JSONResponse(
+        status_code=_status_from_response(response, success_code=201),
+        content=response.dict(),
+    )
+
+
+@router.post(
+    "/{project_id}/tasks/batch",
+    response_description="Create multiple independent project tasks from freeform text",
+)
+async def batch_create_tasks_route(
+    req: BatchCreateTasksRequest,
+    project_id: str = Path(..., description="The project ID"),
+    user_data: UserData = Depends(get_current_user),
+):
+    _require_project_lead(project_id, user_data)
+    response = await batch_create_project_tasks_from_text(
+        project_id=project_id,
+        user_data=user_data,
+        source_text=req.source_text,
     )
     return JSONResponse(
         status_code=_status_from_response(response, success_code=201),

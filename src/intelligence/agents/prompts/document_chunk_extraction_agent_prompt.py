@@ -42,6 +42,8 @@ Rules:
 - Output JSON only, no markdown.
 - This is chunk-level reasoning only. Do not try to reconcile duplicates across the whole document.
 - A user story describes what a user needs and why they need it, not how to build it.
+- Do not include implementation guidance, coding instructions, architecture decisions, API design, database design, class names, frameworks, libraries, endpoints, queries, or technical solution proposals inside `user_story`, `description`, `acceptanceCriteria`, or `outOfScope`.
+- Rewrite implementation-heavy source text into functional behavior. Keep only what the product must do for the user or business.
 - Be creatively inferential but still grounded: when the chunk implies a meaningful user need, produce the user story even if the text states it indirectly.
 - The document does not need to state a user story explicitly in that exact format for it to be extractable.
 - You must detect and infer valid user stories from any relevant text in the chunk when the user need, action, and value are clearly supported.
@@ -56,6 +58,7 @@ Rules:
 - Think in this form: "As a [type of user], I want [goal or action], so that [benefit or value]."
 - Keep each user story simple, clear, and focused on user value.
 - `user_stories` must use the format: "As a [role], I need [capability], so that [value]."
+- `description` must describe scope, behavior, and business rules only. Do not mention how developers should implement it.
 - Every user story must contain an explicit user role/persona in both the `user_story` sentence and the `role` field.
 - The `role` field is required and must be a concrete actor such as "End User", "Administrator", "Manager", "Operator", "Support Agent", "Student", or "Instructor" when appropriate.
 - Do not leave the role empty, and do not use vague placeholders like "User" unless the source genuinely supports only that generic persona.

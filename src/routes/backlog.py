@@ -157,15 +157,24 @@ def _maybe_send_subtask_updated_notification(
         subtask_title = str(updated_subtask.get("title") or "").strip()
         display_title = f"[Subtask] {subtask_title} (De: {parent_story_title})"
 
-        NotificationService().try_send_subtask_updated(
+        sent = NotificationService().try_send_subtask_updated(
             leader_email=leader_email, 
             leader_name=leader_name,               
             changer_name=actor_name,
             project_name=project_name,
             epic_name=epic_name,
-            story_title=display_title,
+            parent_story_title=parent_story_title,
+            subtask_title=display_title,
             changes=changes
         )
+
+        if not sent:
+            return NotificationService()._notification_result(
+                False,
+                "failed",
+                "notification_provider_failed",
+                "Subtask notification failed."
+            )
 
         return NotificationService()._notification_result(True, "sent", "sent", f"Subtask update email sent to {leader_email}.")
     except Exception as e:
@@ -218,11 +227,17 @@ def _build_subtask_backlog_item(
         "story_id": story_id,
         "story_title": story_title,
         "title": subtask.get("title") or subtask.get("description") or "Untitled task",
+        "description": subtask.get("description") or "",
+        "tips_markdown": subtask.get("tips_markdown"),
         "status": subtask.get("status") or "To Do",
         "estimated_hours": subtask.get("estimated_hours"),
+        "complexity": subtask.get("complexity"),
         "type": subtask.get("task_type") or subtask.get("type") or subtask.get("complexity"),
+        "task_type": subtask.get("task_type"),
         "created_at": subtask.get("created_at") or subtask.get("createdDate") or subtask.get("created_date"),
+        "createdDate": subtask.get("createdDate") or subtask.get("created_at") or subtask.get("created_date"),
         "assignee": subtask.get("assignee_email") or subtask.get("assignee"),
+        "sprint_id": subtask.get("sprint_id"),
         "project_id": project_id,
         "project_name": project_name,
         "project_key": project_key,
@@ -242,6 +257,18 @@ def _get_epic_doc_map(epic_ids: set[str]) -> dict[str, dict]:
         epic_data["id"] = epic_doc.id
         epic_map[epic_doc.id] = epic_data
     return epic_map
+
+
+def _unique_docs_by_id(docs) -> list:
+    unique_docs = []
+    seen_ids: set[str] = set()
+    for doc in docs or []:
+        doc_id = getattr(doc, "id", None)
+        if not doc_id or doc_id in seen_ids:
+            continue
+        seen_ids.add(doc_id)
+        unique_docs.append(doc)
+    return unique_docs
 
 
 @router.get(
@@ -271,6 +298,8 @@ async def get_backlog_route(
         backlog_epics = []
         backlog_stories = []
         backlog_subtasks = []
+        seen_story_ids: set[str] = set()
+        seen_subtask_ids: set[str] = set()
         project_scopes = {}
 
         for project in projects_response.data or []:
@@ -325,6 +354,7 @@ async def get_backlog_route(
                 legacy_story_docs = FIRESTORE_CLIENT.collection("user_stories").where("assigneeEmail", "==", filter_email).get()
                 if legacy_story_docs:
                     story_docs.extend(legacy_story_docs)
+                story_docs = _unique_docs_by_id(story_docs)
                 candidate_stories = []
                 unresolved_epic_ids = set()
 
@@ -350,10 +380,11 @@ async def get_backlog_route(
                     ensure_assignee_email(story, scope["member_lookup"])
                     if not assignee_matches(story, scope["filter_email"], scope["member_lookup"]):
                         continue
-                    if story.get("id") in queried_story_ids:
+                    if story.get("id") in queried_story_ids or story.get("id") in seen_story_ids:
                         continue
 
                     queried_story_ids.add(story.get("id"))
+                    seen_story_ids.add(story.get("id"))
                     stories_by_id[story.get("id")] = story
                     backlog_stories.append(
                         _build_story_backlog_item(
@@ -378,6 +409,7 @@ async def get_backlog_route(
                     .get()
                 if legacy_subtask_docs:
                     subtask_docs.extend(legacy_subtask_docs)
+                subtask_docs = _unique_docs_by_id(subtask_docs)
 
                 missing_story_ids = set()
 
@@ -402,6 +434,8 @@ async def get_backlog_route(
                 for doc in subtask_docs or []:
                     subtask = doc.to_dict() or {}
                     subtask["id"] = doc.id
+                    if subtask.get("id") in seen_subtask_ids:
+                        continue
                     ensure_assignee_email(subtask, scope["member_lookup"])
                     if not assignee_matches(subtask, scope["filter_email"], scope["member_lookup"]):
                         continue
@@ -436,6 +470,7 @@ async def get_backlog_route(
                             story_title=story_title,
                         )
                     )
+                    seen_subtask_ids.add(subtask.get("id"))
 
         for project_id, scope in project_scopes.items():
             if scope.get("filter_email"):
@@ -454,6 +489,9 @@ async def get_backlog_route(
                 stories = stories_response.data or []
                 for story in stories:
                     ensure_assignee_email(story, member_lookup)
+                    if story.get("id") in seen_story_ids:
+                        continue
+                    seen_story_ids.add(story.get("id"))
                     backlog_stories.append(
                         _build_story_backlog_item(
                             story,
@@ -477,6 +515,8 @@ async def get_backlog_route(
                         continue
                     for subtask in subtasks_response.data or []:
                         ensure_assignee_email(subtask, member_lookup)
+                        if subtask.get("id") in seen_subtask_ids:
+                            continue
                         fields = story.get("fields") or []
                         story_title = story.get("title") or _extract_field_value(fields, "title") or story.get("user_story") or story.get("user_story_id")
                         backlog_subtasks.append(
@@ -490,6 +530,7 @@ async def get_backlog_route(
                                 story_title=story_title,
                             )
                         )
+                        seen_subtask_ids.add(subtask.get("id"))
 
             standalone_subtasks_docs = FIRESTORE_CLIENT.collection("subtasks").where(
                 "project_id", "==", project_id
@@ -500,6 +541,8 @@ async def get_backlog_route(
                     continue
 
                 subtask["id"] = doc.id
+                if subtask.get("id") in seen_subtask_ids:
+                    continue
                 ensure_assignee_email(subtask, member_lookup)
                 backlog_subtasks.append(
                     _build_subtask_backlog_item(
@@ -509,6 +552,7 @@ async def get_backlog_route(
                         project_key=project_key,
                     )
                 )
+                seen_subtask_ids.add(subtask.get("id"))
 
         response = ResponseModel(
             success=True,
@@ -610,8 +654,9 @@ async def update_backlog_item_status(
             if epic_doc.exists:
                 project_id = epic_doc.to_dict().get("project_id")
     else:
+        project_id = item_data.get("project_id")
         story_id = item_data.get("user_story_id")
-        if story_id:
+        if not project_id and story_id:
             story_doc = FIRESTORE_CLIENT.collection("user_stories").document(story_id).get()
             if story_doc.exists:
                 epic_id = story_doc.to_dict().get("epic_id")

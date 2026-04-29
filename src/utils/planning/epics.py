@@ -4,6 +4,7 @@ import logging
 
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.schemas.response import ResponseModel
+from src.schemas.workflow_status import WORKFLOW_STATUS_VALUES, coerce_workflow_status, normalize_workflow_status
 from src.utils.authz.permissions import get_project_access
 from src.utils.firebase.identifier import get_next_EPIC_identifier
 
@@ -178,7 +179,7 @@ def create_epic(project_id: str, user_id: str, epic_data: Dict[str, Any]) -> Res
             "technologies": epic_data.get("technologies"),
             "keywords": epic_data.get("keywords"),
             "priority": epic_data.get("priority"),
-            "status": epic_data.get("status", "To Do"),
+            "status": coerce_workflow_status(epic_data.get("status"), default="To Do"),
             "story_points": epic_data.get("storyPoints", 0),
             "created_at": now,
             "updated_at": now,
@@ -245,6 +246,15 @@ def update_epic(epic_id: str, user_id: str, epic_update_data: Dict[str, Any]) ->
             update_data["description"] = epic_update_data.get("description")
         if "labels" in epic_update_data:
             update_data["labels"] = epic_update_data.get("labels")
+        if "status" in epic_update_data:
+            canonical_status = normalize_workflow_status(epic_update_data.get("status"))
+            if canonical_status is None:
+                return ResponseModel(
+                    success=False,
+                    message="Invalid status value",
+                    data={"valid_statuses": WORKFLOW_STATUS_VALUES},
+                )
+            update_data["status"] = canonical_status
         if "roles" in epic_update_data:
             update_data["roles"] = epic_update_data.get("roles")
         if "technologies" in epic_update_data:
@@ -304,8 +314,16 @@ def update_epic_status(epic_id: str, user_id: str, status: str) -> ResponseModel
                 data=None
             )
 
+        canonical_status = normalize_workflow_status(status)
+        if canonical_status is None:
+            return ResponseModel(
+                success=False,
+                message="Invalid status value",
+                data={"valid_statuses": WORKFLOW_STATUS_VALUES},
+            )
+
         update_data = {
-            "status": status,
+            "status": canonical_status,
             "updated_at": _current_timestamp_iso(),
         }
         epic_ref.update(update_data)
