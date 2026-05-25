@@ -2,6 +2,27 @@ from typing import Any, Dict, Optional
 
 from src.utils.planning.members import get_project_members
 
+FRIDA_ASSIGNEE_ID = "frida-agent"
+FRIDA_ASSIGNEE_NAME = "Frida"
+
+
+def is_frida_assignee_id(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() == FRIDA_ASSIGNEE_ID
+
+
+def is_frida_assignee_name(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() == FRIDA_ASSIGNEE_NAME.lower()
+
+
+def build_frida_assignee_update() -> Dict[str, Any]:
+    return {
+        "assignee": FRIDA_ASSIGNEE_NAME,
+        "assigneeId": FRIDA_ASSIGNEE_ID,
+        "assigned_to": FRIDA_ASSIGNEE_ID,
+        "assigneeEmail": None,
+        "assignee_email": None,
+    }
+
 
 def build_member_lookup_from_members(
     members: Optional[list],
@@ -72,6 +93,8 @@ def get_assignee_email(
         or ""
     ).strip()
     if not assignee_id:
+        return None
+    if is_frida_assignee_id(assignee_id):
         return None
 
     member = member_lookup.get("by_id", {}).get(assignee_id) or {}

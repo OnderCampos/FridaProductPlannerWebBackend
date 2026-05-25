@@ -53,6 +53,30 @@ class CreateProjectFromFigmaRequest(BaseModel):
     figma_notes: Optional[str] = None
 
 
+class CodegenJobStatusItemRequest(BaseModel):
+    jobId: str
+    jobType: str
+    status: str
+
+
+class CodegenJobRequest(BaseModel):
+    jobId: str
+    jobType: str
+    status: str
+    storagePath: Optional[str] = None
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    downloadReady: Optional[bool] = None
+    jobs: Optional[List[CodegenJobStatusItemRequest]] = None
+
+
+class GitHubConfigRequest(BaseModel):
+    repository_url: Optional[str] = None
+    branch: Optional[str] = None
+    api_token: Optional[str] = None
+    clear_api_token: Optional[bool] = None
+
+
 class UpdateProjectRequest(BaseModel):
     """Request model for updating a project"""
     #project_id: str
@@ -60,6 +84,8 @@ class UpdateProjectRequest(BaseModel):
     description: Optional[str] = None
     project_key: Optional[str] = None
     tech_stack: Optional[List[str]] = None
+    codegen_job: Optional[CodegenJobRequest] = None
+    github_config: Optional[GitHubConfigRequest] = None
 
 
 class DeleteProjectRequest(BaseModel):

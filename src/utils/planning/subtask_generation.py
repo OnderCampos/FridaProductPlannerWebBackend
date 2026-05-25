@@ -12,6 +12,7 @@ from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.services.setup.variables_setup import LLMOPS_API_KEY
 from src.utils.authz.permissions import get_project_access
 from src.utils.core.general import get_code_block
+from src.utils.integrations.github import get_github_file_content, list_github_repository_files
 from src.utils.planning.epics import get_epic_by_id, get_epics_for_project
 from src.utils.planning.user_stories import get_user_stories_by_epic, get_user_story_by_id
 from src.utils.firebase.identifier import get_next_TK_identifier
@@ -32,6 +33,48 @@ LEGACY_TASK_TYPE_MAP = {
     "bug": "Bug",
     "refactor": "Refactor",
     "research": "Research",
+}
+
+REPO_CONTEXT_MAX_FILES = 6
+REPO_CONTEXT_MAX_FILE_CHARS = 1800
+REPO_CONTEXT_MAX_TOTAL_CHARS = 9000
+REPO_CONTEXT_MAX_LISTED_PATHS = 30
+REPO_CONTEXT_PRIORITY_FILENAMES = {
+    "readme.md": 100,
+    "package.json": 60,
+    "pyproject.toml": 55,
+    "requirements.txt": 55,
+    "dockerfile": 50,
+    "compose.yaml": 45,
+    "docker-compose.yml": 45,
+    "docker-compose.yaml": 45,
+    "tsconfig.json": 35,
+    "vite.config.ts": 35,
+    "vite.config.js": 35,
+}
+REPO_CONTEXT_TEXT_EXTENSIONS = {
+    ".ts", ".tsx", ".js", ".jsx", ".py", ".java", ".kt", ".cs", ".go", ".rb", ".php", ".rs",
+    ".swift", ".m", ".mm", ".scala", ".sh", ".ps1", ".sql", ".json", ".yaml", ".yml", ".toml",
+    ".ini", ".env", ".md", ".txt", ".html", ".css", ".scss", ".sass", ".less", ".xml", ".gradle",
+}
+REPO_CONTEXT_SKIP_PATH_PARTS = {
+    "node_modules",
+    "dist",
+    "build",
+    "coverage",
+    "__pycache__",
+    ".next",
+    ".nuxt",
+    ".git",
+    "vendor",
+    "bin",
+    "obj",
+}
+REPO_CONTEXT_STOP_WORDS = {
+    "the", "and", "for", "with", "from", "into", "that", "this", "when", "where", "what", "show",
+    "task", "tasks", "plan", "make", "does", "must", "most", "need", "create", "creating", "repo",
+    "repository", "github", "agent", "development", "fix", "bug", "bugs", "refactor", "research",
+    "title", "description", "your", "their", "have", "has", "had", "will", "would", "should",
 }
 
 TASK_ESTIMATION_PROMPT = """
@@ -59,34 +102,33 @@ Rules:
 """.strip()
 
 TASK_TIPS_PROMPT = """
-You are a senior software engineer creating conceptual guidance for a single software task.
-
-You do NOT have access to the project's source code, repository, runtime, logs, or database.
-Your guidance must stay high-level and discovery-oriented.
+You are a senior software engineer creating a practical development plan for a single software task.
 
 Project tech stack: {tech_stack}
 Task type: {task_type}
 Title: {title}
 Description: {description}
+Repository context:
+{repository_context}
 
 Write Markdown only.
 
 Required structure:
 ## Problem Summary
-## Where to Start
-## What to Research
-## Conceptual Approaches
+## Relevant Repository Files
+## Development Plan
+## Validation Steps
 ## Risks and Edge Cases
 
 Rules:
-- Be practical, but stay conceptual.
-- Focus on how an engineer should frame the problem before coding.
-- Suggest first steps, useful questions, and topics to investigate.
-- If mentioning the tech stack, keep it at the level of areas to inspect or documentation to review.
-- Do not claim knowledge of specific files, functions, components, endpoints, schemas, or current code behavior unless explicitly stated in the task title or description.
-- Do not provide code, pseudocode, exact implementation steps, or instructions that assume direct codebase access.
+- If repository context includes files, explicitly mention the most relevant repository-relative paths in `Relevant Repository Files`.
+- Mention only files that appear in the repository context.
+- `Development Plan` must be a short numbered list with concrete investigation and implementation steps.
+- `Validation Steps` must describe how to verify the task after changes.
+- If repository context is unavailable, say that clearly in `Relevant Repository Files` and fall back to a high-level plan.
+- Do not invent files, functions, endpoints, or components that are not present in the repository context.
+- Do not provide code fences.
 - Use bullets where appropriate.
-- Do not wrap the response in code fences.
 """.strip()
 
 PROJECT_TASK_BATCH_PROMPT = """
@@ -124,6 +166,13 @@ def _current_timestamp_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _get_project_data(project_id: str) -> Dict[str, Any]:
+    project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
+    if not project_doc.exists:
+        return {}
+    return project_doc.to_dict() or {}
+
+
 def _normalize_task_type(value: Any, default: str = "Implementation") -> str:
     normalized = str(value or "").strip()
     if not normalized:
@@ -135,11 +184,7 @@ def _normalize_task_type(value: Any, default: str = "Implementation") -> str:
 
 def _get_project_tech_stack(project_id: str) -> List[str]:
     try:
-        project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
-        if not project_doc.exists:
-            return []
-
-        project_data = project_doc.to_dict() or {}
+        project_data = _get_project_data(project_id)
         tech_stack = project_data.get("technical_stack") or project_data.get("techStack") or []
         if not isinstance(tech_stack, list):
             return []
@@ -148,6 +193,291 @@ def _get_project_tech_stack(project_id: str) -> List[str]:
     except Exception as exc:
         logging.warning(f"Failed to load project tech stack for task tips in project {project_id}: {exc}")
         return []
+
+
+def _extract_task_keywords(*values: Any) -> List[str]:
+    keywords = []
+    seen = set()
+    combined = " ".join(str(value or "") for value in values)
+    for token in re.findall(r"[A-Za-z0-9_\-/]{3,}", combined.lower()):
+        normalized = token.strip("_-/")
+        if not normalized or normalized in REPO_CONTEXT_STOP_WORDS:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        keywords.append(normalized)
+    return keywords[:20]
+
+
+def _is_text_repository_file(path: str) -> bool:
+    normalized_path = str(path or "").strip().lower()
+    if not normalized_path:
+        return False
+
+    path_parts = [part for part in normalized_path.split("/") if part]
+    if any(part in REPO_CONTEXT_SKIP_PATH_PARTS for part in path_parts):
+        return False
+
+    file_name = path_parts[-1] if path_parts else normalized_path
+    if file_name in REPO_CONTEXT_PRIORITY_FILENAMES:
+        return True
+
+    extension_match = re.search(r"(\.[a-z0-9]+)$", file_name)
+    extension = extension_match.group(1) if extension_match else ""
+    return extension in REPO_CONTEXT_TEXT_EXTENSIONS
+
+
+def _score_repository_file(path: str, keywords: List[str], task_type: str) -> int:
+    normalized_path = str(path or "").strip().lower()
+    if not normalized_path:
+        return 0
+
+    path_parts = [part for part in normalized_path.split("/") if part]
+    file_name = path_parts[-1] if path_parts else normalized_path
+    score = REPO_CONTEXT_PRIORITY_FILENAMES.get(file_name, 0)
+
+    if normalized_path.startswith("src/") or "/src/" in normalized_path:
+        score += 10
+    if any(segment in normalized_path for segment in ("/api/", "/routes/", "/services/", "/components/", "/pages/", "/features/", "/utils/")):
+        score += 8
+    if any(segment in normalized_path for segment in ("/test", "/tests/", ".spec.", ".test.")):
+        score += 6
+    if task_type == "Bug" and any(segment in normalized_path for segment in ("/test", "/tests/", ".spec.", ".test.", "/logs/")):
+        score += 8
+    if task_type == "Research" and file_name in {"readme.md", "package.json", "requirements.txt", "pyproject.toml"}:
+        score += 10
+
+    for keyword in keywords:
+        keyword_parts = [part for part in re.split(r"[_\-/]", keyword) if part]
+        if normalized_path.find(keyword) >= 0:
+            score += 18
+        for keyword_part in keyword_parts:
+            if len(keyword_part) < 3:
+                continue
+            if keyword_part == file_name.replace(".", ""):
+                score += 10
+            elif f"/{keyword_part}" in normalized_path or f"{keyword_part}/" in normalized_path:
+                score += 7
+            elif keyword_part in normalized_path:
+                score += 4
+
+    return score
+
+
+def _extract_content_excerpt(content: str, keywords: List[str], max_chars: int = REPO_CONTEXT_MAX_FILE_CHARS) -> str:
+    normalized_content = str(content or "").replace("\r\n", "\n").strip()
+    if not normalized_content:
+        return ""
+
+    lowered = normalized_content.lower()
+    match_index = -1
+    for keyword in keywords:
+        candidate_index = lowered.find(keyword.lower())
+        if candidate_index >= 0:
+            match_index = candidate_index
+            break
+
+    if match_index < 0:
+        return normalized_content[:max_chars].strip()
+
+    start = max(0, match_index - max_chars // 3)
+    end = min(len(normalized_content), start + max_chars)
+    excerpt = normalized_content[start:end].strip()
+    if start > 0:
+        excerpt = "...\n" + excerpt
+    if end < len(normalized_content):
+        excerpt = excerpt + "\n..."
+    return excerpt
+
+
+def _build_repository_context_markdown(repository_context: Dict[str, Any]) -> str:
+    if not repository_context.get("available"):
+        return str(repository_context.get("message") or "No repository context available.")
+
+    lines = [
+        f"Repository: {repository_context.get('repository') or 'Unknown repository'}",
+        f"Branch: {repository_context.get('branch') or 'Unknown branch'}",
+        "Top repository paths:",
+    ]
+
+    for path in repository_context.get("top_paths") or []:
+        lines.append(f"- {path}")
+
+    selected_files = repository_context.get("selected_files") or []
+    if selected_files:
+        lines.append("Loaded file excerpts:")
+        for item in selected_files:
+            lines.append(f"File: {item.get('path')}")
+            lines.append(item.get("excerpt") or "(No readable excerpt available)")
+
+    return "\n".join(lines).strip()
+
+
+def _build_task_tips_fallback(
+    title: str,
+    description: str,
+    task_type: str,
+    tech_stack_text: str,
+    repository_context: Dict[str, Any],
+) -> str:
+    fallback_title = title.strip() or "Untitled task"
+    fallback_description = description.strip() or "No additional description provided."
+    selected_files = repository_context.get("selected_files") or []
+    top_paths = repository_context.get("top_paths") or []
+
+    if selected_files:
+        relevant_files_lines = [
+            f"- `{item.get('path')}`" for item in selected_files if str(item.get("path") or "").strip()
+        ]
+        development_plan_lines = [
+            "- Review the listed files first and confirm which one owns the behavior described in the task.",
+            "- Trace the smallest change needed in those files and any directly related callers or consumers.",
+            f"- Implement the {task_type.lower()} change with the project tech stack in mind: {tech_stack_text}.",
+        ]
+        validation_lines = [
+            "- Verify the affected flow end-to-end in the product surface tied to those files.",
+            "- Confirm adjacent states such as empty, loading, invalid input, and failure handling.",
+            "- Run the most relevant automated checks available for the touched area.",
+        ]
+    elif top_paths:
+        relevant_files_lines = [f"- `{path}`" for path in top_paths[: min(6, len(top_paths))]]
+        development_plan_lines = [
+            "- Start with the listed repository paths and confirm which one owns the behavior described in the task.",
+            "- Load the matching implementation files and any adjacent contracts or UI/API consumers before editing.",
+            f"- Implement the {task_type.lower()} change with the project tech stack in mind: {tech_stack_text}.",
+        ]
+        validation_lines = [
+            "- Verify the affected flow against the files identified above.",
+            "- Check any connected entry points, shared contracts, or rendering states near those files.",
+            "- Run the most relevant automated checks available for the touched area.",
+        ]
+    else:
+        relevant_files_lines = [
+            f"- {repository_context.get('message') or 'Repository files were not available for this task plan.'}",
+        ]
+        development_plan_lines = [
+            "- Clarify the expected outcome, who uses it, and what success looks like.",
+            "- Identify the product area most affected by the task before changing code.",
+            f"- Use the task type ({task_type}) and tech stack ({tech_stack_text}) to narrow the first implementation target.",
+        ]
+        validation_lines = [
+            "- Validate the primary happy path for the task.",
+            "- Check failure handling, invalid input, and regression risk in nearby flows.",
+        ]
+
+    return (
+        "## Problem Summary\n"
+        f"- {fallback_title}\n"
+        f"- {fallback_description}\n\n"
+        "## Relevant Repository Files\n"
+        + "\n".join(relevant_files_lines)
+        + "\n\n## Development Plan\n"
+        + "\n".join(f"{index}. {line[2:]}" for index, line in enumerate(development_plan_lines, start=1))
+        + "\n\n## Validation Steps\n"
+        + "\n".join(validation_lines)
+        + "\n\n## Risks and Edge Cases\n"
+        "- Hidden dependencies may exist outside the first matching files.\n"
+        "- Requirements may affect shared contracts, permissions, or data shape.\n"
+        "- Regression risk is higher when the task touches common entry points or shared UI.\n"
+    )
+
+
+def _load_repository_context_for_task(
+    project_id: str,
+    title: str,
+    description: str,
+    task_type: str,
+) -> Dict[str, Any]:
+    try:
+        project_data = _get_project_data(project_id)
+        github_config = project_data.get("github_config") or {}
+        repository_url = str(github_config.get("repository_url") or "").strip()
+        api_token = github_config.get("api_token")
+        branch = github_config.get("branch")
+
+        if not repository_url or not str(api_token or "").strip():
+            return {
+                "available": False,
+                "message": "GitHub repository context is not configured for this project.",
+            }
+
+        listing = list_github_repository_files(repository_url, api_token, branch)
+        all_files = listing.get("files") or []
+        if not isinstance(all_files, list) or not all_files:
+            return {
+                "available": False,
+                "message": "The configured GitHub repository did not return any files.",
+            }
+
+        keywords = _extract_task_keywords(title, description, task_type)
+        ranked_files = []
+        for item in all_files:
+            path = str((item or {}).get("path") or "").strip()
+            if not _is_text_repository_file(path):
+                continue
+            score = _score_repository_file(path, keywords, task_type)
+            ranked_files.append(
+                {
+                    "path": path,
+                    "score": score,
+                }
+            )
+
+        ranked_files.sort(key=lambda item: (-int(item.get("score") or 0), item.get("path") or ""))
+        top_paths = [
+            item.get("path")
+            for item in ranked_files[:REPO_CONTEXT_MAX_LISTED_PATHS]
+            if str(item.get("path") or "").strip()
+        ]
+
+        selected_files = []
+        total_chars = 0
+        for item in ranked_files:
+            if len(selected_files) >= REPO_CONTEXT_MAX_FILES or total_chars >= REPO_CONTEXT_MAX_TOTAL_CHARS:
+                break
+
+            path = str(item.get("path") or "").strip()
+            if not path:
+                continue
+
+            try:
+                file_payload = get_github_file_content(repository_url, api_token, path, branch)
+                excerpt = _extract_content_excerpt(file_payload.get("content") or "", keywords)
+                if not excerpt:
+                    continue
+                total_chars += len(excerpt)
+                selected_files.append(
+                    {
+                        "path": path,
+                        "excerpt": excerpt,
+                    }
+                )
+            except Exception as exc:
+                logging.warning(f"Skipping GitHub file '{path}' while building task context: {exc}")
+
+        if not selected_files and top_paths:
+            return {
+                "available": True,
+                "repository": listing.get("repository"),
+                "branch": listing.get("branch"),
+                "top_paths": top_paths,
+                "selected_files": [],
+            }
+
+        return {
+            "available": True,
+            "repository": listing.get("repository"),
+            "branch": listing.get("branch"),
+            "top_paths": top_paths,
+            "selected_files": selected_files,
+        }
+    except Exception as exc:
+        logging.warning(f"Failed to load GitHub repository context for task planning in project {project_id}: {exc}")
+        return {
+            "available": False,
+            "message": "GitHub repository context could not be loaded for this task.",
+        }
 
 
 def _serialize_subtask(subtask_data: Dict[str, Any], subtask_id: Optional[str] = None) -> Dict[str, Any]:
@@ -235,6 +565,7 @@ async def _estimate_project_task_fields(
 
 
 async def _generate_project_task_tips(
+    project_id: str,
     user_data: UserData,
     title: str,
     description: str,
@@ -245,26 +576,19 @@ async def _generate_project_task_tips(
     fallback_description = description.strip() or "No additional description provided."
     tech_stack_values = [str(item).strip() for item in (tech_stack or []) if str(item).strip()]
     tech_stack_text = ", ".join(tech_stack_values) if tech_stack_values else "Not specified"
-    fallback = (
-        "## Problem Summary\n"
-        f"- {fallback_title}\n\n"
-        "## Where to Start\n"
-        "- Clarify the expected outcome, who uses it, and what success looks like.\n"
-        "- Identify the product area, workflow, or user journey most affected by this task.\n"
-        f"- Use the task type ({task_type}) and the project tech stack ({tech_stack_text}) to decide which area to inspect first.\n\n"
-        "## What to Research\n"
-        "- Existing product behavior and current limitations related to this task.\n"
-        "- Relevant framework, library, or platform documentation tied to the affected area.\n"
-        "- Similar patterns already used elsewhere in the product, if any.\n"
-        "- Constraints around validation, permissions, loading states, failures, and empty states.\n\n"
-        "## Conceptual Approaches\n"
-        "- Break the work into a small discovery phase and a small delivery phase.\n"
-        "- Prefer the smallest change that resolves the user problem without expanding scope.\n"
-        f"- Use this description as context while validating assumptions: {fallback_description}\n\n"
-        "## Risks and Edge Cases\n"
-        "- Ambiguous scope can lead to rework.\n"
-        "- Hidden dependencies may exist in adjacent flows or shared data.\n"
-        "- Permissions, invalid inputs, empty states, and failure handling should be verified early.\n"
+    repository_context = _load_repository_context_for_task(
+        project_id=project_id,
+        title=fallback_title,
+        description=fallback_description,
+        task_type=task_type,
+    )
+    repository_context_text = _build_repository_context_markdown(repository_context)
+    fallback = _build_task_tips_fallback(
+        title=fallback_title,
+        description=fallback_description,
+        task_type=task_type,
+        tech_stack_text=tech_stack_text,
+        repository_context=repository_context,
     )
 
     try:
@@ -275,6 +599,7 @@ async def _generate_project_task_tips(
                 task_type=task_type,
                 title=fallback_title,
                 description=fallback_description,
+                repository_context=repository_context_text,
             )
         )
         normalized = str(raw or "").strip()
@@ -362,6 +687,7 @@ async def _build_project_task_document(
         task_type=normalized_task_type,
     )
     tips_markdown = await _generate_project_task_tips(
+        project_id=project_id,
         user_data=user_data,
         title=title,
         description=description,
@@ -1064,6 +1390,7 @@ async def create_subtask_for_user_story_with_agent(
             task_type=task_type,
         )
         tips_markdown = await _generate_project_task_tips(
+            project_id=project_id,
             user_data=user_data,
             title=title,
             description=description,

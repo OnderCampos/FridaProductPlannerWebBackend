@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File, Form, Query
 from fastapi.responses import JSONResponse
-from typing import Optional
+from typing import Dict, List, Optional
 import logging
 import re
 import secrets
@@ -72,7 +72,9 @@ from src.services.workflows.project_import.project_import_from_jira.initializati
     list_jira_projects,
 )
 from src.services.notifications import NotificationService
+from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.utils.ai.project_creation_source_spec import generate_spec_from_source
+from src.utils.integrations.github import get_github_file_content, list_github_repository_files
 
 
 from src.utils.authz.permissions import get_project_access, get_global_user_role
@@ -89,7 +91,6 @@ from src.utils.planning.members import (
     format_team_member_response
 )
 from src.utils.planning.epics import get_epics_for_project_with_auth, get_epics_for_project
-from src.utils.planning.user_stories import get_user_stories_by_epic
 from src.utils.planning.invitations import (
     create_invitation,
     get_project_invitations,
@@ -135,6 +136,28 @@ def _derive_project_key_base(name: str, description: str) -> str:
 def _random_project_key_suffix(length: int = 3) -> str:
     alphabet = string.ascii_uppercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(max(1, length)))
+
+
+def _chunk_values(values: List[str], chunk_size: int = 30) -> List[List[str]]:
+    normalized = [str(value).strip() for value in values if str(value).strip()]
+    return [normalized[index:index + chunk_size] for index in range(0, len(normalized), chunk_size)]
+
+
+def _get_story_sprint_assignment_map(story_ids: List[str]) -> Dict[str, Optional[str]]:
+    sprint_map: Dict[str, Optional[str]] = {}
+    for chunk in _chunk_values(story_ids):
+        assignments = (
+            FIRESTORE_CLIENT.collection("sprint_items")
+            .where("item_type", "==", "story")
+            .where("item_id", "in", chunk)
+            .get()
+        )
+        for assignment in assignments:
+            assignment_data = assignment.to_dict() or {}
+            item_id = str(assignment_data.get("item_id") or "").strip()
+            if item_id and item_id not in sprint_map:
+                sprint_map[item_id] = assignment_data.get("sprint_id")
+    return sprint_map
 
 
 def _normalize_invitation_payload(invitation: dict) -> dict:
@@ -382,16 +405,104 @@ async def update_project_route(
             name=req.name if req else None,
             description=req.description if req else None,
             project_key=req.project_key if req else None,
-            tech_stack=req.tech_stack if req else None
+            tech_stack=req.tech_stack if req else None,
+            codegen_job=req.codegen_job.model_dump(exclude_none=True) if req and req.codegen_job else None,
+            github_config=req.github_config.model_dump(exclude_none=True) if req and req.github_config else None,
         )
+        message = (response.message or "").lower()
+        status_code = 200
+        if not response.success:
+            if "not found" in message:
+                status_code = 404
+            elif "unauthorized" in message or "forbidden" in message:
+                status_code = 403
+            else:
+                status_code = 400
         return JSONResponse(
-            status_code=200 if response.success else 404,
+            status_code=status_code,
             content=response.dict(),
         )
     except HTTPException:
         raise
     except Exception:
         logger.exception("Failed to update project")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get(
+    "/{project_id}/github/files",
+    response_description="List files for the project's configured GitHub repository.",
+)
+async def list_project_github_files_route(
+    project_id: str = Path(..., description="The project ID"),
+    user_data: UserData = Depends(get_current_user),
+):
+    access = get_project_access(project_id, user_data.user_id, user_data.email)
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+
+    project_data = access.data.get("project") or {}
+    github_config = project_data.get("github_config") or {}
+    repository_url = str(github_config.get("repository_url") or "").strip()
+    api_token = github_config.get("api_token")
+    branch = github_config.get("branch")
+
+    if not repository_url:
+        raise HTTPException(status_code=400, detail="GitHub repository URL is not configured for this project")
+    if not str(api_token or "").strip():
+        raise HTTPException(status_code=400, detail="GitHub API token is not configured for this project")
+
+    try:
+        response = ResponseModel(
+            success=True,
+            message="GitHub repository files retrieved successfully",
+            data=list_github_repository_files(repository_url, api_token, branch),
+        )
+        return JSONResponse(status_code=200, content=response.dict())
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to load GitHub repository files")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get(
+    "/{project_id}/github/file",
+    response_description="Load a text file from the project's configured GitHub repository.",
+)
+async def get_project_github_file_route(
+    project_id: str = Path(..., description="The project ID"),
+    path: str = Query(..., description="Repository-relative file path"),
+    user_data: UserData = Depends(get_current_user),
+):
+    access = get_project_access(project_id, user_data.user_id, user_data.email)
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+
+    project_data = access.data.get("project") or {}
+    github_config = project_data.get("github_config") or {}
+    repository_url = str(github_config.get("repository_url") or "").strip()
+    api_token = github_config.get("api_token")
+    branch = github_config.get("branch")
+
+    if not repository_url:
+        raise HTTPException(status_code=400, detail="GitHub repository URL is not configured for this project")
+    if not str(api_token or "").strip():
+        raise HTTPException(status_code=400, detail="GitHub API token is not configured for this project")
+
+    try:
+        response = ResponseModel(
+            success=True,
+            message="GitHub file retrieved successfully",
+            data=get_github_file_content(repository_url, api_token, path, branch),
+        )
+        return JSONResponse(status_code=200, content=response.dict())
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to load GitHub file")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.delete(
@@ -1149,12 +1260,32 @@ async def get_project_stats_timeline_route(
 
     try:
         epics = get_epics_for_project(project_id, user_data.user_id) or []
+        epic_ids = [str(epic.get("id") or "").strip() for epic in epics if str(epic.get("id") or "").strip()]
+        stories_by_epic_id: Dict[str, List[dict]] = {}
+        all_story_ids: List[str] = []
+
+        for chunk in _chunk_values(epic_ids):
+            story_docs = (
+                FIRESTORE_CLIENT.collection("user_stories")
+                .where("epic_id", "in", chunk)
+                .get()
+            )
+            for doc in story_docs:
+                story_data = doc.to_dict() or {}
+                story_id = doc.id
+                story_data["id"] = story_id
+                epic_id = str(story_data.get("epic_id") or "").strip()
+                if not epic_id:
+                    continue
+                stories_by_epic_id.setdefault(epic_id, []).append(story_data)
+                all_story_ids.append(story_id)
+
+        sprint_id_by_story = _get_story_sprint_assignment_map(all_story_ids)
         payload_epics = []
 
         for epic in epics:
             epic_id = epic.get("id")
-            stories_response = get_user_stories_by_epic(epic_id, user_data.user_id, allow_member=True)
-            stories = stories_response.data if stories_response and stories_response.success else []
+            stories = stories_by_epic_id.get(str(epic_id or "").strip(), [])
 
             normalized_stories = []
             for story in stories or []:
@@ -1168,7 +1299,7 @@ async def get_project_stats_timeline_route(
                     "createdDate": story.get("createdDate") or story.get("created_at"),
                     "startDate": story.get("startDate") or story.get("start_date"),
                     "dueDate": story.get("dueDate") or story.get("due_date"),
-                    "sprint_id": story.get("sprint_id"),
+                    "sprint_id": sprint_id_by_story.get(str(story.get("id") or "").strip()),
                     "effortHours": effort_hours,
                     "effort_hours": effort_hours,
                 })

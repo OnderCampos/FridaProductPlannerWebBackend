@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import logging
 
+from google.cloud import firestore
+
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.schemas.response import ResponseModel
 from src.services.workflows.project_creation.project_creation_by_figma.initialization import (
@@ -14,7 +16,6 @@ from src.utils.authz.project_memberships import (
     delete_memberships_for_project,
     get_memberships_for_user,
 )
-from src.utils.planning.user_stories import get_user_stories_by_epic
 from src.utils.authz.permissions import get_project_access
 from src.schemas.user_data import UserData
 from src.services.workflows.project_creation.common import PROJECT_KEY_LENGTH, normalize_project_key
@@ -23,6 +24,22 @@ from src.services.workflows.project_creation.common import PROJECT_KEY_LENGTH, n
 def _current_timestamp_iso() -> str:
     """Generate current timestamp in ISO format"""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _sanitize_github_config(project_data: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(project_data, dict):
+        return project_data
+
+    github_config = project_data.get("github_config")
+    if not isinstance(github_config, dict):
+        return project_data
+
+    project_data["github_config"] = {
+        "repository_url": github_config.get("repository_url"),
+        "branch": github_config.get("branch"),
+        "has_api_token": bool(str(github_config.get("api_token") or "").strip()),
+    }
+    return project_data
 
 
 def get_project_for_user(project_id: str, user_id: str) -> ResponseModel:
@@ -89,6 +106,7 @@ def get_all_projects_for_user(user_id: str, include_member_projects: bool = Fals
 
             team_members = get_team_members(doc.id)
             project_data["teamMembers"] = team_members
+            project_data = _sanitize_github_config(project_data)
 
             all_projects.append(project_data)
 
@@ -110,6 +128,7 @@ def get_all_projects_for_user(user_id: str, include_member_projects: bool = Fals
 
                 team_members = get_team_members(project_id)
                 project_data["teamMembers"] = team_members
+                project_data = _sanitize_github_config(project_data)
 
                 all_projects.append(project_data)
 
@@ -141,6 +160,7 @@ def get_all_projects_for_user(user_id: str, include_member_projects: bool = Fals
 
                 team_members = get_team_members(project_id)
                 project_data["teamMembers"] = team_members
+                project_data = _sanitize_github_config(project_data)
 
                 all_projects.append(project_data)
 
@@ -188,20 +208,14 @@ def get_project_by_id(
         if allow_member and isinstance(project_data, dict) and "project" in project_data:
             project_data = project_data.get("project")
 
-        # Get epics for the project using utility function
+        # Get epics for the project without hydrating story lists.
         project_epics = get_epics_for_project(project_id, user_id)
-        for epic in project_epics:
-            stories_response = get_user_stories_by_epic(epic["id"], user_id, allow_member=allow_member)
-            stories = stories_response.data or []
-            for story in stories:
-                if "assigneeId" not in story and "assigned_to" in story:
-                    story["assigneeId"] = story.get("assigned_to")
-            epic["userStories"] = stories
         project_data["epics"] = project_epics
 
         # Include team members
         members = get_team_members(project_id)
         project_data["teamMembers"] = format_team_members_response(members)
+        project_data = _sanitize_github_config(project_data)
         
         return ResponseModel(
             success=True,
@@ -237,7 +251,8 @@ async def create_project_from_figma(
 
 
 def update_project(project_id: str, user_id: str, name: Optional[str] = None, 
-    description: Optional[str] = None, project_key: Optional[str] = None, tech_stack: List[str] = None) -> ResponseModel:
+    description: Optional[str] = None, project_key: Optional[str] = None, tech_stack: List[str] = None,
+    codegen_job: Optional[dict] = None, github_config: Optional[dict] = None) -> ResponseModel:
     """
     Updates an existing project.
     
@@ -274,18 +289,11 @@ def update_project(project_id: str, user_id: str, name: Optional[str] = None,
                 )
             project_key = normalized_key
         
-        # Check if user owns the project
-        if project_data.get("user_id") != user_id:
-            return ResponseModel(
-                success=False,
-                message="Unauthorized: You don't own this project",
-                data=None
-            )
-        
         # Check if new project_key conflicts with existing projects (if provided)
         if project_key and project_key != project_data.get("project_key"):
+            owner_user_id = project_data.get("user_id")
             existing_projects = FIRESTORE_CLIENT.collection("projects").where(
-                "user_id", "==", user_id
+                "user_id", "==", owner_user_id
             ).where(
                 "project_key", "==", project_key
             ).get()
@@ -307,6 +315,43 @@ def update_project(project_id: str, user_id: str, name: Optional[str] = None,
             update_data["project_key"] = project_key
         if tech_stack is not None:
             update_data["technical_stack"] = tech_stack
+        if codegen_job is not None:
+            update_data["codegen_job"] = codegen_job
+        if github_config is not None:
+            existing_config = project_data.get("github_config") or {}
+            if not isinstance(existing_config, dict):
+                existing_config = {}
+
+            next_repository_url = github_config.get("repository_url")
+            if next_repository_url is None:
+                next_repository_url = existing_config.get("repository_url")
+            else:
+                next_repository_url = str(next_repository_url).strip()
+
+            next_branch = github_config.get("branch")
+            if next_branch is None:
+                next_branch = existing_config.get("branch")
+            else:
+                next_branch = str(next_branch).strip() or None
+
+            clear_api_token = bool(github_config.get("clear_api_token"))
+            provided_api_token = github_config.get("api_token")
+            if clear_api_token:
+                next_api_token = None
+            elif provided_api_token is None:
+                next_api_token = existing_config.get("api_token")
+            else:
+                trimmed_token = str(provided_api_token).strip()
+                next_api_token = trimmed_token or existing_config.get("api_token")
+
+            if next_repository_url or next_branch or next_api_token:
+                update_data["github_config"] = {
+                    "repository_url": next_repository_url or "",
+                    "branch": next_branch,
+                    "api_token": next_api_token,
+                }
+            else:
+                update_data["github_config"] = firestore.DELETE_FIELD
         
         if len(update_data) == 1:  # Only updated_at
             return ResponseModel(
@@ -322,6 +367,7 @@ def update_project(project_id: str, user_id: str, name: Optional[str] = None,
         updated_doc = project_ref.get()
         updated_data = updated_doc.to_dict()
         updated_data["id"] = project_id
+        updated_data = _sanitize_github_config(updated_data)
         
         return ResponseModel(
             success=True,

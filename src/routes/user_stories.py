@@ -44,7 +44,13 @@ from src.utils.planning.user_stories import (
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
 from src.utils.authz.permissions import get_project_access
-from src.utils.planning.assignees import build_member_lookup
+from src.utils.planning.assignees import (
+    FRIDA_ASSIGNEE_ID,
+    build_frida_assignee_update,
+    build_member_lookup,
+    is_frida_assignee_id,
+    is_frida_assignee_name,
+)
 from src.utils.planning.members import get_member_by_id
 from src.utils.planning.subtask_generation import (
     generate_subtasks_for_user_story,
@@ -78,6 +84,13 @@ router = APIRouter()
 
 def _build_story_assignee_update(project_id: str, req: UpdateUserStoryAssigneeRequest) -> dict:
     update_data: dict = {}
+
+    if (
+        is_frida_assignee_id(req.assigneeId)
+        or is_frida_assignee_name(req.assignee)
+        or is_frida_assignee_name(req.assignee_email)
+    ):
+        return build_frida_assignee_update()
 
     if req.assigneeId:
         member = get_member_by_id(project_id, req.assigneeId) if project_id else None
@@ -881,6 +894,8 @@ async def update_user_story_assignee_name_route(
         }
         if "assigneeId" in update_data or response.data.get("assigneeId"):
             assignee_payload["assigneeId"] = update_data.get("assigneeId", response.data.get("assigneeId"))
+        elif str(assignee_payload.get("assignee") or "").strip().lower() == "frida":
+            assignee_payload["assigneeId"] = FRIDA_ASSIGNEE_ID
         if response.data.get("assignment_notification") is not None:
             assignee_payload["assignment_notification"] = response.data.get("assignment_notification")
 
