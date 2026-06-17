@@ -270,7 +270,7 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
                 user_name=user_data.get_user_name(),
             )
         else:
-            operation = update_subtask_status(item_id, user_id, status)
+            operation = update_subtask_status(item_id, user_id, status, user_name=user_data.get_user_name(), user_email=user_data.get_email())
 
         return _action_result(action_type, action_id, operation)
 
@@ -712,7 +712,7 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
         latest_result: Optional[ResponseModel] = None
 
         if non_status_fields:
-            fields_response = update_subtask_fields(subtask_id, user_id, non_status_fields)
+            fields_response = update_subtask_fields(subtask_id, user_id, non_status_fields, user_name=user_data.get_user_name(), user_email=user_data.get_email())
             if not fields_response.success:
                 return _action_result(action_type, action_id, fields_response)
             latest_result = fields_response
@@ -721,7 +721,7 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
             normalized_status = _normalize_item_status(fields.get("status"))
             if normalized_status is None:
                 return ResponseModel(success=False, message="Invalid status value", data=None)
-            status_response = update_subtask_status(subtask_id, user_id, normalized_status)
+            status_response = update_subtask_status(subtask_id, user_id, normalized_status, user_name=user_data.get_user_name(), user_email=user_data.get_email())
             if not status_response.success:
                 return _action_result(action_type, action_id, status_response)
             latest_result = status_response

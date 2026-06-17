@@ -180,6 +180,8 @@ async def update_task_status_route(
         user_id=user_data.get_user_id(),
         status=req.status,
         completed_date=req.completed_date,
+        user_name=user_data.get_user_name(),
+        user_email=user_data.get_email()
     )
     return JSONResponse(
         status_code=_status_from_response(response),
@@ -221,6 +223,8 @@ async def update_task_fields_route(
         subtask_id=task_id,
         user_id=user_data.get_user_id(),
         update_data=payload,
+        user_name=user_data.get_user_name(),
+        user_email=user_data.get_email(),
     )
     return JSONResponse(
         status_code=_status_from_response(response),

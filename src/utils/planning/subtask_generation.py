@@ -1,9 +1,11 @@
+import traceback
 from typing import Any, Dict, List, Optional
 import json
 import logging
 import re
 from datetime import datetime, timezone
 
+from src.services.notifications import NotificationService
 from src.prompts.subtask_generation import GENERATE_SUBTASKS_PROMPT
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
@@ -20,6 +22,7 @@ from src.schemas.workflow_status import (
     coerce_workflow_status,
     normalize_workflow_status,
 )
+from src.utils.authz.users import get_user_profile
 
 TASK_TYPE_VALUES = {"Implementation", "Bug", "Refactor", "Research"}
 LEGACY_TASK_TYPE_MAP = {
@@ -132,6 +135,185 @@ def _normalize_task_type(value: Any, default: str = "Implementation") -> str:
         return normalized
     return LEGACY_TASK_TYPE_MAP.get(normalized.lower(), default)
 
+def _maybe_send_subtask_updated_notification(
+    *,
+    previous_subtask: Dict[str, Any],
+    updated_subtask: Dict[str, Any],
+    user_id: str,
+    user_email: Optional[str] = None,
+    user_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        fields_to_watch = {
+            "status": "Status"
+        }
+
+        changes = {}
+        for db_key, display_name in fields_to_watch.items():
+            old_val = str(previous_subtask.get(db_key) or "N/A").strip()
+            new_val = str(updated_subtask.get(db_key) or "N/A").strip()
+
+            if old_val != new_val and old_val.lower() != new_val.lower():
+                changes[display_name] = {"old": old_val, "new": new_val}
+
+        if not changes:
+            return NotificationService()._notification_result(False, "skipped", "no_changes", "No relevant fields were changed")
+
+        story_id = str(updated_subtask.get("user_story_id") or previous_subtask.get("user_story_id") or "").strip()
+        if not story_id:
+            return NotificationService()._notification_result(False, "skipped", "story_missing", "User Story ID is missing in subtask.")
+
+        story_doc = FIRESTORE_CLIENT.collection("user_stories").document(story_id).get()
+        if not story_doc.exists:
+            return NotificationService()._notification_result(False, "skipped", "story_not_found", "Parent Story not found.")
+        
+        story_data = story_doc.to_dict() or {}
+        parent_story_title = str(story_data.get("user_story") or story_data.get("title") or "").strip()
+        epic_id = str(story_data.get("epic_id") or "").strip()
+
+        if not epic_id:
+            return NotificationService()._notification_result(False, "skipped", "epic_missing", "Epic ID is missing in parent story.")
+
+        epic_doc = FIRESTORE_CLIENT.collection("epics").document(epic_id).get()
+        epic_name = ""
+        project_id = ""
+        if epic_doc.exists:
+            epic_data = epic_doc.to_dict() or {}
+            epic_name = str(epic_data.get("epic") or epic_data.get("name") or "").strip()
+            project_id = str(epic_data.get("project_id") or "").strip()
+
+        if not project_id:
+            return NotificationService()._notification_result(False, "skipped", "project_missing", "Project ID missing in epic.")
+
+        project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
+        if not project_doc.exists:
+            return NotificationService()._notification_result(False, "skipped", "project_not_found", "Project not found")
+
+        project_data = project_doc.to_dict() or {}
+        project_name = str(project_data.get("name") or "").strip()
+        leader_email = project_data.get("projectLead", "")
+
+        leader_id = project_data.get("user_id", "")
+        leader_doc = FIRESTORE_CLIENT.collection("users").document(leader_id).get()
+        if not leader_doc.exists:
+            return NotificationService()._notification_result(False, "skipped", "admin_not_found", "Admin Project not found")
+
+        # If the leader has made the change , we do not send the email
+        if user_email and user_email.lower() == leader_email.lower():
+                return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
+
+        leader_data = leader_doc.to_dict() or {}
+        leader_name = leader_data.get("name", "")
+
+        actor_name = str(user_name or user_email or "A User").strip()
+        if not actor_name or actor_name == "None":
+            actor_profile = get_user_profile(user_id=user_id, email=user_email)
+            actor_name = str((actor_profile or {}).get("name") or user_email or "A User").strip()
+
+        subtask_title = str(updated_subtask.get("title") or "").strip()
+        display_title = f"[Subtask] {subtask_title} (De: {parent_story_title})"
+
+        sent = NotificationService().try_send_subtask_updated(
+            leader_email=leader_email, 
+            leader_name=leader_name,               
+            changer_name=actor_name,
+            project_name=project_name,
+            epic_name=epic_name,
+            parent_story_title=parent_story_title,
+            subtask_title=display_title,
+            changes=changes
+        )
+
+        if not sent:
+            return NotificationService()._notification_result(
+                False,
+                "failed",
+                "notification_provider_failed",
+                "Subtask notification failed."
+            )
+
+        return NotificationService()._notification_result(True, "sent", "sent", f"Subtask update email sent to {leader_email}.")
+    except Exception as e:
+        print(f"ERROR EN NOTIFICACIÓN DE SUBTAREA: {e}")
+        traceback.print_exc()
+        return NotificationService()._notification_result(False, "failed", "error", "Subtask notification failed.")
+
+def _maybe_send_subtask_assignment_notification(
+    *,
+    previous_subtask: Dict[str, Any],
+    updated_subtask: Dict[str, Any],
+    user_id: str,
+    user_email: Optional[str] = None,
+    user_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        # We check if the assignee has changed
+        previous_email = str(previous_subtask.get("assigneeEmail") or "").strip().lower()
+        updated_email = str(updated_subtask.get("assignee_email") or "").strip().lower()
+
+        if not updated_email:
+            return NotificationService()._notification_result(False, "skipped", "no_assignee", "No assignee email provided, skipping assignment notification.")
+
+        if previous_email == updated_email:
+            return NotificationService()._notification_result(False, "skipped", "assignee_unchanged", "Assignee email did not change, skipping notification.")
+
+        # Initialize context variables with defaults in case of missing data
+        project_id = str(updated_subtask.get("project_id") or "").strip()
+        story_id = str(updated_subtask.get("user_story_id") or "").strip()
+        epic_name = "N/A"
+        parent_story_title = "Independent Task"
+        project_name = "Unknown Project"
+
+        # If the subtask is linked to a story, It is a normal subtask
+        if story_id:
+            story_doc = FIRESTORE_CLIENT.collection("user_stories").document(story_id).get()
+            if story_doc.exists:
+                story_data = story_doc.to_dict() or {}
+                parent_story_title = str(story_data.get("user_story") or "").strip()
+                epic_id = str(story_data.get("epic_id") or "").strip()
+
+                if epic_id: 
+                    epic_doc = FIRESTORE_CLIENT.collection("epics").document(epic_id).get()
+                    if epic_doc.exists:
+                        epic_data = epic_doc.to_dict() or {}
+                        epic_name = str(epic_data.get("name") or "").strip()
+                        if not project_id:
+                            project_id = str(epic_data.get("project_id") or "").strip()
+
+        if project_id:
+            project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
+            if project_doc.exists:
+                project_name = str(project_doc.to_dict().get("name") or "").strip()
+        else:
+            return NotificationService()._notification_result(False, "skipped", "project_missing", "Project ID is missing, cannot send assignment notification.")
+
+        # Get names
+        assignee_name = str(updated_subtask.get("assignee") or updated_email).strip()
+        subtask_title = str(updated_subtask.get("title") or updated_subtask.get("description") or "").strip()
+
+        actor_name = str(user_name or "").strip()
+        if not actor_name:
+            actor_profile = get_user_profile(user_id=user_id, email=user_email)
+            actor_name = str((actor_profile or {}).get("name") or user_email or "A User").strip()
+
+        # Send email
+        NotificationService().try_send_subtask_assignment(
+            assignee_name=assignee_name,
+            assignee_email=updated_email,
+            project_name=project_name,
+            epic_name=epic_name,
+            parent_story_title=parent_story_title,
+            subtask_title=subtask_title,
+            assigned_by_name=actor_name,
+        )
+
+        return NotificationService()._notification_result(True, "sent", "sent", f"Assignment email sent to {updated_email}.")
+
+    except Exception as e:
+        import traceback
+        print(f"🔥 ERROR EN NOTIFICACIÓN DE ASIGNACIÓN DE SUBTAREA: {e}")
+        traceback.print_exc()
+        return NotificationService()._notification_result(False, "failed", "error", "Subtask assignment notification failed.")
 
 def _get_project_tech_stack(project_id: str) -> List[str]:
     try:
@@ -791,7 +973,7 @@ async def batch_create_project_tasks_from_text(
         return ResponseModel(success=False, message=f"Error batch creating project tasks: {str(e)}", data=None)
 
 
-def update_subtask_status(subtask_id: str, user_id: str, status: str, completed_date: str = None) -> ResponseModel:
+def update_subtask_status(subtask_id: str, user_id: str, status: str, completed_date: str = None, user_name: Optional[str] = None, user_email: Optional[str] = None) -> ResponseModel:
     try:
         canonical_status = normalize_workflow_status(status)
         if canonical_status is None:
@@ -810,6 +992,10 @@ def update_subtask_status(subtask_id: str, user_id: str, status: str, completed_
         if subtask_data.get("user_id") != user_id:
             return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
 
+        current_data = subtask_doc.to_dict() or {}
+        if current_data.get("user_id") != user_id:
+            return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
+
         now = _current_timestamp_iso()
         update_data = {
             "status": canonical_status,
@@ -820,13 +1006,28 @@ def update_subtask_status(subtask_id: str, user_id: str, status: str, completed_
         subtask_ref.update(update_data)
         updated_doc = subtask_ref.get()
         updated_data = _serialize_subtask(updated_doc.to_dict() or {}, updated_doc.id)
+
+        try:
+            updated_data_for_notif = updated_data.copy()
+            updated_data_for_notif["id"] = subtask_id
+
+            _maybe_send_subtask_updated_notification(
+                previous_subtask=current_data,
+                updated_subtask=updated_data_for_notif,
+                user_id=user_id,
+                user_name=user_name,
+                user_email=user_email,
+            )
+        except Exception as e:
+            logging.error(f"Error disparando notificación de actualización de status de subtarea: {e}")
+
         return ResponseModel(success=True, message="Subtask status updated successfully", data=updated_data)
     except Exception as e:
         logging.error(f"Error updating subtask status: {e}")
         return ResponseModel(success=False, message=f"Error updating subtask status: {str(e)}", data=None)
 
 
-def update_subtask_fields(subtask_id: str, user_id: str, update_data: Dict) -> ResponseModel:
+def update_subtask_fields(subtask_id: str, user_id: str, update_data: Dict, user_name: Optional[str] = None, user_email: Optional[str] = None) -> ResponseModel:
     try:
         subtask_ref = FIRESTORE_CLIENT.collection("subtasks").document(subtask_id)
         subtask_doc = subtask_ref.get()
@@ -871,7 +1072,25 @@ def update_subtask_fields(subtask_id: str, user_id: str, update_data: Dict) -> R
         subtask_ref.update(filtered_update)
 
         updated_doc = subtask_ref.get()
-        final_data = _serialize_subtask(updated_doc.to_dict() or {}, subtask_id)
+        # final_data = _serialize_subtask(updated_doc.to_dict() or {}, subtask_id)
+        updated_data = updated_doc.to_dict() or {}
+        final_data = _serialize_subtask(updated_data, subtask_id)
+
+        try:
+            # Le pasamos el ID por si la notificación lo necesita
+            updated_data_for_notif = updated_data.copy()
+            updated_data_for_notif["id"] = subtask_id
+
+            _maybe_send_subtask_assignment_notification(
+                previous_subtask=current_data,
+                updated_subtask=updated_data_for_notif,
+                user_id=user_id,
+                user_name=user_name,
+                user_email=user_email,
+            )
+        except Exception as e:
+            logging.error(f"Error disparando notificación de asignación de subtarea: {e}")
+
         return ResponseModel(success=True, message="Subtask updated successfully", data=final_data)
     except Exception as e:
         logging.error(f"Error updating subtask fields: {e}")
