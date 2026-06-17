@@ -1144,7 +1144,7 @@ async def update_subtask_status_route(
         if not status:
             raise HTTPException(status_code=400, detail="Status field is required")
         
-        response = update_subtask_status(subtask_id, user_data.get_user_id(), status, completed_date)
+        response = update_subtask_status(subtask_id, user_data.get_user_id(), status, completed_date, user_name=user_data.get_user_name(), user_email=user_data.get_email())
         
         status_code = 200
         if not response.success:
@@ -1201,7 +1201,7 @@ async def update_subtask_fields_route(
 
         update_data = await request.json()
 
-        response = update_subtask_fields(subtask_id, user_data.get_user_id(), update_data)
+        response = update_subtask_fields(subtask_id, user_data.get_user_id(), update_data, user_name=user_data.get_user_name(), user_email=user_data.get_email())
 
         if not response.success:
             raise HTTPException(status_code=400, detail=response.message)
