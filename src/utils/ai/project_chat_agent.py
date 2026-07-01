@@ -4,6 +4,7 @@ from uuid import uuid4
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, TypedDict, Annotated
 
+import httpx
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -29,6 +30,7 @@ from src.utils.planning.members import format_team_members_response, get_project
 from src.utils.authz.permissions import get_project_access, get_project_id_for_story, get_project_id_for_subtask
 from src.utils.planning.projects import get_project_by_id
 from src.utils.planning.sprints import (
+    _get_subtask_for_project,
     assign_item_to_sprint,
     create_sprint,
     delete_sprint,
@@ -829,6 +831,166 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
 
         operation = delete_subtasks_by_user_story(subtask_id, user_id)
         return _action_result(action_type, action_id, operation)
+
+    if action_type == "implement_frida_tasks":
+            project_id = str(payload.get("project_id") or "").strip()
+            story_ids = payload.get("story_ids") if isinstance(payload.get("story_ids"), list) else []
+            task_ids = payload.get("task_ids") if isinstance(payload.get("task_ids"), list) else []
+
+            if not project_id:
+                return ResponseModel(success=False, message="project_id is required for implementation", data=None)
+
+            # 1. Validar que el usuario tenga permisos en el proyecto
+            access = _require_project_lead_access(user_data, project_id)
+            if not access.success:
+                return access
+
+            # ---------------------------------------------------------
+            # Función auxiliar para sanitizar textos y formatear listas
+            # ---------------------------------------------------------
+            def sanitize_text(val):
+                if isinstance(val, list):
+                    # Si es un arreglo (como Acceptance Criteria), lo unimos con espacios
+                    text = " ".join(str(v) for v in val)
+                else:
+                    text = str(val or "")
+                # IMPORTANTE: Reemplazar comillas simples rectas por curvas
+                # para no romper el comando `curl -d '...'` en E2B Bash
+                return text.strip().replace("'", "’")
+
+            description_lines = []
+            processed_subtask_ids = set() # Escudo para evitar duplicados
+
+            # ---------------------------------------------------------
+            # 1. Procesar User Stories y sus Subtasks hijas
+            # ---------------------------------------------------------
+            if story_ids:
+                description_lines.append("### USER STORIES")
+                for story_id in story_ids:
+                    story_resp = get_user_story_by_id(
+                        story_id, 
+                        user_id, 
+                        allow_member=True, 
+                        user_email=user_email
+                    )
+                    if story_resp.success and isinstance(story_resp.data, dict):
+                        story = story_resp.data
+                        
+                        # Usamos nuestra nueva función mágica para limpiar TODO
+                        business_id = sanitize_text(story.get("user_story_id"))
+                        title = sanitize_text(story.get("user_story") or story.get("title") or f"Story {business_id or story_id}")
+                        desc = sanitize_text(story.get("description"))
+                        ac = sanitize_text(story.get("acceptanceCriteria"))
+                        out_scope = sanitize_text(story.get("outOfScope"))
+                        
+                        if business_id: description_lines.append(f"ID: {business_id}")
+                        description_lines.append(f"User Story: {title}")
+                        if desc: description_lines.append(f"Description: {desc}")
+                        if ac: description_lines.append(f"Acceptance Criteria: {ac}")
+                        if out_scope: description_lines.append(f"Out of Scope: {out_scope}")
+                        
+                        # Buscar las subtasks de esta historia
+                        subtasks_resp = get_subtasks_by_user_story(
+                            story_id, 
+                            user_id, 
+                            allow_member=True, 
+                            user_email=user_email
+                        )
+                        if subtasks_resp.success and isinstance(subtasks_resp.data, list) and len(subtasks_resp.data) > 0:
+                            description_lines.append("Subtasks:")
+                            for st in subtasks_resp.data:
+                                st_id = st.get("id")
+                                if st_id:
+                                    processed_subtask_ids.add(st_id) # La marcamos como ya procesada
+                                    
+                                st_title = sanitize_text(st.get("title"))
+                                st_desc = sanitize_text(st.get("description"))
+                                description_lines.append(f"  - [Subtask] {st_title}")
+                                description_lines.append(f"    [Details] {st_desc}")
+                        
+                        description_lines.append("\n-------------------\n")
+
+            # ---------------------------------------------------------
+            # 2. Procesar Tareas (Clasificando Independientes vs Subtasks)
+            # ---------------------------------------------------------
+            if task_ids:
+                independent_lines = []
+                subtask_lines = []
+                
+                for task_id in task_ids:
+                    # Si ya la imprimimos adentro de su User Story, nos la saltamos
+                    if task_id in processed_subtask_ids:
+                        continue
+                        
+                    task_resp = _get_subtask_for_project(
+                        subtask_id=task_id, 
+                        project_id=project_id, 
+                        user_id=user_id, 
+                        allow_member=True, 
+                        user_email=user_email
+                    )
+                    
+                    if task_resp.success and isinstance(task_resp.data, dict):
+                        task = task_resp.data
+                        
+                        task_title = sanitize_text(task.get("title"))
+                        task_desc = sanitize_text(task.get("description"))
+                        parent_story_id = task.get("user_story_id")
+                        
+                        # CLASIFICACIÓN INTELIGENTE
+                        if parent_story_id:
+                            subtask_lines.append(f"[Subtask of a Story] {task_title}")
+                            subtask_lines.append(f"Description: {task_desc}\n")
+                        else:
+                            independent_lines.append(f"[Independent Task] {task_title}")
+                            independent_lines.append(f"Description: {task_desc}\n")
+                    else:
+                        independent_lines.append(f"[Task] {task_id}")
+                        independent_lines.append(f"Description: Details not found\n")
+                        
+                if independent_lines:
+                    description_lines.append("### INDEPENDENT TASKS ###")
+                    description_lines.extend(independent_lines)
+                    
+                if subtask_lines:
+                    description_lines.append("### SELECTED SUBTASKS ###")
+                    description_lines.extend(subtask_lines)
+
+            description = "\n".join(description_lines)
+
+            if not description.strip():
+                description = "Implement the assigned tasks for Frida."
+
+            # 2. Aquí llamamos a la función que encola el trabajo para github_pr_generator.py
+            try:
+                codegen_url = "http://127.0.0.1:5001/frida-microvms/us-central1/jobs/v1/createJob"
+
+                data = {
+                    "userId": user_id,
+                    "storage_path": f"projects/{project_id}",
+                    "description": description,
+                    "jobType": "github_pr_generator"
+                }
+
+                with httpx.Client(timeout=30.0) as client:
+                    response = client.post(codegen_url, data=data)
+
+                if response.status_code not in (200, 201):
+                    raise Exception(f"Codegen API returned status {response.status_code}: {response.text}")
+
+                result = response.json()
+                if not result.get("success"):
+                    raise Exception(result.get("message") or "Failed to create code generation job")
+
+                operation = ResponseModel(
+                    success=True, 
+                    message=f"Frida has started working! Job ID: {result.get('jobId')}. A PR will be generated shortly.", 
+                    data={"jobId": result.get("jobId"), "jobType": "github_pr_generator"}
+                )
+                return _action_result(action_type, action_id, operation)
+
+            except Exception as e:
+                return ResponseModel(success=False, message=f"Failed to trigger implementation: {str(e)}", data=None)
 
     return ResponseModel(success=False, message=f"Unsupported action_type: {action_type}", data=None)
 
@@ -2822,6 +2984,40 @@ def run_project_chat_agent(
             "scope_project_id": scope_project_id or focused_project_id,
         }
 
+    def propose_implement_frida_tasks_tool(
+        project_id_arg: Optional[str] = None,
+        story_ids: Optional[List[str]] = None,
+        task_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        resolved_project_id = _resolve_project_arg(project_id_arg)
+        if not resolved_project_id:
+            return {"error": "Project not found or not accessible"}
+
+        # We check that the user has permissions
+        lead_error = _validate_lead_for_project(resolved_project_id)
+        if lead_error:
+            return {"error": lead_error}
+
+        safe_story_ids = story_ids if isinstance(story_ids, list) else []
+        safe_task_ids = task_ids if isinstance(task_ids, list) else []
+
+        action = _register_pending_action(
+            action_type="implement_frida_tasks", # ID of the execute
+            title="Implement work with Frida",
+            summary=(
+                f"Command the Frida agent to write code and generate a PR for "
+                f"**{len(safe_story_ids)} user stories** and **{len(safe_task_ids)} tasks**."
+                #f"{len(safe_task_ids)} tasks."
+            ),
+            payload={
+                "project_id": resolved_project_id,
+                "story_ids": safe_story_ids,
+                "task_ids": safe_task_ids,
+            },
+            project_id_hint=resolved_project_id,
+        )
+        return {"confirmation_required": True, "pending_action": action}
+
     tools = [
         StructuredTool.from_function(
             func=get_project_details,
@@ -2966,6 +3162,20 @@ def run_project_chat_agent(
             name="search_work_items",
             description="Search epics, stories, and subtasks by keyword within the current scoped project.",
         ),
+        StructuredTool.from_function(
+            func=propose_implement_frida_tasks_tool,
+            name="propose_implement_frida_tasks",
+            description=(
+                "Propose triggering the Frida coding agent to implement the user stories and tasks "
+                "currently assigned to it. Use this when the user asks to 'Implement the work' or 'Generate code'. "
+                "CRITICAL INSTRUCTION: Read the user's prompt carefully to classify the IDs. "
+                "Extract the complex database IDs (e.g., 'a1b2C3d4E5f6') located at the very beginning of each bullet point. "
+                "Ignore the human-readable tags like '(Ref: TK-51)'. "
+                "Only put IDs listed under the 'User stories:' section strictly into the `story_ids` list. "
+                "Only put IDs listed under the 'Tasks:' section strictly into the `task_ids` list. "
+                "Do NOT mix them up. Do NOT put task IDs into the story_ids list."
+            ),
+        ),
     ]
 
     tool_map = {tool.name: tool for tool in tools}
@@ -3050,6 +3260,7 @@ def run_project_chat_agent(
         "Do not ask for free-text confirmation like 'reply yes/no'. "
         "Always generate a pending action via propose_* tools so confirmation happens with the UI buttons. "
         "You can help with most planner UI operations, including creating, updating, deleting, assigning, moving, and sprint planning actions when matching tools exist. "
+        "When the user asks to implement work assigned to Frida or generate code, use the propose_implement_frida_tasks tool and extract the mentioned IDs. "
         "When a user references a story by title, short key, or description, pass that text as story_query instead of asking for story_id first. "
         "When a user references an epic or sprint by name, prefer epic_query or sprint_query instead of asking for raw IDs first. "
         "Only ask for clarification when tool output indicates multiple matches. "

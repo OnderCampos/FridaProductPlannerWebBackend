@@ -43,7 +43,7 @@ from src.utils.planning.user_stories import (
 )
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
-from src.utils.authz.permissions import get_project_access
+from src.utils.authz.permissions import get_project_access, get_project_id_for_story
 from src.utils.planning.assignees import (
     FRIDA_ASSIGNEE_ID,
     build_frida_assignee_update,
@@ -51,7 +51,7 @@ from src.utils.planning.assignees import (
     is_frida_assignee_id,
     is_frida_assignee_name,
 )
-from src.utils.planning.members import get_member_by_id
+from src.utils.planning.members import get_member_by_id, get_project_members
 from src.utils.planning.subtask_generation import (
     generate_subtasks_for_user_story,
     create_subtask_for_user_story_with_agent,
@@ -1199,7 +1199,27 @@ async def update_subtask_fields_route(
             raise HTTPException(status_code=404, detail="Epic not found")
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
+        project_id = get_project_id_for_story(story_id)
+
         update_data = await request.json()
+
+        assignee_name = update_data.get("assignee")
+        if assignee_name is not None:
+            if not assignee_name or assignee_name.lower() == "unassigned":
+                update_data["assignee"] = ""
+                update_data["assigneeEmail"] = None
+                update_data["assignee_email"] = None
+                update_data["assigneeId"] = None
+                update_data["assigned_to"] = None
+            else:
+                members = get_project_members(project_id)
+                for member in members:
+                    if member.get("name") == assignee_name:
+                        update_data["assigneeEmail"] = member.get("email")
+                        update_data["assignee_email"] = member.get("email")
+                        update_data["assigneeId"] = member.get("id")
+                        update_data["assigned_to"] = member.get("id")
+                        break
 
         response = update_subtask_fields(subtask_id, user_data.get_user_id(), update_data, user_name=user_data.get_user_name(), user_email=user_data.get_email())
 
