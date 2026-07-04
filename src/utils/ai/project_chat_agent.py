@@ -899,6 +899,10 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
                         if subtasks_resp.success and isinstance(subtasks_resp.data, list) and len(subtasks_resp.data) > 0:
                             description_lines.append("Subtasks:")
                             for st in subtasks_resp.data:
+                                st_status = str(st.get("status", "")).strip().lower()
+                                if st_status == "done":
+                                    continue
+
                                 st_id = st.get("id")
                                 if st_id:
                                     processed_subtask_ids.add(st_id) # La marcamos como ya procesada
@@ -972,7 +976,7 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
                     "jobType": "github_pr_generator"
                 }
 
-                with httpx.Client(timeout=30.0) as client:
+                with httpx.Client(timeout=120.0) as client:
                     response = client.post(codegen_url, data=data)
 
                 if response.status_code not in (200, 201):
