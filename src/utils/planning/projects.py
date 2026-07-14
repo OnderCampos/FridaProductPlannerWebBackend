@@ -38,6 +38,7 @@ def _sanitize_github_config(project_data: Dict[str, Any]) -> Dict[str, Any]:
         "repository_url": github_config.get("repository_url"),
         "branch": github_config.get("branch"),
         "has_api_token": bool(str(github_config.get("api_token") or "").strip()),
+        "installation_id": github_config.get("installation_id")
     }
     return project_data
 
@@ -344,11 +345,22 @@ def update_project(project_id: str, user_id: str, name: Optional[str] = None,
                 trimmed_token = str(provided_api_token).strip()
                 next_api_token = trimmed_token or existing_config.get("api_token")
 
-            if next_repository_url or next_branch or next_api_token:
+            clear_installation_id = bool(github_config.get("clear_installation_id"))
+            provided_installation_id = github_config.get("installation_id")
+
+            if clear_installation_id:
+                next_installation_id = None
+            elif provided_installation_id is None:
+                next_installation_id = existing_config.get("installation_id")
+            else:
+                next_installation_id = str(provided_installation_id).strip() or None
+
+            if next_repository_url or next_branch or next_api_token or next_installation_id:
                 update_data["github_config"] = {
                     "repository_url": next_repository_url or "",
                     "branch": next_branch,
                     "api_token": next_api_token,
+                    "installation_id": next_installation_id,
                 }
             else:
                 update_data["github_config"] = firestore.DELETE_FIELD

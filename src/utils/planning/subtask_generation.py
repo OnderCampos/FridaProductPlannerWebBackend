@@ -14,7 +14,7 @@ from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.services.setup.variables_setup import LLMOPS_API_KEY
 from src.utils.authz.permissions import get_project_access
 from src.utils.core.general import get_code_block
-from src.utils.integrations.github import get_github_file_content, list_github_repository_files
+from src.utils.integrations.github import get_github_file_content, get_installation_token, list_github_repository_files
 from src.utils.planning.epics import get_epic_by_id, get_epics_for_project
 from src.utils.planning.user_stories import get_user_stories_by_epic, get_user_story_by_id
 from src.utils.firebase.identifier import get_next_TK_identifier
@@ -577,14 +577,22 @@ def _load_repository_context_for_task(
         repository_url = str(github_config.get("repository_url") or "").strip()
         api_token = github_config.get("api_token")
         branch = github_config.get("branch")
+        installation_id = github_config.get("installation_id")
 
-        if not repository_url or not str(api_token or "").strip():
+        active_token = None
+        if installation_id:
+            try:
+                active_token = get_installation_token(str(installation_id))
+            except Exception as e:
+                logging.error(f"Failed to generate GitHub App token: {e}")
+
+        if not repository_url or not str(active_token or "").strip():
             return {
                 "available": False,
                 "message": "GitHub repository context is not configured for this project.",
             }
 
-        listing = list_github_repository_files(repository_url, api_token, branch)
+        listing = list_github_repository_files(repository_url, active_token, branch)
         all_files = listing.get("files") or []
         if not isinstance(all_files, list) or not all_files:
             return {
@@ -624,7 +632,7 @@ def _load_repository_context_for_task(
                 continue
 
             try:
-                file_payload = get_github_file_content(repository_url, api_token, path, branch)
+                file_payload = get_github_file_content(repository_url, active_token, path, branch)
                 excerpt = _extract_content_excerpt(file_payload.get("content") or "", keywords)
                 if not excerpt:
                     continue

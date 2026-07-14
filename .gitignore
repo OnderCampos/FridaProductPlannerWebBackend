@@ -82,3 +82,6 @@ Thumbs.db
 
 # Firebase credentials
 src/services/auth/firebase.json
+
+*.pem
+*.private-key.pem

@@ -74,7 +74,7 @@ from src.services.workflows.project_import.project_import_from_jira.initializati
 from src.services.notifications import NotificationService
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.utils.ai.project_creation_source_spec import generate_spec_from_source
-from src.utils.integrations.github import get_github_file_content, list_github_repository_files
+from src.utils.integrations.github import get_github_file_content, list_github_app_repositories, list_github_repository_branches, list_github_repository_files
 
 
 from src.utils.authz.permissions import get_project_access, get_global_user_role
@@ -428,6 +428,65 @@ async def update_project_route(
         logger.exception("Failed to update project")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+@router.get(
+    "/{project_id}/github/repositories",
+    response_description="List available repositories for a GitHub App installation"
+)
+async def get_github_app_repositories_route(
+    project_id: str,
+    installation_id: str = Query(..., description="The GitHub App installation ID"),
+    user_data: UserData = Depends(get_current_user)
+):
+    """
+        Get repositories list which GitHub App has access
+    """
+    access = get_project_access(project_id, user_data.user_id, user_data.email)
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+
+    try:
+        repos = list_github_app_repositories(installation_id)
+
+        return {
+            "success": True,
+            "message": "Repositories loaded successfully",
+            "data": repos
+        }
+    except Exception as e:
+        return {"success": False, "message": str(e), "data": []}
+
+@router.get(
+    "/{project_id}/github/branches",
+    response_description="List branches for a specific GitHub repository"
+)
+async def get_github_repository_branches_route(
+    project_id: str,
+    repository_url: str = Query(..., description="The full URL or owner/repo string"),
+    installation_id: str = Query(None, description="The GitHub App installation ID"),
+    user_data: UserData = Depends(get_current_user)
+):
+    """
+        Get the branches list of a repository
+    """
+    access = get_project_access(project_id, user_data.user_id, user_data.email)
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+
+    try:
+        branches = list_github_repository_branches(
+            repository_url=repository_url,
+            installation_id=installation_id,
+        )
+
+        return {
+            "success": True,
+            "message": "Branches loaded successfully",
+            "data": branches
+        }
+    except Exception as e:
+        return {"success": False, "message": str(e), "data": []}
 
 @router.get(
     "/{project_id}/github/files",
