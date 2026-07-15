@@ -1015,7 +1015,12 @@ async def generate_subtasks_route(
             raise HTTPException(status_code=404, detail="Epic not found")
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
-        response = await generate_subtasks_for_user_story(user_data, story_id)
+        response = await generate_subtasks_for_user_story(
+            user_data,
+            story_id,
+            allow_member=True,
+            user_email=user_data.get_email(),
+        )
         return JSONResponse(
             status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
             content=response.dict(),

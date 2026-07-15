@@ -413,7 +413,8 @@ async def transform_user_data(user_data: dict) -> dict:
         
         # Call the Azure Chat Service with the prompt
         response = await azure_chat_service.simple_completion(
-            prompt=formatted_prompt
+            prompt=formatted_prompt,
+            model_tier="mini",
         )
         transformed_data = json.loads(response)
     except Exception as e:
@@ -450,7 +451,8 @@ async def transform_user_data_with_llm(user_data: dict, team_id: str, text_data:
         
         # Get completion from Azure OpenAI
         result = await chat_session.simple_completion(
-            prompt=formatted_prompt
+            prompt=formatted_prompt,
+            model_tier="mini",
         )
 
         print("LLM Result:", result)

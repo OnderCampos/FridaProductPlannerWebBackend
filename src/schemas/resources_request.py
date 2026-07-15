@@ -23,8 +23,7 @@ class CreateProjectRequest(BaseModel):
 class CreateProjectFromDescriptionRequest(BaseModel):
     """Request model for creating a project from a description only."""
     description: str
-    name: Optional[str] = None
-    project_key: Optional[str] = None
+    name: str
 
 
 class StartProjectClarificationRequest(BaseModel):

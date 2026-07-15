@@ -310,8 +310,9 @@ async def create_project_route(
     """
     Creates a new project from a description.
 
-    The client can optionally provide `name` and/or `project_key`; if omitted, the backend
-    will generate reasonable defaults.
+    The client provides the description and optional display name. The backend
+    derives the 3-character project key automatically from the name/description
+    and retries alternate candidates if the first key conflicts for the same user.
     """
     role_info = get_global_user_role(user_data)
     if role_info.get("role") == "member":
@@ -322,43 +323,32 @@ async def create_project_route(
         if not description:
             raise HTTPException(status_code=400, detail="description is required")
 
-        name = (req.name or "").strip() or _derive_project_name(description)
-        requested_key = _sanitize_project_key(req.project_key or "")
+        name = (req.name or "").strip()
 
-        if requested_key:
-            project_record = create_project_record(
-                user_data=user_data,
-                name=name,
-                description=description,
-                project_key=requested_key,
-                creation_status="created",
-                creation_source="manual",
-            )
-        else:
-            base_key = _derive_project_key_base(name, description)
-            project_record = None
-            last_exc: Optional[Exception] = None
-            candidates = [base_key]
-            candidates.extend(f"{base_key[:2]}{_random_project_key_suffix(1)}" for _ in range(25))
-            candidates.extend(_random_project_key_suffix(3) for _ in range(25))
+        base_key = _derive_project_key_base(name, description)
+        project_record = None
+        last_exc: Optional[Exception] = None
+        candidates = [base_key]
+        candidates.extend(f"{base_key[:2]}{_random_project_key_suffix(1)}" for _ in range(25))
+        candidates.extend(_random_project_key_suffix(3) for _ in range(25))
 
-            for candidate in candidates:
-                try:
-                    project_record = create_project_record(
-                        user_data=user_data,
-                        name=name,
-                        description=description,
-                        project_key=candidate,
-                        creation_status="created",
-                        creation_source="manual",
-                    )
-                    last_exc = None
-                    break
-                except ProjectKeyConflictError as exc:
-                    last_exc = exc
+        for candidate in candidates:
+            try:
+                project_record = create_project_record(
+                    user_data=user_data,
+                    name=name,
+                    description=description,
+                    project_key=candidate,
+                    creation_status="created",
+                    creation_source="manual",
+                )
+                last_exc = None
+                break
+            except ProjectKeyConflictError as exc:
+                last_exc = exc
 
-            if project_record is None:
-                raise ProjectRecordCreationError(str(last_exc or "Failed to generate unique project key"))
+        if project_record is None:
+            raise ProjectRecordCreationError(str(last_exc or "Failed to generate unique project key"))
 
         data = {
             "project": project_record.project.dict(),
@@ -1075,7 +1065,7 @@ async def generate_project_spec_from_file_route(
 
 @router.post(
     "/{project_id}/spec/accept",
-    response_description="Accept specification document and finalize project.",
+    response_description="Accept specification document and finalize project with epics and user stories.",
 )
 async def accept_project_spec_route(
     project_id: str = Path(..., description="The project ID"),
@@ -1087,7 +1077,7 @@ async def accept_project_spec_route(
 
     This endpoint is the final step in the file/Figma-based project creation flows:
     once a project is in a "spec_ready" state, the project lead can accept the spec to
-    trigger downstream generation (e.g., epics) via `finalize_project_from_spec`.
+    trigger downstream generation of epics and per-epic user stories via `finalize_project_from_spec`.
 
     Authorization:
         - Requires authentication.
@@ -1295,13 +1285,14 @@ async def get_project_stats_timeline_route(
                 normalized_stories.append({
                     "id": story.get("id"),
                     "user_story_id": story.get("user_story_id"),
-                    "status": story.get("status") or "To Do",
+                    "status": coerce_workflow_status(story.get("status"), default="To Do"),
                     "createdDate": story.get("createdDate") or story.get("created_at"),
                     "startDate": story.get("startDate") or story.get("start_date"),
                     "dueDate": story.get("dueDate") or story.get("due_date"),
                     "sprint_id": sprint_id_by_story.get(str(story.get("id") or "").strip()),
                     "effortHours": effort_hours,
                     "effort_hours": effort_hours,
+                    "storyPoints": story.get("storyPoints") or story.get("story_points") or 0,
                 })
 
             payload_epics.append({

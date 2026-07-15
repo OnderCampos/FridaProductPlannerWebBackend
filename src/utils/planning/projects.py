@@ -81,7 +81,12 @@ def get_project_for_user(project_id: str, user_id: str) -> ResponseModel:
         )
 
 
-def get_all_projects_for_user(user_id: str, include_member_projects: bool = False, user_email: Optional[str] = None) -> ResponseModel:
+def get_all_projects_for_user(
+    user_id: str,
+    include_member_projects: bool = False,
+    user_email: Optional[str] = None,
+    include_team_members: bool = True,
+) -> ResponseModel:
     """
     Retrieves all projects for a specific user.
     
@@ -92,7 +97,6 @@ def get_all_projects_for_user(user_id: str, include_member_projects: bool = Fals
         ResponseModel: Response containing the user's projects
     """
     try:
-        print(f"Fetching projects for user with {user_id}")
         project_ids = set()
         all_projects = []
 
@@ -104,8 +108,9 @@ def get_all_projects_for_user(user_id: str, include_member_projects: bool = Fals
             project_data["id"] = doc.id  # Add document ID as project ID
             project_ids.add(doc.id)
 
-            team_members = get_team_members(doc.id)
-            project_data["teamMembers"] = team_members
+            if include_team_members:
+                team_members = get_team_members(doc.id)
+                project_data["teamMembers"] = team_members
             project_data = _sanitize_github_config(project_data)
 
             all_projects.append(project_data)
@@ -126,8 +131,9 @@ def get_all_projects_for_user(user_id: str, include_member_projects: bool = Fals
                 project_data["id"] = project_doc.id
                 project_ids.add(project_id)
 
-                team_members = get_team_members(project_id)
-                project_data["teamMembers"] = team_members
+                if include_team_members:
+                    team_members = get_team_members(project_id)
+                    project_data["teamMembers"] = team_members
                 project_data = _sanitize_github_config(project_data)
 
                 all_projects.append(project_data)
@@ -158,8 +164,9 @@ def get_all_projects_for_user(user_id: str, include_member_projects: bool = Fals
                 project_data["id"] = project_doc.id
                 project_ids.add(project_id)
 
-                team_members = get_team_members(project_id)
-                project_data["teamMembers"] = team_members
+                if include_team_members:
+                    team_members = get_team_members(project_id)
+                    project_data["teamMembers"] = team_members
                 project_data = _sanitize_github_config(project_data)
 
                 all_projects.append(project_data)

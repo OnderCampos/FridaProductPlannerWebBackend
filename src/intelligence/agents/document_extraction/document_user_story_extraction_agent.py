@@ -8,8 +8,8 @@ from src.intelligence.agents.prompts.document_user_story_extraction_agent_prompt
 
 _DOCUMENT_USER_STORY_EXTRACTION_DEPLOYMENT = (
     os.getenv("DOCUMENT_USER_STORY_EXTRACTION_AGENT_DEPLOYMENT")
-    or os.getenv("AZURE_DEPLOYMENT_MINI")
     or os.getenv("AZURE_DEPLOYMENT")
+    or os.getenv("AZURE_DEPLOYMENT_MINI")
 )
 
 

@@ -3,6 +3,16 @@ from typing import Any, Dict, List
 from pydantic import BaseModel
 
 
+class EpicUserStoryGenerationStatus(BaseModel):
+    epic_id: str
+    epic_name: str
+    success: bool = True
+    skipped: bool = False
+    generated_count: int = 0
+    existing_count: int = 0
+    message: str = ""
+
+
 class FinalizeProjectCreationData(BaseModel):
     """
     Payload returned by the project creation finalization workflow.
@@ -18,6 +28,8 @@ class FinalizeProjectCreationData(BaseModel):
     roles: List[Any] = []
     project_key: str
     epics: List[Dict[str, Any]] = []
+    generated_user_stories_count: int = 0
+    user_story_generation: List[EpicUserStoryGenerationStatus] = []
 
     def dict(self, *args, **kwargs):
         """Compatibility wrapper for Pydantic v1/v2 callers."""

@@ -8,8 +8,8 @@ from src.intelligence.agents.prompts.document_chunk_extraction_agent_prompt impo
 
 _DOCUMENT_CHUNK_EXTRACTION_DEPLOYMENT = (
     os.getenv("DOCUMENT_CHUNK_EXTRACTION_AGENT_DEPLOYMENT")
-    or os.getenv("AZURE_DEPLOYMENT_MINI")
     or os.getenv("AZURE_DEPLOYMENT")
+    or os.getenv("AZURE_DEPLOYMENT_MINI")
 )
 
 

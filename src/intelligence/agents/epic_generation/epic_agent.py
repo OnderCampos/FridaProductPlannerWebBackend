@@ -9,8 +9,8 @@ from src.intelligence.agents.prompts.epic_agent_prompt import (
 
 _EPIC_AGENT_DEPLOYMENT = (
     os.getenv("EPIC_AGENT_DEPLOYMENT")
-    or os.getenv("AZURE_DEPLOYMENT_MINI")
     or os.getenv("AZURE_DEPLOYMENT")
+    or os.getenv("AZURE_DEPLOYMENT_MINI")
 )
 
 

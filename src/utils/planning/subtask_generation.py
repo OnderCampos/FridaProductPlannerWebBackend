@@ -1,3 +1,4 @@
+import asyncio
 import traceback
 from typing import Any, Dict, List, Optional
 import json
@@ -668,6 +669,7 @@ def _serialize_subtask(subtask_data: Dict[str, Any], subtask_id: Optional[str] =
         serialized["id"] = subtask_id
 
     user_story_id = str(serialized.get("user_story_id") or "").strip()
+    project_id = str(serialized.get("project_id") or "").strip()
     task_type = _normalize_task_type(
         serialized.get("task_type") or serialized.get("type"),
         default="Implementation",
@@ -684,7 +686,18 @@ def _serialize_subtask(subtask_data: Dict[str, Any], subtask_id: Optional[str] =
     serialized["dependencies"] = serialized.get("dependencies") or []
     serialized["estimated_hours"] = serialized.get("estimated_hours", 0)
     serialized["complexity"] = serialized.get("complexity") or "Medium"
-    serialized["tips_markdown"] = str(serialized.get("tips_markdown") or serialized.get("tipsMarkdown") or "").strip()
+    tips_markdown = str(serialized.get("tips_markdown") or serialized.get("tipsMarkdown") or "").strip()
+    if not tips_markdown:
+        tech_stack_items = _get_project_tech_stack(project_id) if project_id else []
+        tech_stack_text = ", ".join(tech_stack_items) if tech_stack_items else "the existing project stack"
+        tips_markdown = _build_task_tips_fallback(
+            str(serialized.get("title") or "").strip(),
+            str(serialized.get("description") or "").strip(),
+            task_type,
+            tech_stack_text,
+            {"available": False, "message": "Saved task tips were not available for this item."},
+        )
+    serialized["tips_markdown"] = tips_markdown
     serialized["story_title"] = str(serialized.get("story_title") or "").strip()
     serialized["epic_name"] = str(serialized.get("epic_name") or "").strip()
     serialized["sprint_id"] = serialized.get("sprint_id")
@@ -727,7 +740,8 @@ async def _estimate_project_task_fields(
                 task_type=task_type,
                 title=title.strip() or "Untitled task",
                 description=description.strip() or "No additional description provided.",
-            )
+            ),
+            model_tier="mini",
         )
 
         payload_text = get_code_block(raw) or raw
@@ -782,7 +796,8 @@ async def _generate_project_task_tips(
                 title=fallback_title,
                 description=fallback_description,
                 repository_context=repository_context_text,
-            )
+            ),
+            model_tier="mini",
         )
         normalized = str(raw or "").strip()
         return normalized or fallback
@@ -808,7 +823,8 @@ async def _generate_project_tasks_from_text(
     try:
         azure_services = AzureChatService(LLMOPS_API_KEY, user_data, None)
         raw = await azure_services.simple_completion(
-            PROJECT_TASK_BATCH_PROMPT.format(source_text=cleaned_text)
+            PROJECT_TASK_BATCH_PROMPT.format(source_text=cleaned_text),
+            model_tier="mini",
         )
         payload_text = get_code_block(raw) or raw
         try:
@@ -1013,10 +1029,15 @@ def _list_tasks_for_project_legacy(
     return list(tasks_by_id.values())
 
 
-def save_subtasks_to_firestore(user_story_id: str, user_id: str, subtasks: List[Dict[str, Any]]) -> ResponseModel:
+async def save_subtasks_to_firestore(
+    user_story_id: str,
+    user_data: UserData,
+    subtasks: List[Dict[str, Any]],
+) -> ResponseModel:
     try:
         saved_subtasks: List[Dict[str, Any]] = []
         now = _current_timestamp_iso()
+        user_id = user_data.get_user_id()
         story_context = _build_story_context(user_story_id, user_id)
         project_id = str(story_context.get("project_id") or "").strip()
         if not project_id:
@@ -1025,27 +1046,62 @@ def save_subtasks_to_firestore(user_story_id: str, user_id: str, subtasks: List[
                 message="Project not found for user story",
                 data=None,
             )
+        tech_stack = _get_project_tech_stack(project_id)
 
         existing_subtasks = FIRESTORE_CLIENT.collection("subtasks").where("user_story_id", "==", user_story_id).get()
         for doc in existing_subtasks:
             doc.reference.delete()
 
+        task_payloads: List[Dict[str, Any]] = []
         for subtask_data in subtasks:
-            task_identifier = get_next_TK_identifier()
+            task_type = _normalize_task_type(
+                subtask_data.get("task_type") or subtask_data.get("type"),
+                default="Implementation",
+            )
+            task_payloads.append(
+                {
+                    "task_identifier": get_next_TK_identifier(),
+                    "order": subtask_data.get("order", 0),
+                    "title": str(subtask_data.get("title") or "").strip(),
+                    "description": str(subtask_data.get("description") or "").strip(),
+                    "estimated_hours": subtask_data.get("estimated_hours", 0),
+                    "complexity": subtask_data.get("complexity", "Medium"),
+                    "dependencies": subtask_data.get("dependencies", []),
+                    "task_type": task_type,
+                    "type": task_type,
+                }
+            )
+
+        tips_values = await asyncio.gather(
+            *[
+                _generate_project_task_tips(
+                    project_id=project_id,
+                    user_data=user_data,
+                    title=task_payload["title"],
+                    description=task_payload["description"],
+                    task_type=task_payload["task_type"],
+                    tech_stack=tech_stack,
+                )
+                for task_payload in task_payloads
+            ]
+        ) if task_payloads else []
+
+        for index, task_payload in enumerate(task_payloads):
             subtask_document = {
                 "user_story_id": user_story_id,
                 "user_id": user_id,
                 "project_id": project_id,
                 "source": "story",
-                "task_id": task_identifier,
-                "order": subtask_data.get("order", 0),
-                "title": subtask_data.get("title", ""),
-                "description": subtask_data.get("description", ""),
-                "estimated_hours": subtask_data.get("estimated_hours", 0),
-                "complexity": subtask_data.get("complexity", "Medium"),
-                "dependencies": subtask_data.get("dependencies", []),
-                "task_type": "Implementation",
-                "type": "Implementation",
+                "task_id": task_payload["task_identifier"],
+                "order": task_payload["order"],
+                "title": task_payload["title"],
+                "description": task_payload["description"],
+                "estimated_hours": task_payload["estimated_hours"],
+                "complexity": task_payload["complexity"],
+                "tips_markdown": tips_values[index] if index < len(tips_values) else "",
+                "dependencies": task_payload["dependencies"],
+                "task_type": task_payload["task_type"],
+                "type": task_payload["type"],
                 "status": "To Do",
                 "completed_date": None,
                 "created_at": now,
@@ -1423,9 +1479,19 @@ def update_subtask_fields(subtask_id: str, user_id: str, update_data: Dict, user
         return ResponseModel(success=False, message=f"Error updating subtask fields: {str(e)}", data=None)
 
 
-async def generate_subtasks_for_user_story(user_data: UserData, story_id: str) -> ResponseModel:
+async def generate_subtasks_for_user_story(
+    user_data: UserData,
+    story_id: str,
+    allow_member: bool = False,
+    user_email: Optional[str] = None,
+) -> ResponseModel:
     try:
-        story_response = get_user_story_by_id(story_id, user_data.get_user_id())
+        story_response = get_user_story_by_id(
+            story_id,
+            user_data.get_user_id(),
+            allow_member=allow_member,
+            user_email=user_email,
+        )
         if not story_response.success:
             return ResponseModel(
                 success=False,
@@ -1434,6 +1500,14 @@ async def generate_subtasks_for_user_story(user_data: UserData, story_id: str) -
             )
 
         story_data = story_response.data
+        story_context = _build_story_context(
+            story_id,
+            user_data.get_user_id(),
+            allow_member=allow_member,
+            user_email=user_email,
+        )
+        project_id = str(story_context.get("project_id") or "").strip()
+        technical_stack = _get_project_tech_stack(project_id)
         additional_fields_text = ""
         if story_data.get("fields"):
             for field in story_data["fields"]:
@@ -1445,10 +1519,11 @@ async def generate_subtasks_for_user_story(user_data: UserData, story_id: str) -
             description=story_data.get("description", ""),
             epic=story_data.get("epic", ""),
             user_story_id=story_data.get("user_story_id", ""),
+            technical_stack=", ".join(technical_stack) if technical_stack else "Not specified",
             additional_fields=additional_fields_text if additional_fields_text else "No additional fields",
         )
 
-        response = await azure_services.simple_completion(prompt)
+        response = await azure_services.simple_completion(prompt, model_tier="gpt")
         subtasks_json = get_code_block(response)
 
         if subtasks_json:
@@ -1456,7 +1531,7 @@ async def generate_subtasks_for_user_story(user_data: UserData, story_id: str) -
                 subtasks_data = json.loads(subtasks_json)
                 subtasks = subtasks_data.get("subtasks", [])
                 if subtasks:
-                    save_result = save_subtasks_to_firestore(story_id, user_data.get_user_id(), subtasks)
+                    save_result = await save_subtasks_to_firestore(story_id, user_data, subtasks)
                     if save_result.success:
                         return ResponseModel(
                             success=True,
@@ -1489,7 +1564,7 @@ async def generate_subtasks_for_user_story(user_data: UserData, story_id: str) -
             subtasks_data = json.loads(response)
             subtasks = subtasks_data.get("subtasks", [])
             if subtasks:
-                save_result = save_subtasks_to_firestore(story_id, user_data.get_user_id(), subtasks)
+                save_result = await save_subtasks_to_firestore(story_id, user_data, subtasks)
                 if save_result.success:
                     return ResponseModel(
                         success=True,

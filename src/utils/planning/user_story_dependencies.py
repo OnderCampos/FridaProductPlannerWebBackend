@@ -146,6 +146,7 @@ async def generate_user_story_dependencies(
             prompt,
             key="dependencies",
             expected_keys=["story_id", "depends_on"],
+            model_tier="mini",
         )
 
         if dependencies_response is None:

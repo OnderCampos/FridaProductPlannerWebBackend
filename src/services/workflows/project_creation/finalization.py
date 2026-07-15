@@ -11,14 +11,18 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.schemas.project_finalization import FinalizeProjectCreationData
+from src.schemas.project_finalization import (
+    EpicUserStoryGenerationStatus,
+    FinalizeProjectCreationData,
+)
 from src.schemas.user_data import UserData
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.services.workflows.project_creation.common import current_timestamp_iso
 from src.utils.planning.epic_generation import generate_epics
 from src.utils.planning.epics import create_epic, get_epics_for_project
 from src.utils.planning.user_story_dependencies import generate_and_persist_user_story_dependencies
-from src.utils.planning.user_stories import create_multiple_user_stories
+from src.utils.planning.user_story_generation import generate_user_stories
+from src.utils.planning.user_stories import create_multiple_user_stories, get_user_stories_by_epic
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +60,10 @@ class EpicGenerationFailedError(ProjectFinalizationError):
 def _slugify(value: str) -> str:
     cleaned = "".join(ch if ch.isalnum() else "_" for ch in (value or "").lower())
     return "_".join(part for part in cleaned.split("_") if part)
+
+
+def _normalize_name_key(value: Any) -> str:
+    return str(value or "").strip().lower()
 
 
 def _normalize_bullets(value: Any) -> List[str]:
@@ -317,22 +325,108 @@ def _create_epics_from_payload(
     project_id: str,
     epics: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    existing_epics = get_epics_for_project(project_id, user_data.get_user_id())
+    existing_by_name = {
+        _normalize_name_key(epic.get("name")): epic
+        for epic in existing_epics
+        if _normalize_name_key(epic.get("name"))
+    }
+
     created_epics: List[Dict[str, Any]] = []
     epic_id_by_name: Dict[str, str] = {}
 
     for epic in epics:
+        epic_name_key = _normalize_name_key(epic.get("name"))
+        existing_epic = existing_by_name.get(epic_name_key)
+        if existing_epic:
+            created_epics.append(existing_epic)
+            epic_id = str(existing_epic.get("id") or "").strip()
+            if epic_name_key and epic_id:
+                epic_id_by_name[epic_name_key] = epic_id
+            continue
+
         # Persist each epic using the existing planning util (ensures consistent schema + timestamps).
         epic_response = create_epic(project_id, user_data.get_user_id(), epic)
         if not (epic_response.success and isinstance(epic_response.data, dict)):
             continue
 
         created_epics.append(epic_response.data)
-        epic_name = str(epic_response.data.get("name") or "").strip()
+        epic_name = _normalize_name_key(epic_response.data.get("name"))
         epic_id = str(epic_response.data.get("id") or "").strip()
         if epic_name and epic_id:
-            epic_id_by_name[epic_name.lower()] = epic_id
+            epic_id_by_name[epic_name] = epic_id
+            existing_by_name[epic_name] = epic_response.data
 
     return created_epics, epic_id_by_name
+
+
+async def _generate_missing_user_stories_for_epics(
+    *,
+    user_data: UserData,
+    epics: List[Dict[str, Any]],
+) -> Tuple[List[EpicUserStoryGenerationStatus], int]:
+    generation_statuses: List[EpicUserStoryGenerationStatus] = []
+    generated_total = 0
+
+    for epic in epics:
+        epic_id = str(epic.get("id") or "").strip()
+        epic_name = str(epic.get("name") or "").strip() or "Untitled Epic"
+
+        if not epic_id:
+            generation_statuses.append(
+                EpicUserStoryGenerationStatus(
+                    epic_id="",
+                    epic_name=epic_name,
+                    success=False,
+                    message="Epic was persisted without an id.",
+                )
+            )
+            continue
+
+        existing_stories_response = get_user_stories_by_epic(epic_id, user_data.get_user_id())
+        existing_stories = (
+            existing_stories_response.data
+            if existing_stories_response.success and isinstance(existing_stories_response.data, list)
+            else []
+        )
+        if existing_stories:
+            generation_statuses.append(
+                EpicUserStoryGenerationStatus(
+                    epic_id=epic_id,
+                    epic_name=epic_name,
+                    success=True,
+                    skipped=True,
+                    existing_count=len(existing_stories),
+                    message="User stories already exist for this epic.",
+                )
+            )
+            continue
+
+        stories_response = await generate_user_stories(
+            user_data=user_data,
+            epic_id=epic_id,
+        )
+        response_data = stories_response.data if isinstance(stories_response.data, dict) else {}
+        generated_count = int(response_data.get("generated_count") or 0)
+
+        generation_statuses.append(
+            EpicUserStoryGenerationStatus(
+                epic_id=epic_id,
+                epic_name=epic_name,
+                success=bool(stories_response.success),
+                generated_count=generated_count if stories_response.success else 0,
+                message=stories_response.message or (
+                    "User stories generated successfully."
+                    if stories_response.success
+                    else "Failed to generate user stories."
+                ),
+            )
+        )
+
+        if stories_response.success:
+            generated_total += generated_count
+
+    return generation_statuses, generated_total
 
 
 async def _create_user_stories_for_epics(
@@ -421,6 +515,8 @@ def _build_finalization_response(
     technical_stack: List[Any],
     roles: List[Any],
     epics: List[Dict[str, Any]],
+    generated_user_stories_count: int = 0,
+    user_story_generation: Optional[List[EpicUserStoryGenerationStatus]] = None,
 ) -> FinalizeProjectCreationData:
     return FinalizeProjectCreationData(
         id=project_id,
@@ -430,15 +526,25 @@ def _build_finalization_response(
         roles=roles,
         project_key=str(project.get("project_key") or ""),
         epics=epics,
+        generated_user_stories_count=generated_user_stories_count,
+        user_story_generation=user_story_generation or [],
     )
 
 
-def _finalized_response(project_id: str, project: Dict[str, Any], user_id: str) -> FinalizeProjectCreationData:
+async def _finalized_response(
+    project_id: str,
+    project: Dict[str, Any],
+    user_data: UserData,
+) -> FinalizeProjectCreationData:
     project_description = str(project.get("ai_project_description") or project.get("description") or "")
     technical_stack = project.get("technical_stack") or []
     roles = project.get("roles") or []
     # Load already-persisted epics so a repeated finalization call returns the current project state.
-    epics = get_epics_for_project(project_id, user_id)
+    epics = get_epics_for_project(project_id, user_data.get_user_id())
+    user_story_generation, generated_user_stories_count = await _generate_missing_user_stories_for_epics(
+        user_data=user_data,
+        epics=epics if isinstance(epics, list) else [],
+    )
     return _build_finalization_response(
         project_id=project_id,
         project=project,
@@ -446,6 +552,8 @@ def _finalized_response(project_id: str, project: Dict[str, Any], user_id: str) 
         technical_stack=technical_stack if isinstance(technical_stack, list) else [],
         roles=roles if isinstance(roles, list) else [],
         epics=epics if isinstance(epics, list) else [],
+        generated_user_stories_count=generated_user_stories_count,
+        user_story_generation=user_story_generation,
     )
 
 
@@ -552,6 +660,10 @@ async def _finalize_from_epic_generation(
         project_id=project_id,
         epics=epics_list,
     )
+    user_story_generation, generated_user_stories_count = await _generate_missing_user_stories_for_epics(
+        user_data=user_data,
+        epics=created_epics,
+    )
 
     # Use one timestamp across all writes for consistency.
     now = current_timestamp_iso()
@@ -576,6 +688,8 @@ async def _finalize_from_epic_generation(
         technical_stack=technical_stack if isinstance(technical_stack, list) else [],
         roles=roles if isinstance(roles, list) else [],
         epics=created_epics,
+        generated_user_stories_count=generated_user_stories_count,
+        user_story_generation=user_story_generation,
     )
 
 
@@ -603,7 +717,7 @@ async def finalize_project_creation(
 
     # If this project was already finalized, return persisted data instead of creating duplicates.
     if _is_finalized(project, knowledge):
-        return _finalized_response(project_id, project, user_data.get_user_id())
+        return await _finalized_response(project_id, project, user_data)
 
     # Prevent finalization until the spec is ready (otherwise generation runs on incomplete context).
     if not _is_spec_ready(project, knowledge):

@@ -7,7 +7,11 @@ from langchain_openai import AzureChatOpenAI
 LLMOPS_API_KEY = os.getenv("LLMOPS_API_KEY")
 LOGGING_ENDPOINT = os.getenv("LOGGING_ENDPOINT")
 
-MODEL = os.getenv("AZURE_DEPLOYMENT")
+GPT_DEPLOYMENT = os.getenv("AZURE_DEPLOYMENT")
+MINI_DEPLOYMENT = os.getenv("AZURE_DEPLOYMENT_MINI") or GPT_DEPLOYMENT
+
+MODEL = GPT_DEPLOYMENT
+MINI_MODEL = MINI_DEPLOYMENT
 
 JIRA_API_KEY = os.getenv("JIRA_API_KEY")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
@@ -34,14 +38,18 @@ NOTIFICATION_SENDER_NAME = os.getenv(
     "FridaPlatform",
 )
 
-logging.getLogger(__name__).info("Setting up Azure Chat OpenAI client...")
+logging.getLogger(__name__).info("Setting up Azure Chat OpenAI clients...")
 
-gpt40_client = AzureChatOpenAI(
-    azure_deployment=os.getenv("AZURE_DEPLOYMENT"),
-    api_version=os.getenv("API_VERSION")
-)
-
-gpt40_mini_client = AzureChatOpenAI(
-    azure_deployment=os.getenv("AZURE_DEPLOYMENT_MINI"),
+gpt_client = AzureChatOpenAI(
+    azure_deployment=GPT_DEPLOYMENT or MINI_DEPLOYMENT,
     api_version=os.getenv("API_VERSION"),
 )
+
+gpt_mini_client = AzureChatOpenAI(
+    azure_deployment=MINI_DEPLOYMENT or GPT_DEPLOYMENT,
+    api_version=os.getenv("API_VERSION"),
+)
+
+# Backward-compatible aliases for existing imports.
+gpt40_client = gpt_client
+gpt40_mini_client = gpt_mini_client

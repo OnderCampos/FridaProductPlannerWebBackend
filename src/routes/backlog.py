@@ -186,6 +186,7 @@ async def get_backlog_route(
             user_data.user_id,
             include_member_projects=True,
             user_email=user_data.get_email(),
+            include_team_members=False,
         )
         if not projects_response.success:
             return JSONResponse(
