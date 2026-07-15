@@ -8,8 +8,8 @@ from src.intelligence.agents.prompts.user_story_generation_agent_prompt import (
 
 _USER_STORY_GENERATION_DEPLOYMENT = (
     os.getenv("USER_STORY_GENERATION_AGENT_DEPLOYMENT")
-    or os.getenv("AZURE_DEPLOYMENT_MINI")
     or os.getenv("AZURE_DEPLOYMENT")
+    or os.getenv("AZURE_DEPLOYMENT_MINI")
 )
 
 

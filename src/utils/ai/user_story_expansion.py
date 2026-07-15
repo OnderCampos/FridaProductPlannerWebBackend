@@ -288,9 +288,9 @@ Rules:
 
     azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
     raw = (
-        await azure.simple_completion_with_images(prompt, image_payloads)
+        await azure.simple_completion_with_images(prompt, image_payloads, model_tier="gpt")
         if image_payloads
-        else await azure.simple_completion(prompt)
+        else await azure.simple_completion(prompt, model_tier="gpt")
     )
     parsed = _safe_json_load(raw)
     if not isinstance(parsed, dict):

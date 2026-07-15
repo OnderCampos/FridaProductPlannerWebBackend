@@ -176,7 +176,7 @@ Rules:
 """.strip()
 
     azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-    raw = await azure.simple_completion(prompt)
+    raw = await azure.simple_completion(prompt, model_tier="mini")
     parsed = _safe_json_load(raw)
     if not isinstance(parsed, dict):
         return {"complete": False, "questions": []}
@@ -268,7 +268,7 @@ Rules:
 """.strip()
 
     azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-    raw = await azure.simple_completion(prompt)
+    raw = await azure.simple_completion(prompt, model_tier="gpt")
     parsed = _safe_json_load(raw)
     if not isinstance(parsed, dict):
         return {}

@@ -43,9 +43,15 @@ from src.utils.planning.user_stories import (
 )
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
-from src.utils.authz.permissions import get_project_access
-from src.utils.planning.assignees import build_member_lookup
-from src.utils.planning.members import get_member_by_id
+from src.utils.authz.permissions import get_project_access, get_project_id_for_story
+from src.utils.planning.assignees import (
+    FRIDA_ASSIGNEE_ID,
+    build_frida_assignee_update,
+    build_member_lookup,
+    is_frida_assignee_id,
+    is_frida_assignee_name,
+)
+from src.utils.planning.members import get_member_by_id, get_project_members
 from src.utils.planning.subtask_generation import (
     generate_subtasks_for_user_story,
     create_subtask_for_user_story_with_agent,
@@ -78,6 +84,13 @@ router = APIRouter()
 
 def _build_story_assignee_update(project_id: str, req: UpdateUserStoryAssigneeRequest) -> dict:
     update_data: dict = {}
+
+    if (
+        is_frida_assignee_id(req.assigneeId)
+        or is_frida_assignee_name(req.assignee)
+        or is_frida_assignee_name(req.assignee_email)
+    ):
+        return build_frida_assignee_update()
 
     if req.assigneeId:
         member = get_member_by_id(project_id, req.assigneeId) if project_id else None
@@ -881,6 +894,8 @@ async def update_user_story_assignee_name_route(
         }
         if "assigneeId" in update_data or response.data.get("assigneeId"):
             assignee_payload["assigneeId"] = update_data.get("assigneeId", response.data.get("assigneeId"))
+        elif str(assignee_payload.get("assignee") or "").strip().lower() == "frida":
+            assignee_payload["assigneeId"] = FRIDA_ASSIGNEE_ID
         if response.data.get("assignment_notification") is not None:
             assignee_payload["assignment_notification"] = response.data.get("assignment_notification")
 
@@ -1000,7 +1015,12 @@ async def generate_subtasks_route(
             raise HTTPException(status_code=404, detail="Epic not found")
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
-        response = await generate_subtasks_for_user_story(user_data, story_id)
+        response = await generate_subtasks_for_user_story(
+            user_data,
+            story_id,
+            allow_member=True,
+            user_email=user_data.get_email(),
+        )
         return JSONResponse(
             status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
             content=response.dict(),
@@ -1129,7 +1149,7 @@ async def update_subtask_status_route(
         if not status:
             raise HTTPException(status_code=400, detail="Status field is required")
         
-        response = update_subtask_status(subtask_id, user_data.get_user_id(), status, completed_date)
+        response = update_subtask_status(subtask_id, user_data.get_user_id(), status, completed_date, user_name=user_data.get_user_name(), user_email=user_data.get_email())
         
         status_code = 200
         if not response.success:
@@ -1184,9 +1204,29 @@ async def update_subtask_fields_route(
             raise HTTPException(status_code=404, detail="Epic not found")
         _require_project_lead(epic_response.data.get("project_id"), user_data)
 
+        project_id = get_project_id_for_story(story_id)
+
         update_data = await request.json()
 
-        response = update_subtask_fields(subtask_id, user_data.get_user_id(), update_data)
+        assignee_name = update_data.get("assignee")
+        if assignee_name is not None:
+            if not assignee_name or assignee_name.lower() == "unassigned":
+                update_data["assignee"] = ""
+                update_data["assigneeEmail"] = None
+                update_data["assignee_email"] = None
+                update_data["assigneeId"] = None
+                update_data["assigned_to"] = None
+            else:
+                members = get_project_members(project_id)
+                for member in members:
+                    if member.get("name") == assignee_name:
+                        update_data["assigneeEmail"] = member.get("email")
+                        update_data["assignee_email"] = member.get("email")
+                        update_data["assigneeId"] = member.get("id")
+                        update_data["assigned_to"] = member.get("id")
+                        break
+
+        response = update_subtask_fields(subtask_id, user_data.get_user_id(), update_data, user_name=user_data.get_user_name(), user_email=user_data.get_email())
 
         if not response.success:
             raise HTTPException(status_code=400, detail=response.message)

@@ -9,8 +9,8 @@ from src.intelligence.agents.prompts.epic_role_brainstorm_agent_prompt import (
 
 _EPIC_ROLE_BRAINSTORM_DEPLOYMENT = (
     os.getenv("EPIC_ROLE_BRAINSTORM_AGENT_DEPLOYMENT")
-    or os.getenv("AZURE_DEPLOYMENT_MINI")
     or os.getenv("AZURE_DEPLOYMENT")
+    or os.getenv("AZURE_DEPLOYMENT_MINI")
 )
 
 def _sanitize_role_name(value: str) -> str:

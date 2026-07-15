@@ -8,8 +8,8 @@ from src.intelligence.agents.prompts.epic_synthesis_agent_prompt import (
 
 _EPIC_SYNTHESIS_DEPLOYMENT = (
     os.getenv("EPIC_SYNTHESIS_AGENT_DEPLOYMENT")
-    or os.getenv("AZURE_DEPLOYMENT_MINI")
     or os.getenv("AZURE_DEPLOYMENT")
+    or os.getenv("AZURE_DEPLOYMENT_MINI")
 )
 
 

@@ -8,8 +8,8 @@ from src.intelligence.agents.prompts.document_entity_consolidation_agent_prompt 
 
 _DOCUMENT_ENTITY_CONSOLIDATION_DEPLOYMENT = (
     os.getenv("DOCUMENT_ENTITY_CONSOLIDATION_AGENT_DEPLOYMENT")
-    or os.getenv("AZURE_DEPLOYMENT_MINI")
     or os.getenv("AZURE_DEPLOYMENT")
+    or os.getenv("AZURE_DEPLOYMENT_MINI")
 )
 
 

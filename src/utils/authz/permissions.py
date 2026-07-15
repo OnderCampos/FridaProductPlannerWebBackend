@@ -10,7 +10,6 @@ from src.utils.authz.project_memberships import (
     get_memberships_for_user,
     is_management_membership_role,
     normalize_membership_role,
-    upsert_project_membership,
 )
 
 def _is_lead_member(member: Optional[Dict[str, Any]]) -> bool:
@@ -72,14 +71,16 @@ def get_project_access(project_id: str, user_id: str, email: Optional[str]) -> R
         member_record = None
 
         if is_owner:
-            membership_record = upsert_project_membership(
-                project_id=project_id,
-                user_id=user_id,
-                email=email,
-                role="leader",
-                project_role="owner",
-                project_seniority=None,
-            )
+            membership_record = {
+                "id": f"{project_id}:{user_id}",
+                "project_id": project_id,
+                "user_id": user_id,
+                "email": email.lower() if isinstance(email, str) else email,
+                "role": "leader",
+                "project_role": "owner",
+                "project_seniority": None,
+            }
+            member_record = membership_record
         else:
             membership_record = _get_membership_record(project_id, user_id, email)
             if not membership_record:
@@ -90,15 +91,16 @@ def get_project_access(project_id: str, user_id: str, email: Optional[str]) -> R
                         member_record.get("seniority"),
                         member_record.get("member_type"),
                     )
-                    membership_record = upsert_project_membership(
-                        project_id=project_id,
-                        user_id=user_id,
-                        email=email or member_record.get("email"),
-                        role=membership_role,
-                        project_role=member_record.get("role"),
-                        project_seniority=member_record.get("seniority"),
-                        member_id=member_record.get("id") or member_record.get("member_id"),
-                    )
+                    membership_record = {
+                        "id": member_record.get("id") or member_record.get("member_id"),
+                        "project_id": project_id,
+                        "user_id": user_id,
+                        "email": (email or member_record.get("email") or "").lower() or None,
+                        "role": membership_role,
+                        "project_role": member_record.get("role"),
+                        "project_seniority": member_record.get("seniority"),
+                        "member_id": member_record.get("id") or member_record.get("member_id"),
+                    }
 
         if not is_owner and not membership_record and not member_record:
             return ResponseModel(success=False, message="Unauthorized: You don't have access to this project", data=None)

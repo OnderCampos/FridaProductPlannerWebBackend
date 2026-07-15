@@ -5,6 +5,7 @@ GENERATE_SUBTASKS_PROMPT = """You are an expert project manager and software dev
 - Description: {description}
 - Epic: {epic}
 - User Story ID: {user_story_id}
+- Technical Stack: {technical_stack}
 
 **Additional Fields:**
 {additional_fields}
@@ -15,9 +16,10 @@ GENERATE_SUBTASKS_PROMPT = """You are an expert project manager and software dev
 3. Each subtask should be clear and achievable
 4. Estimate the time to complete each subtask in hours
 5. Assign a complexity level (Low, Medium, High) to each subtask
-6. Consider all aspects: frontend, backend, testing, documentation, etc.
-7. Assign an order number to each subtask (1, 2, 3, etc.) based on logical sequence
-8. Identify dependencies - which subtasks must be completed before this one can start
+6. Ground the implementation breakdown in the provided technical stack and favor stack-appropriate tasks, tooling, and validation steps
+7. Consider all aspects: frontend, backend, testing, documentation, etc.
+8. Assign an order number to each subtask (1, 2, 3, etc.) based on logical sequence
+9. Identify dependencies - which subtasks must be completed before this one can start
 
 **Output Format:**
 Return a JSON array of subtasks. Each subtask must have:

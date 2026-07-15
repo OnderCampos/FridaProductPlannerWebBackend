@@ -15,10 +15,11 @@ from src.utils.planning.team import get_team_name
 from src.utils.core.validation_utils import has_expected_epic_structure, get_code_block
 from src.utils.ai.llm_graph import invoke_model_with_graph
 from src.services.setup.variables_setup import (
-    gpt40_client,
-    gpt40_mini_client,
+    gpt_client,
+    gpt_mini_client,
+    GPT_DEPLOYMENT,
+    MINI_DEPLOYMENT,
     LLMOPS_API_KEY,
-    MODEL,
 )
 from src.services.setup.language_setup import build_llm_language_system_prompt, get_default_llm_language
 from src.utils.knowledge_bases import schemas, general
@@ -27,6 +28,8 @@ from src.schemas.function_response import FunctionResponse
 import logging
 import sys
 sys.stdout.reconfigure(encoding='utf-8')
+
+logger = logging.getLogger(__name__)
 
 
 class Message:
@@ -161,6 +164,20 @@ class AzureChatService:
             "image_url": {"url": image_data},
         }
 
+    def _resolve_client(self, model_tier: str = "mini", use_images: bool = False):
+        normalized_tier = "gpt" if str(model_tier or "").strip().lower() == "gpt" else "mini"
+        logger = logging.getLogger(__name__)
+
+        if use_images or normalized_tier == "gpt":
+            if use_images:
+                logger.info("Using GPT deployment with image support")
+            else:
+                logger.info("Using GPT deployment")
+            return gpt_client, GPT_DEPLOYMENT or MINI_DEPLOYMENT
+
+        logger.info("Using mini deployment")
+        return gpt_mini_client, MINI_DEPLOYMENT or GPT_DEPLOYMENT
+
     async def call_with_retry(
         self,
         messages: List,
@@ -168,7 +185,8 @@ class AzureChatService:
         tries: int = 3,
         expected_keys: List[str] = [],
         return_full_response: bool = False,
-        use_images: bool = False
+        use_images: bool = False,
+        model_tier: str = "mini",
     ) -> Dict:
         """
         This function calls the LLM API with a given prompt and retries if the response is not as expected.
@@ -184,7 +202,11 @@ class AzureChatService:
             Dict: The JSON response from the LLM API or the filtered objects.
         """
         for _ in range(tries):
-            response = self.chat_completion(messages, use_images=use_images)
+            response = self.chat_completion(
+                messages,
+                use_images=use_images,
+                model_tier=model_tier,
+            )
             json_response = None
             try:
                 json_response = json.loads(response)
@@ -222,7 +244,12 @@ class AzureChatService:
                         return good_responses
         return None
 
-    def chat_completion(self, messages_list: list, use_images: bool = False) -> str:
+    def chat_completion(
+        self,
+        messages_list: list,
+        use_images: bool = False,
+        model_tier: str = "mini",
+    ) -> str:
         """
         Sends a list of messages to the Azure GPT-based chat model and retrieves the response.
 
@@ -246,13 +273,10 @@ class AzureChatService:
             messages_list.insert(insert_at, language_message)
 
         # Invoke the chat service
-        logger = logging.getLogger(__name__)
-        if use_images:
-            logger.info("Using GPT-4.0 model with image support")
-            client = gpt40_client
-        else:
-            logger.info("Using GPT-4.0 Mini model")
-            client = gpt40_mini_client
+        client, selected_deployment = self._resolve_client(
+            model_tier=model_tier,
+            use_images=use_images,
+        )
         response = invoke_model_with_graph(client=client, messages=messages_list)
 
         prompt_tokens = response.response_metadata["token_usage"]["prompt_tokens"]
@@ -296,7 +320,7 @@ class AzureChatService:
                 created=datetime.now(timezone.utc).isoformat(),
                 uid="",
                 api_key=LLMOPS_API_KEY,
-                model=MODEL,
+                model=selected_deployment,
                 additional_kwargs=additional_kwargs,
                 email=self.user_email,
                 status="success",
@@ -307,32 +331,63 @@ class AzureChatService:
         return response.content
 
     async def completion_without_knowledge_base(
-        self, prompt: str, key: str = None, attempts: int = 3, expected_keys: list = [], return_full_response: bool = False, images: list = []
+        self,
+        prompt: str,
+        key: str = None,
+        attempts: int = 3,
+        expected_keys: list = [],
+        return_full_response: bool = False,
+        images: list = [],
+        model_tier: str = "mini",
     ):
         if len(images) > 0:
             image_messages = [ImageMessage(image_data=image).to_dict() for image in images]
             messages = [HumanMessage(content=[TextMessage(text=prompt).to_dict()] + image_messages)]
-            return await self.call_with_retry(messages, key, attempts, expected_keys, return_full_response=return_full_response, use_images=True)
+            return await self.call_with_retry(
+                messages,
+                key,
+                attempts,
+                expected_keys,
+                return_full_response=return_full_response,
+                use_images=True,
+                model_tier=model_tier,
+            )
         messages = [HumanMessage(content=[TextMessage(text=prompt).to_dict()])]
-        return await self.call_with_retry(messages, key, attempts, expected_keys, return_full_response=return_full_response)
+        return await self.call_with_retry(
+            messages,
+            key,
+            attempts,
+            expected_keys,
+            return_full_response=return_full_response,
+            model_tier=model_tier,
+        )
 
-    async def simple_completion(self, prompt: str):
-        return self.chat_completion([HumanMessage(content=prompt)])
+    async def simple_completion(self, prompt: str, model_tier: str = "mini"):
+        return self.chat_completion(
+            [HumanMessage(content=prompt)],
+            model_tier=model_tier,
+        )
 
-    async def simple_completion_with_images(self, prompt: str, images: List[str]):
+    async def simple_completion_with_images(
+        self,
+        prompt: str,
+        images: List[str],
+        model_tier: str = "gpt",
+    ):
         image_messages = [
             ImageMessage(image_data=image).to_dict()
             for image in (images or [])
             if str(image or "").strip()
         ]
         if not image_messages:
-            return await self.simple_completion(prompt)
+            return await self.simple_completion(prompt, model_tier=model_tier)
         return self.chat_completion(
             [HumanMessage(content=[TextMessage(text=prompt).to_dict()] + image_messages)],
             use_images=True,
+            model_tier=model_tier,
         )
 
-    async def simple_kb_completion(self, prompt: str) -> FunctionResponse:
+    async def simple_kb_completion(self, prompt: str, model_tier: str = "mini") -> FunctionResponse:
 
         if not self.knowledge_base_id:
             raise ValueError(
@@ -364,7 +419,8 @@ class AzureChatService:
 
             # Call the chat model with retry logic
             response = await self.simple_completion(
-                prompt=f"Use the following context to answer the question:\n{context}\n\nQuestion: {prompt}"
+                prompt=f"Use the following context to answer the question:\n{context}\n\nQuestion: {prompt}",
+                model_tier=model_tier,
             )
 
             return FunctionResponse(status=True, data=response)
@@ -382,7 +438,8 @@ class AzureChatService:
         key: str = None,
         attempts: int = 3,
         expected_keys: list = [],
-        return_full_response: bool = False
+        return_full_response: bool = False,
+        model_tier: str = "mini",
     ) -> FunctionResponse:
         """
         Interacts with a knowledge base to retrieve relevant information and sends the processed messages to the Azure GPT-based chat model.
@@ -447,7 +504,8 @@ class AzureChatService:
                 key=key,
                 tries=attempts,
                 expected_keys=expected_keys,
-                return_full_response=return_full_response
+                return_full_response=return_full_response,
+                model_tier=model_tier,
             )
             logging.getLogger(__name__).debug(
                 "Response from chat model with knowledge base: %s", response

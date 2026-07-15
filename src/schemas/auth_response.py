@@ -11,3 +11,5 @@ class AuthResponse(BaseModel):
     message: str = Field(..., example="User authenticated successfully")
     data: Optional[Any] = Field(None, example="firebase_id_token")
     user: Optional[Dict[str, Any]] = Field(None, example={"email": "user@domain.com"})
+    refresh_token: Optional[str] = Field(None, example="firebase_refresh_token")
+    expires_in: Optional[str] = Field(None, example="3600")

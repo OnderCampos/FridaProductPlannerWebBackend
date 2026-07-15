@@ -828,10 +828,100 @@ class NotificationService:
 
         return self.send_mail(message)
 
+    def send_subtask_assignment(
+        self,
+        *,
+        assignee_name: str,
+        assignee_email: str,
+        project_name: str,
+        epic_name: str,
+        parent_story_title: str,
+        subtask_title: str,
+        assigned_by_name: str,
+    ) -> dict | str | None:
+        clean_assignee_name = assignee_name.strip() or assignee_email
+        clean_project_name = project_name.strip() or "your project"
+        clean_epic_name = epic_name.strip() or "N/A"
+        clean_parent_story = parent_story_title.strip() or "Independent Task"
+        clean_subtask_title = subtask_title.strip() or "a subtask"
+        clean_assigned_by_name = assigned_by_name.strip() or "A Product Planner administrator"
+        project_url = f"{self.frontend_base_url}/projects" if self.frontend_base_url else ""
+
+        subject = f"Subtask assigned: {clean_subtask_title}"
+        body_lines = [
+            f"Hello {clean_assignee_name},",
+            "",
+            f"{clean_assigned_by_name} assigned you a subtask in Product Planner.",
+            f"Project: {clean_project_name}",
+        ]
+
+        # Solo mostramos el Epic y la Historia si existen (para ocultarlos en las independientes)
+        if clean_epic_name != "N/A":
+            body_lines.append(f"Epic: {clean_epic_name}")
+        if clean_parent_story != "Independent Task":
+            body_lines.append(f"Parent Story: {clean_parent_story}")
+
+        body_lines.append(f"Subtask: {clean_subtask_title}")
+
+        if project_url:
+            body_lines.extend(["", f"Open Product Planner: {project_url}"])
+
+        html_parts = [
+            f"<p>Hello <strong>{escape(clean_assignee_name)}</strong>,</p>",
+            (
+                "<p>"
+                f"<strong>{escape(clean_assigned_by_name)}</strong> assigned you a subtask in Product Planner."
+                "</p>"
+            ),
+            "<div style='background-color: rgba(0,0,0,0.2); padding: 15px; border-radius: 8px; border-left: 3px solid #16e0d0; margin-top: 15px;'>",
+            f"<p style='margin-top: 0; color: #eaf2ff; margin-bottom: 5px;'><strong>Project:</strong> {escape(clean_project_name)}</p>"
+        ]
+
+        # Condicionales para HTML (ocultar campos si es independiente)
+        if clean_epic_name != "N/A":
+            html_parts.append(f"<p style='margin-top: 0; color: #eaf2ff; margin-bottom: 5px;'><strong>Epic:</strong> {escape(clean_epic_name)}</p>")
+        if clean_parent_story != "Independent Task":
+            html_parts.append(f"<p style='margin-top: 0; color: #eaf2ff; margin-bottom: 5px;'><strong>Story:</strong> {escape(clean_parent_story)}</p>")
+
+        html_parts.extend([
+            f"<p style='margin-top: 0; color: #eaf2ff; margin-bottom: 0;'><strong>Subtask:</strong> {escape(clean_subtask_title)}</p>",
+            "</div>"
+        ])
+
+        if project_url:
+            html_parts.append(
+                "<div style='text-align: center; margin: 35px 0 20px;'>"
+                f"<a href=\"{escape(project_url)}\" style=\"display: inline-block; padding: 14px 28px; "
+                "background-color: #16e0d0; color: #051327; text-decoration: none; "
+                "border-radius: 6px; font-weight: 600; font-size: 14px;\">"
+                "Open Product Planner"
+                "</a></div>"
+            )
+
+        final_html = self.build_email_template("".join(html_parts))
+
+        message = NotificationMessage(
+            to=[assignee_email],
+            subject=subject,
+            body="\n".join(body_lines),
+            html_body=final_html,
+            is_html=True,
+        )
+
+        return self.send_mail(message)
+
     def try_send_subtask_updated(self, **kwargs) -> bool:
         try:
             self.send_subtask_updated(**kwargs)
             return True
         except Exception:
             logger.exception("Failed to send subtask updated notification")
+            return False
+
+    def try_send_subtask_assignment(self, **kwargs) -> bool:
+        try:
+            self.send_subtask_assignment(**kwargs)
+            return True
+        except Exception:
+            logger.exception("Failed to send subtask assignment notification")
             return False
