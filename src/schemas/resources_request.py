@@ -74,6 +74,8 @@ class GitHubConfigRequest(BaseModel):
     branch: Optional[str] = None
     api_token: Optional[str] = None
     clear_api_token: Optional[bool] = None
+    installation_id: Optional[str] = None
+    clear_installation_id: Optional[bool] = None
 
 
 class UpdateProjectRequest(BaseModel):

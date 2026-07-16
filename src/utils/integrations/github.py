@@ -1,14 +1,61 @@
 import base64
+import os
+from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
+import httpx
+import jwt
 import requests
-from fastapi import HTTPException
+from fastapi import HTTPException, logger
 
 
 GITHUB_API_BASE = "https://api.github.com"
 MAX_GITHUB_FILE_SIZE_BYTES = 200_000
 
+BASE_DIR = Path(__file__).resolve().parent
+
+def get_installation_token(installation_id: str) -> str:
+    app_id = os.environ.get("GITHUB_APP_ID")
+    if not app_id:
+        raise Exception("GITHUB_APP_ID environment variable is not set.")
+
+    relative_key_path = os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH")
+    if not relative_key_path:
+        raise Exception("GITHUB_APP_PRIVATE_KEY_PATH environment variable is not set.")
+
+    key_path = BASE_DIR / relative_key_path if not os.path.isabs(relative_key_path) else Path(relative_key_path)
+
+    if not key_path.exists():
+        raise FileNotFoundError(f"GitHub App private key file not found at: {key_path}")
+
+    # Read the private key from the specified file
+    with open(key_path, "rb") as pem_file:
+        private_key = pem_file.read()
+
+    # Generate a JWT using the private key and app ID
+    payload = {
+        "iat": int(time.time()),
+        "exp": int(time.time()) + (10 * 60),  # JWT valid for 10 minutes
+        "iss": app_id
+    }
+    encoded_jwt = jwt.encode(payload, private_key, algorithm="RS256")
+
+    # We ask the Installation Token
+    headers = {
+        "Authorization": f"Bearer {encoded_jwt}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+
+    with httpx.Client(timeout=10.0) as client:
+        response = client.post(url, headers=headers)
+        if response.status_code != 201:
+            logger.error(f"Failed to get installation token: {response.status_code} - {response.text}")
+            raise Exception(f"Failed to get installation token: {response.status_code} - {response.text}")
+
+    return response.json()["token"]
 
 def parse_github_repository_reference(repository_url: str) -> Tuple[str, str]:
     raw_value = str(repository_url or "").strip()
@@ -185,3 +232,65 @@ def get_github_file_content(
         "content": decoded_text,
         "encoding": "utf-8",
     }
+
+def list_github_app_repositories(installation_id: str) -> List[Dict[str, Any]]:
+    try:
+        # Generate token
+        token = get_installation_token(installation_id)
+
+        # Make a request to the GitHub Api
+        url = f"{GITHUB_API_BASE}/installation/repositories"
+        headers = _build_github_headers(token)
+
+        response = requests.get(url, headers=headers, timeout=30)
+        _raise_for_github_error(response, "Failed to load repositories for GitHub App installation")
+
+        payload = response.json()
+        repositories = payload.get("repositories", [])
+
+        # Map only the data that the fronted needs
+        return [
+            {
+                "id": repo.get("id"),
+                "name": repo.get("name"),
+                "full_name": repo.get("full_name"),
+                "url": repo.get("html_url"),
+                "default_branch": repo.get("default_branch")
+            }
+            for repo in repositories
+        ]
+    except Exception as e:
+        logger.error(f"Error listing app repositories: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+def list_github_repository_branches(
+    repository_url: str,
+    installation_id: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    try:
+        # Get the owner and repo
+        owner, repo = parse_github_repository_reference(repository_url)
+
+        # Determine what token use
+        active_token = get_installation_token(installation_id)
+
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/branches"
+        headers = _build_github_headers(active_token)
+
+        params = {"per_page": 100}
+
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+        _raise_for_github_error(response, f"Failed to load branches for repository {owner}/{repo}")
+
+        branches = response.json()
+
+        return [
+            {
+                "name": branch.get("name"),
+                "protected": branch.get("protected", False)
+            }
+            for branch in branches
+        ]
+    except Exception as e:
+        logger.error(f"Error listing repository branches: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
