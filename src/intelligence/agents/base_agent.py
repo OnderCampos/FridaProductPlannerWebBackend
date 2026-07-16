@@ -56,8 +56,8 @@ class Agent:
         self.__args = list(args) if args else None
         self.__azure_deployment = (
             azure_deployment
-            or os.getenv("AZURE_DEPLOYMENT_MINI")
             or os.getenv("AZURE_DEPLOYMENT")
+            or os.getenv("AZURE_DEPLOYMENT_MINI")
         )
         self.__api_version = os.getenv("API_VERSION")
         self.__tools = list(tools) if tools else []

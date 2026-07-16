@@ -11,7 +11,12 @@ from src.schemas.task_schemas import (
 from src.schemas.user_data import UserData
 from src.utils.authz.auth import get_current_user
 from src.utils.authz.permissions import get_project_access
-from src.utils.planning.assignees import build_member_lookup
+from src.utils.planning.assignees import (
+    build_frida_assignee_update,
+    build_member_lookup,
+    is_frida_assignee_id,
+    is_frida_assignee_name,
+)
 from src.utils.planning.members import get_member_by_id
 from src.utils.planning.subtask_generation import (
     batch_create_project_tasks_from_text,
@@ -48,6 +53,13 @@ def _require_project_lead(project_id: str, user_data: UserData) -> None:
 
 
 def _build_task_assignee_update(project_id: str, req: UpdateTaskFieldsRequest) -> dict:
+    if (
+        is_frida_assignee_id(req.assigneeId)
+        or is_frida_assignee_name(req.assignee)
+        or is_frida_assignee_name(req.assignee_email)
+    ):
+        return build_frida_assignee_update()
+
     if req.assigneeId:
         member = get_member_by_id(project_id, req.assigneeId) if project_id else None
         if not member:
@@ -180,6 +192,8 @@ async def update_task_status_route(
         user_id=user_data.get_user_id(),
         status=req.status,
         completed_date=req.completed_date,
+        user_name=user_data.get_user_name(),
+        user_email=user_data.get_email()
     )
     return JSONResponse(
         status_code=_status_from_response(response),
@@ -221,6 +235,8 @@ async def update_task_fields_route(
         subtask_id=task_id,
         user_id=user_data.get_user_id(),
         update_data=payload,
+        user_name=user_data.get_user_name(),
+        user_email=user_data.get_email(),
     )
     return JSONResponse(
         status_code=_status_from_response(response),

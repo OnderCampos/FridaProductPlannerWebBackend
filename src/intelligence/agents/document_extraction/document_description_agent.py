@@ -8,8 +8,8 @@ from src.intelligence.agents.prompts.document_description_agent_prompt import (
 
 _DOCUMENT_DESCRIPTION_DEPLOYMENT = (
     os.getenv("DOCUMENT_DESCRIPTION_AGENT_DEPLOYMENT")
-    or os.getenv("AZURE_DEPLOYMENT_MINI")
     or os.getenv("AZURE_DEPLOYMENT")
+    or os.getenv("AZURE_DEPLOYMENT_MINI")
 )
 
 

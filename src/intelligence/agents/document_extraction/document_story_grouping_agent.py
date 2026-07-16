@@ -8,8 +8,8 @@ from src.intelligence.agents.prompts.document_story_grouping_agent_prompt import
 
 _DOCUMENT_STORY_GROUPING_DEPLOYMENT = (
     os.getenv("DOCUMENT_STORY_GROUPING_AGENT_DEPLOYMENT")
-    or os.getenv("AZURE_DEPLOYMENT_MINI")
     or os.getenv("AZURE_DEPLOYMENT")
+    or os.getenv("AZURE_DEPLOYMENT_MINI")
 )
 
 

@@ -1,13 +1,13 @@
 import json
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import requests
 
 from firebase_admin import auth
 
-from src.services.setup.firebase_setup import FIREBASE, FIREBASE_KEY, FIRESTORE_CLIENT
+from src.services.setup.firebase_setup import FIREBASE_KEY, FIRESTORE_CLIENT
 from src.services.setup.variables_setup import FRONTEND_VERSION, LLMOPS_API_KEY
 from src.utils.authz.admin_utils import create_firebase_user
 
@@ -15,6 +15,35 @@ from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
 from src.utils.authz.permissions import get_global_user_role
 from src.utils.authz.users import upsert_user_profile
+
+
+def _describe_firebase_auth_error(error: Exception) -> str:
+    error_name = error.__class__.__name__
+    message = str(error or "").strip()
+
+    if error_name == "ExpiredIdTokenError":
+        return "Expired Firebase token"
+    if error_name == "RevokedIdTokenError":
+        return "Revoked Firebase token"
+    if error_name == "InvalidIdTokenError":
+        return "Invalid Firebase token"
+    if error_name == "CertificateFetchError":
+        return "Unable to verify Firebase token certificates"
+    if error_name == "UserDisabledError":
+        return "Firebase user is disabled"
+    if error_name == "UserNotFoundError":
+        return "Firebase user no longer exists"
+    if message:
+        return f"Firebase token verification failed: {message}"
+    return "Firebase token verification failed"
+
+
+def _build_firebase_session_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id_token": payload.get("idToken") or payload.get("id_token"),
+        "refresh_token": payload.get("refreshToken") or payload.get("refresh_token"),
+        "expires_in": payload.get("expiresIn") or payload.get("expires_in"),
+    }
 
 
 def build_login_user_payload(email: str) -> dict:
@@ -79,13 +108,54 @@ def firebase_authenticate(email: str, password: str) -> ResponseModel:
 
         if response.status_code == 200 and "idToken" in response_data:
             logging.info(f"User {email} authenticated successfully.")
-            return ResponseModel(success=True, message="User authenticated successfully", data=response_data.get("idToken"))
+            return ResponseModel(
+                success=True,
+                message="User authenticated successfully",
+                data=_build_firebase_session_payload(response_data),
+            )
         else:
             logging.error(f"Failed to authenticate user {email}. Error: {response_data.get('error')}")
             return ResponseModel(success=False, message="Failed to authenticate user", data=response_data.get("error"))
     except Exception as e:
         logging.error(f"Exception during Firebase authentication for {email}: {e}")
         return ResponseModel(success=False, message="Exception during Firebase authentication", data=str(e))
+
+
+def firebase_refresh_session(refresh_token: str) -> ResponseModel:
+    """
+    Exchanges a Firebase refresh token for a new ID token.
+    """
+    try:
+        url = "https://securetoken.googleapis.com/v1/token"
+        payload = {"grant_type": "refresh_token", "refresh_token": refresh_token}
+        response = requests.post(url, params={"key": FIREBASE_KEY}, data=payload)
+        response_data = response.json()
+        logging.getLogger(__name__).debug(
+            "Firebase refresh response status: %s, body: %s",
+            response.status_code,
+            response_data,
+        )
+
+        if response.status_code == 200 and "id_token" in response_data:
+            return ResponseModel(
+                success=True,
+                message="Session refreshed successfully",
+                data=_build_firebase_session_payload(response_data),
+            )
+
+        logging.error("Failed to refresh Firebase session. Error: %s", response_data.get("error"))
+        return ResponseModel(
+            success=False,
+            message="Failed to refresh session",
+            data=response_data.get("error"),
+        )
+    except Exception as error:
+        logging.error("Exception during Firebase session refresh: %s", error)
+        return ResponseModel(
+            success=False,
+            message="Exception during Firebase session refresh",
+            data=str(error),
+        )
 
 async def authenticate_external_user(email: str, password: str, version: str) -> ResponseModel:
     """
@@ -208,14 +278,16 @@ def validate_user(id_token: str) -> bool:
 
         user = auth.get_user(uid)
         if user:
-            user_details = {"user_id": user.uid, "email": user.email}
             return True
         else:
             logging.getLogger(__name__).debug("No user found for UID: %s", uid)
-            raise HTTPException(status_code=401, detail="Unauthorized user")
+            raise HTTPException(status_code=401, detail="Unauthorized user: Firebase user no longer exists")
+    except HTTPException:
+        raise
     except Exception as e:
-        logging.error(f"Error verifying token or retrieving user: {e}")
-        raise HTTPException(status_code=401, detail="Unauthorized user")
+        detail = _describe_firebase_auth_error(e)
+        logging.error("Error verifying token or retrieving user: %s", detail)
+        raise HTTPException(status_code=401, detail=f"Unauthorized user: {detail}")
 
 def validate_user_and_get_data(id_token: str) -> UserData:
     """
@@ -255,13 +327,16 @@ def validate_user_and_get_data(id_token: str) -> UserData:
             return user_data
         else:
             logging.getLogger(__name__).debug("No user found for UID: %s", uid)
-            raise HTTPException(status_code=401, detail="Unauthorized user")
+            raise HTTPException(status_code=401, detail="Unauthorized user: Firebase user no longer exists")
+    except HTTPException:
+        raise
     except Exception as e:
-        logging.error(f"Error verifying token or retrieving user details/team: {e}")
+        detail = _describe_firebase_auth_error(e)
+        logging.error("Error verifying token or retrieving user details/team: %s", detail)
         logging.getLogger(__name__).debug(
             "Exception in validate_user_and_get_data for %s: %s", id_token, e
         )
-        raise HTTPException(status_code=401, detail="Unauthorized user")
+        raise HTTPException(status_code=401, detail=f"Unauthorized user: {detail}")
 
 
 _bearer_scheme = HTTPBearer(auto_error=False)

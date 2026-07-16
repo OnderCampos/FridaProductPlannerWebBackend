@@ -85,7 +85,7 @@ Rules:
 """.strip()
 
     azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-    raw = await azure.simple_completion(prompt)
+    raw = await azure.simple_completion(prompt, model_tier="mini")
 
     parsed = None
     try:
@@ -142,7 +142,7 @@ Context:
 """.strip()
 
     azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-    return await azure.simple_completion(prompt)
+    return await azure.simple_completion(prompt, model_tier="gpt")
 
 
 def _render_pdf_bytes(title: str, body: str) -> bytes:

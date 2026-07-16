@@ -8,8 +8,8 @@ from src.intelligence.agents.prompts.user_story_document_table_agent_prompt impo
 
 _USER_STORY_DOCUMENT_TABLE_DEPLOYMENT = (
     os.getenv("USER_STORY_DOCUMENT_TABLE_AGENT_DEPLOYMENT")
-    or os.getenv("AZURE_DEPLOYMENT_MINI")
     or os.getenv("AZURE_DEPLOYMENT")
+    or os.getenv("AZURE_DEPLOYMENT_MINI")
 )
 
 

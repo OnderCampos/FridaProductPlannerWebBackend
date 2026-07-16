@@ -9,7 +9,12 @@ from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.schemas.response import ResponseModel
 from src.utils.authz.permissions import get_project_access, get_project_id_for_epic
 from src.utils.authz.users import get_user_profile
-from src.utils.planning.assignees import build_member_lookup, ensure_assignee_email
+from src.utils.planning.assignees import (
+    build_member_lookup,
+    ensure_assignee_email,
+    is_frida_assignee_id,
+    is_frida_assignee_name,
+)
 from src.utils.firebase.identifier import get_next_US_identifier
 from src.schemas.workflow_status import WORKFLOW_STATUS_VALUES, normalize_workflow_status
 
@@ -204,20 +209,51 @@ def _normalize_string_list(value: Optional[Any]) -> List[str]:
 
 def _attach_story_sprint_assignment(story_data: Dict[str, Any], story_id: str) -> Dict[str, Any]:
     """Attach the assigned sprint ID for a story when present."""
-    assignment_query = (
-        FIRESTORE_CLIENT.collection("sprint_items")
-        .where("item_type", "==", "story")
-        .where("item_id", "==", story_id)
-        .limit(1)
-        .get()
-    )
-
-    story_data["sprint_id"] = None
-    if assignment_query:
-        assignment_data = assignment_query[0].to_dict()
-        story_data["sprint_id"] = assignment_data.get("sprint_id")
-
+    story_data["sprint_id"] = get_story_sprint_assignment_map([story_id]).get(story_id)
     return story_data
+
+
+def _chunk_values(values: List[str], chunk_size: int = 30) -> List[List[str]]:
+    normalized = [str(value).strip() for value in values if str(value).strip()]
+    return [normalized[index:index + chunk_size] for index in range(0, len(normalized), chunk_size)]
+
+
+def get_story_sprint_assignment_map(story_ids: List[str]) -> Dict[str, Any]:
+    sprint_map: Dict[str, Any] = {}
+    for chunk in _chunk_values(story_ids):
+        assignments = (
+            FIRESTORE_CLIENT.collection("sprint_items")
+            .where("item_type", "==", "story")
+            .where("item_id", "in", chunk)
+            .get()
+        )
+        for assignment in assignments:
+            assignment_data = assignment.to_dict() or {}
+            item_id = str(assignment_data.get("item_id") or "").strip()
+            if item_id and item_id not in sprint_map:
+                sprint_map[item_id] = assignment_data.get("sprint_id")
+    return sprint_map
+
+
+def _get_story_subtask_hours_map(story_ids: List[str]) -> Dict[str, float]:
+    hours_map: Dict[str, float] = {}
+    for chunk in _chunk_values(story_ids):
+        subtasks = (
+            FIRESTORE_CLIENT.collection("subtasks")
+            .where("user_story_id", "in", chunk)
+            .get()
+        )
+        for subtask in subtasks:
+            subtask_data = subtask.to_dict() or {}
+            story_id = str(subtask_data.get("user_story_id") or "").strip()
+            if not story_id:
+                continue
+            try:
+                estimated_hours = float(subtask_data.get("estimated_hours", 0) or 0)
+            except (TypeError, ValueError):
+                estimated_hours = 0
+            hours_map[story_id] = hours_map.get(story_id, 0.0) + estimated_hours
+    return hours_map
 
 """
 ---------------------------------------------------------------------------------------------------------------------------------------
@@ -277,6 +313,13 @@ def _maybe_send_user_story_assignment_notification(
         previous_email = str(previous_assignee.get("assignee_email") or "").strip().lower()
         updated_email = str(updated_assignee.get("assignee_email") or "").strip().lower()
         if not updated_email:
+            if is_frida_assignee_id(updated_assignee_id) or is_frida_assignee_name(updated_assignee_name):
+                return NotificationService()._notification_result(
+                    False,
+                    "skipped",
+                    "virtual_assignee",
+                    "",
+                )
             return NotificationService()._notification_result(
                 False,
                 "skipped",
@@ -713,24 +756,21 @@ def get_user_stories_by_epic(epic_id: str, user_id: str = None, allow_member: bo
             query = query.where("user_id", "==", user_id)
         
         user_stories_docs = query.get()
+        story_ids = [doc.id for doc in user_stories_docs]
+        subtask_hours_by_story = _get_story_subtask_hours_map(story_ids)
+        sprint_id_by_story = get_story_sprint_assignment_map(story_ids)
         
         user_stories = []
         for doc in user_stories_docs:
             story_data = doc.to_dict()
-            # story_data["id"] = doc.id
-            story_id = doc.id 
-
-            subtasks_docs = FIRESTORE_CLIENT.collection("subtasks").where("user_story_id", "==", story_id).get()
-
-            # Sum estimate_hours from subtasks
-            total_subtask_hours = sum(float(s.to_dict().get("estimated_hours", 0)) for s in subtasks_docs)
+            story_id = doc.id
 
             story_data["id"] = story_id
 
             _normalize_story_payload(story_data)
-            _attach_story_sprint_assignment(story_data, story_id)
+            story_data["sprint_id"] = sprint_id_by_story.get(story_id)
 
-            story_data["effortHours"] = story_data.get("effortHours", 0) + total_subtask_hours
+            story_data["effortHours"] = story_data.get("effortHours", 0) + subtask_hours_by_story.get(story_id, 0.0)
 
             user_stories.append(story_data)
         

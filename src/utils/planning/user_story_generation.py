@@ -187,7 +187,7 @@ Return ONLY valid JSON with EXACTLY {len(payload)} items in the same order:
     parsed: Any = None
     try:
         azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-        raw = await azure.simple_completion(prompt)
+        raw = await azure.simple_completion(prompt, model_tier="gpt")
         parsed = parse_json_response(raw)
     except Exception as exc:
         logging.warning("Failed to enrich acceptanceCriteria/outOfScope: %s", exc)
@@ -329,7 +329,7 @@ Expected JSON format:
     parsed: Any = None
     try:
         azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-        raw = await azure.simple_completion(prompt)
+        raw = await azure.simple_completion(prompt, model_tier="gpt")
         parsed = parse_json_response(raw)
     except Exception as exc:
         logging.warning("Failed to enrich user story details: %s", exc)

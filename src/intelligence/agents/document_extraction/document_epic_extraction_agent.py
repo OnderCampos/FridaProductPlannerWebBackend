@@ -8,8 +8,8 @@ from src.intelligence.agents.prompts.document_epic_extraction_agent_prompt impor
 
 _DOCUMENT_EPIC_EXTRACTION_DEPLOYMENT = (
     os.getenv("DOCUMENT_EPIC_EXTRACTION_AGENT_DEPLOYMENT")
-    or os.getenv("AZURE_DEPLOYMENT_MINI")
     or os.getenv("AZURE_DEPLOYMENT")
+    or os.getenv("AZURE_DEPLOYMENT_MINI")
 )
 
 
