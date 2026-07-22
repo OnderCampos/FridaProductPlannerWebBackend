@@ -4,15 +4,11 @@ import logging
 
 from src.intelligence.agents.json_executor import parse_json_response
 from src.intelligence.graphs.user_story_graph import run_user_story_generation_graph
-from src.intelligence.agents.user_story_generation.analysis_agent import (
-    USER_STORY_ANALYSIS_AGENT,
-)
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
 from src.services.azure_services import AzureChatService
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
-from src.utils.planning.user_story_dependencies import generate_and_persist_user_story_dependencies
 from src.utils.planning.user_stories import create_multiple_user_stories, _current_timestamp_iso
 
 
@@ -187,7 +183,7 @@ Return ONLY valid JSON with EXACTLY {len(payload)} items in the same order:
     parsed: Any = None
     try:
         azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-        raw = await azure.simple_completion(prompt, model_tier="gpt")
+        raw = await azure.simple_completion(prompt, model_tier="mini")
         parsed = parse_json_response(raw)
     except Exception as exc:
         logging.warning("Failed to enrich acceptanceCriteria/outOfScope: %s", exc)
@@ -329,7 +325,7 @@ Expected JSON format:
     parsed: Any = None
     try:
         azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-        raw = await azure.simple_completion(prompt, model_tier="gpt")
+        raw = await azure.simple_completion(prompt, model_tier="mini")
         parsed = parse_json_response(raw)
     except Exception as exc:
         logging.warning("Failed to enrich user story details: %s", exc)
@@ -440,35 +436,30 @@ async def generate_analysis(
         
         project = project_response.data
 
-        response = USER_STORY_ANALYSIS_AGENT.bind_context({"user_data": user_data}).execute(
-            epic=epic,
-            project_description=project["description"],
+        role_values = epic.get("roles") or project.get("roles") or []
+        users = []
+        if isinstance(role_values, list):
+            for role in role_values:
+                role_name = str(role or "").strip()
+                if not role_name:
+                    continue
+                users.append(
+                    {
+                        "role": role_name,
+                        "permissions": "",
+                        "interactions": "",
+                        "needs": "",
+                    }
+                )
+
+        return ResponseModel(
+            success=True,
+            message="Epic analysis compatibility response generated successfully",
+            data={
+                "users": users,
+                "functionalities": [],
+            },
         )
-
-        analysis = parse_json_response(response)
-        if isinstance(analysis, dict):
-            users = analysis.get("epic_analysis", {}).get("users", [])
-            functionalities = analysis.get("epic_analysis", {}).get(
-                "functionalities", []
-            )
-
-            # Return the populated values
-            return ResponseModel(
-                success=True,
-                message="Successfully identified users and functionalities",
-                data={
-                    "users": users,
-                    "functionalities": functionalities,
-                },
-            )
-        else:
-            # Handle case where analysis failed to parse
-            print("Warning: Could not parse user analysis as JSON, using empty lists")
-            return ResponseModel(
-                success=True,
-                message="Analysis completed but could not parse structured data",
-                data={"users": [], "functionalities": [], "raw_response": response},
-            )
 
     except Exception as e:
         logging.error(f"Error in generate_analysis: {e}")
@@ -521,16 +512,6 @@ async def generate_user_stories(
         template_data = graph_state.get("template_data") or {}
 
         if response:
-            epic = graph_state.get("epic") or {}
-            project = graph_state.get("project") or {}
-            if isinstance(epic, dict) and isinstance(project, dict):
-                response = await enrich_user_story_details(
-                    user_data=user_data,
-                    epic=epic,
-                    project=project,
-                    stories=response,
-                )
-
             print("[DEBUG] User stories generated successfully via graph")
             print(f"[DEBUG] Generated user stories response: {response}")
 
@@ -544,32 +525,13 @@ async def generate_user_stories(
 
             if save_result.success:
                 saved_stories = save_result.data if isinstance(save_result.data, list) else []
-                updated_stories = saved_stories
-
-                dependencies_result = await generate_and_persist_user_story_dependencies(
-                    user_data=user_data,
-                    epic_id=epic_id,
-                    user_stories=saved_stories,
-                )
-                if (
-                    dependencies_result.success
-                    and isinstance(dependencies_result.data, dict)
-                    and isinstance(dependencies_result.data.get("user_stories"), list)
-                ):
-                    updated_stories = dependencies_result.data.get("user_stories") or []
-                elif not dependencies_result.success:
-                    logging.warning(
-                        "Generated user stories for epic %s were saved without refreshed dependencies: %s",
-                        epic_id,
-                        dependencies_result.message,
-                    )
 
                 print("[DEBUG] User stories saved successfully")
                 return ResponseModel(
                     success=True,
                     message="User stories generated and saved successfully for functionality",
                     data={
-                        "user_stories": updated_stories,
+                        "user_stories": saved_stories,
                         "generated_count": len(response),
                     },
                 )

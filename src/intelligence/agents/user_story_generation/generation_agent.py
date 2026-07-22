@@ -18,10 +18,9 @@ USER_STORY_GENERATION_AGENT = Agent(
     task=GENERATE_EPIC_PROMPT,
     azure_deployment=_USER_STORY_GENERATION_DEPLOYMENT,
     args=[
-        "functionality",
-        "users",
         "epic",
-        "functionalities",
+        "project_name",
+        "project_description",
         "template_field_keys",
         "template_fields_json",
         "fields_description",

@@ -2,9 +2,6 @@ import logging
 from typing import Any, Dict, List, Optional, TypedDict
 
 from src.intelligence.agents.json_executor import execute_agent, parse_json_response
-from src.intelligence.agents.user_story_generation.analysis_agent import (
-    USER_STORY_ANALYSIS_AGENT,
-)
 from src.intelligence.agents.user_story_generation.generation_agent import (
     USER_STORY_GENERATION_AGENT,
 )
@@ -40,10 +37,6 @@ class UserStoryGraphState(TypedDict, total=False):
     fields_description: str
     detailed_expected_keys: List[str]
 
-    analysis: Dict[str, Any]
-    users: List[Any]
-    analyzed_functionalities: List[Any]
-    functionality_worklist: List[str]
     brainstorm_batches: List[List[Dict[str, Any]]]
     synthesized_user_stories: List[Dict[str, Any]]
 
@@ -143,66 +136,10 @@ def _load_context_node(state: UserStoryGraphState) -> Dict[str, Any]:
     }
 
 
-def _analyze_node(state: UserStoryGraphState) -> Dict[str, Any]:
-    user_data = state.get("user_data")
-    epic = state.get("epic") or {}
-    project = state.get("project") or {}
-
-    raw_response = USER_STORY_ANALYSIS_AGENT.bind_context({"user_data": user_data}).execute(
-        epic=epic,
-        project_description=project.get("description", ""),
-    )
-    analysis = parse_json_response(raw_response)
-    if not isinstance(analysis, dict):
-        return {
-            "analysis": {},
-            "users": [],
-            "analyzed_functionalities": [],
-        }
-
-    users = analysis.get("epic_analysis", {}).get("users", [])
-    functionalities = analysis.get("epic_analysis", {}).get("functionalities", [])
-    return {
-        "analysis": analysis,
-        "users": users if isinstance(users, list) else [],
-        "analyzed_functionalities": functionalities if isinstance(functionalities, list) else [],
-    }
-
-
 def _brainstorm_node(state: UserStoryGraphState) -> Dict[str, Any]:
     user_data = state.get("user_data")
     epic = state.get("epic") or {}
     project = state.get("project") or {}
-    users = state.get("users") or []
-    analyzed_functionalities = state.get("analyzed_functionalities") or []
-
-    requested_functionality = state.get("requested_functionality")
-    requested_functionalities = state.get("requested_functionalities") or []
-
-    worklist: List[str] = []
-    if isinstance(requested_functionality, str) and requested_functionality.strip():
-        worklist.append(requested_functionality.strip())
-    for item in requested_functionalities:
-        value = _normalize_functionality_text(item)
-        if value:
-            worklist.append(value)
-    if not worklist:
-        for item in analyzed_functionalities:
-            value = _normalize_functionality_text(item)
-            if value:
-                worklist.append(value)
-    if not worklist:
-        worklist.append("Core epic functionality")
-
-    dedup_worklist: List[str] = []
-    seen = set()
-    for item in worklist:
-        key = item.lower().strip()
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup_worklist.append(item)
-    worklist = dedup_worklist[:1]
 
     detailed_expected_keys = state.get("detailed_expected_keys") or [
         "epic",
@@ -218,40 +155,114 @@ def _brainstorm_node(state: UserStoryGraphState) -> Dict[str, Any]:
     template_fields_json = state.get("template_fields_json", "")
     fields_description = state.get("fields_description", "")
 
-    brainstorm_batches: List[List[Dict[str, Any]]] = []
-    functionalities_context = analyzed_functionalities or requested_functionalities or worklist
-    users_context = users or (project.get("roles", []) if isinstance(project, dict) else [])
+    stories_batch = execute_agent(
+        agent=USER_STORY_GENERATION_AGENT,
+        prompt_kwargs={
+            "epic": epic,
+            "project_name": str(project.get("name") or "").strip(),
+            "project_description": str(project.get("description") or "").strip(),
+            "template_field_keys": template_field_keys,
+            "template_fields_json": template_fields_json,
+            "fields_description": fields_description,
+        },
+        key="user_stories",
+        attempts=1,
+        expected_keys=[],
+        context={"user_data": user_data},
+    )
 
-    for current_functionality in worklist:
-        stories_batch = execute_agent(
-            agent=USER_STORY_GENERATION_AGENT,
-            prompt_kwargs={
-                "functionality": current_functionality,
-                "users": users_context,
-                "epic": epic,
-                "functionalities": functionalities_context,
-                "template_field_keys": template_field_keys,
-                "template_fields_json": template_fields_json,
-                "fields_description": fields_description,
-            },
-            key="user_stories",
-            expected_keys=detailed_expected_keys,
-            context={"user_data": user_data},
-        )
-        if isinstance(stories_batch, list) and stories_batch:
-            brainstorm_batches.append(stories_batch)
+    brainstorm_batches: List[List[Dict[str, Any]]] = []
+    if isinstance(stories_batch, list) and stories_batch:
+        brainstorm_batches.append(stories_batch)
 
     if not brainstorm_batches:
         return {"error": "Failed to generate user stories during brainstorm step."}
 
+    return {"brainstorm_batches": brainstorm_batches}
+
+
+def _normalize_story_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    items: List[str] = []
+    for raw_line in text.splitlines():
+        line = str(raw_line).strip()
+        if not line:
+            continue
+        for prefix in ("- ", "* ", "• "):
+            if line.startswith(prefix):
+                line = line[len(prefix):].strip()
+                break
+        if line:
+            items.append(line)
+    return items
+
+
+def _normalize_story_document(story: Dict[str, Any], acceptance: List[str], out_of_scope: List[str]) -> Dict[str, str]:
+    raw_document = story.get("document")
+    document = raw_document if isinstance(raw_document, dict) else {}
+    description = str(story.get("description") or "").strip()
     return {
-        "functionality_worklist": worklist,
-        "brainstorm_batches": brainstorm_batches,
+        "description_and_scope": str(document.get("description_and_scope") or description or "N/A").strip(),
+        "out_of_scope": str(document.get("out_of_scope") or "\n".join(f"- {item}" for item in out_of_scope) or "N/A").strip(),
+        "preconditions": str(document.get("preconditions") or "N/A").strip(),
+        "entry_points": str(document.get("entry_points") or "N/A").strip(),
+        "output_points": str(document.get("output_points") or "N/A").strip(),
+        "success_flow": str(document.get("success_flow") or "N/A").strip(),
+        "wireframe_mockup": str(document.get("wireframe_mockup") or "N/A").strip(),
+        "field_description": str(document.get("field_description") or "N/A").strip(),
+        "api_description": str(document.get("api_description") or "N/A").strip(),
+        "acceptance_criteria": str(document.get("acceptance_criteria") or "\n".join(f"- {item}" for item in acceptance) or "N/A").strip(),
+        "test_scenarios": str(document.get("test_scenarios") or "N/A").strip(),
+        "benefits": str(document.get("benefits") or "N/A").strip(),
+        "estimation_dev": str(document.get("estimation_dev") or "N/A").strip(),
     }
+
+
+def _normalize_generated_story(
+    story: Dict[str, Any],
+    *,
+    epic_name: str,
+    order: int,
+) -> Optional[Dict[str, Any]]:
+    user_story = str(story.get("user_story") or "").strip()
+    description = str(story.get("description") or "").strip()
+    user_story_id = str(story.get("user_story_id") or "").strip()
+    if not user_story or not description or not user_story_id:
+        return None
+
+    acceptance = _normalize_story_list(story.get("acceptanceCriteria"))
+    if not acceptance:
+        acceptance = ["Not provided."]
+
+    out_of_scope = _normalize_story_list(story.get("outOfScope"))
+    if not out_of_scope:
+        out_of_scope = ["N/A"]
+
+    dependencies = _normalize_story_list(story.get("dependencies"))
+
+    normalized = dict(story)
+    normalized["epic"] = str(story.get("epic") or epic_name).strip()
+    normalized["user_story"] = user_story
+    normalized["description"] = description
+    normalized["user_story_id"] = user_story_id
+    normalized["order"] = order
+    normalized["story_points"] = int(story.get("story_points") or story.get("storyPoints") or 0)
+    normalized["effortHours"] = float(story.get("effortHours") or story.get("effort_hours") or 0)
+    normalized["dependencies"] = dependencies
+    normalized["acceptanceCriteria"] = acceptance
+    normalized["outOfScope"] = out_of_scope
+    normalized["document"] = _normalize_story_document(normalized, acceptance, out_of_scope)
+    return normalized
 
 
 def _synthesize_node(state: UserStoryGraphState) -> Dict[str, Any]:
     brainstorm_batches = state.get("brainstorm_batches") or []
+    epic = state.get("epic") or {}
+    epic_name = str(epic.get("name") or epic.get("epic") or "").strip()
     flattened: List[Dict[str, Any]] = []
     for batch in brainstorm_batches:
         if not isinstance(batch, list):
@@ -263,6 +274,8 @@ def _synthesize_node(state: UserStoryGraphState) -> Dict[str, Any]:
     deduped: List[Dict[str, Any]] = []
     seen = set()
     for story in flattened:
+        if not isinstance(story, dict):
+            continue
         story_id = str(story.get("user_story_id") or "").strip().lower()
         story_title = str(story.get("user_story") or "").strip().lower()
         dedupe_key = story_id or story_title
@@ -271,10 +284,14 @@ def _synthesize_node(state: UserStoryGraphState) -> Dict[str, Any]:
         if dedupe_key in seen:
             continue
         seen.add(dedupe_key)
-        deduped.append(dict(story))
-
-    for index, story in enumerate(deduped, start=1):
-        story["order"] = index
+        normalized_story = _normalize_generated_story(
+            dict(story),
+            epic_name=epic_name,
+            order=len(deduped) + 1,
+        )
+        if normalized_story is None:
+            continue
+        deduped.append(normalized_story)
 
     if not deduped:
         return {"error": "Synthesis produced no user stories."}
@@ -296,7 +313,6 @@ def _run_sequential_fallback(initial_state: UserStoryGraphState) -> UserStoryGra
     state: UserStoryGraphState = dict(initial_state)
     for node in (
         _load_context_node,
-        _analyze_node,
         _brainstorm_node,
         _synthesize_node,
         _validate_node,
@@ -326,7 +342,6 @@ def run_user_story_generation_graph(
 
     graph = StateGraph(UserStoryGraphState)
     graph.add_node("load_context", _load_context_node)
-    graph.add_node("analyze", _analyze_node)
     graph.add_node("brainstorm", _brainstorm_node)
     graph.add_node("synthesize", _synthesize_node)
     graph.add_node("validate", _validate_node)
@@ -334,11 +349,6 @@ def run_user_story_generation_graph(
     graph.add_edge(START, "load_context")
     graph.add_conditional_edges(
         "load_context",
-        _route_on_error,
-        {"ok": "analyze", "error": END},
-    )
-    graph.add_conditional_edges(
-        "analyze",
         _route_on_error,
         {"ok": "brainstorm", "error": END},
     )
