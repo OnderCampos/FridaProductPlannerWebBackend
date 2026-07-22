@@ -77,8 +77,8 @@ def _maybe_sprint_assignment_notification(
         leader_name = leader_data.get("name", "")
 
         # If the leader has made the change , we do not send the email
-        if user_email and user_email.lower() == leader_email.lower():
-                return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
+        # if user_email and user_email.lower() == leader_email.lower():
+        #     return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
 
         collection_name = "user_stories" if item_type.lower() == "story" else "subtasks"
         item_doc = FIRESTORE_CLIENT.collection(collection_name).document(item_id).get()

@@ -81,6 +81,7 @@ Thumbs.db
 !.env.example
 
 # Firebase credentials
+src/services/auth/firebase_old.json
 src/services/auth/firebase.json
 
 *.pem

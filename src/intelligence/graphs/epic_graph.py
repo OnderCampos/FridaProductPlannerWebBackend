@@ -213,6 +213,8 @@ def _brainstorm_roles_node(state: EpicGraphState) -> Dict[str, Any]:
 
     role_brainstorms: List[Dict[str, Any]] = []
 
+    roles = roles[:3]
+
     for role_profile in roles:
         if not isinstance(role_profile, dict):
             continue

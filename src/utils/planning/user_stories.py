@@ -334,14 +334,14 @@ def _maybe_send_user_story_assignment_notification(
                 "Assignment email was not sent because the assignee did not change.",
             )
 
-        actor_email = str(user_email or "").strip().lower()
-        if actor_email and updated_email == actor_email:
-            return NotificationService()._notification_result(
-                False,
-                "skipped",
-                "self_assigned",
-                "Assignment email was not sent because the user assigned the story to themselves.",
-            )
+        # actor_email = str(user_email or "").strip().lower()
+        # if actor_email and updated_email == actor_email:
+        #     return NotificationService()._notification_result(
+        #         False,
+        #         "skipped",
+        #         "self_assigned",
+        #         "Assignment email was not sent because the user assigned the story to themselves.",
+        #     )
 
         project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
         project_name = ""
@@ -464,8 +464,8 @@ def _maybe_send_user_story_updated_notification(
         leader_name = leader_data.get("name", "")
 
         # If the leader has made the change , we do not send the email
-        if user_email and user_email.lower() == leader_email.lower():
-            return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
+        # if user_email and user_email.lower() == leader_email.lower():
+        #     return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
 
         # Get who has made the change
         user_story_title = str(updated_story.get("user_story") or "").strip()

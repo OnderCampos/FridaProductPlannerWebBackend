@@ -202,7 +202,7 @@ def _brainstorm_node(state: UserStoryGraphState) -> Dict[str, Any]:
             continue
         seen.add(key)
         dedup_worklist.append(item)
-    worklist = dedup_worklist
+    worklist = dedup_worklist[:1]
 
     detailed_expected_keys = state.get("detailed_expected_keys") or [
         "epic",

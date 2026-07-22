@@ -17,12 +17,11 @@ Epic context (for reference only):
 All functionalities in this epic (for reference to avoid overlap):
 {functionalities}
 
-ATOMIC USER STORY CREATION PROCESS:
-1. For the functionality provided, create a SEPARATE atomic user story for EACH user role that would interact with it
-2. For EACH specific action a user can take with this functionality, create a SEPARATE user story
-3. Do NOT combine multiple roles into a single user story
-4. For CRUD operations, create a SEPARATE user story for EACH operation (Create, Read, Update, Delete)
-5. Include user stories for error handling and edge cases related to this functionality
+USER STORY CREATION PROCESS & STRICT LIMITS:
+1. CRITICAL RULE: You MUST generate a MAXIMUM of 3 to 5 user stories for the provided functionality.
+2. CONSOLIDATE ACTIONS: Do NOT create separate stories for every single CRUD operation or minor action. Group related actions (e.g., Create, Read, Update, Delete) into a single, cohesive user story if they serve the same user goal.
+3. ERROR HANDLING: Include error handling and edge cases as "Acceptance Criteria" within the main user stories. Do NOT create separate user stories solely for error handling.
+4. ROLE FOCUS: Focus only on the primary user role that derives the most value from this functionality. Do not create duplicate stories just to cover every minor role.
 
 For each user story, provide the following information: User Story, Description, Order, Dependencies, Story Points, Effort Hours, {template_field_keys}
 

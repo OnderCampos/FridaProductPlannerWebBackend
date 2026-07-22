@@ -249,8 +249,8 @@ def _maybe_send_subtask_updated_notification(
             return NotificationService()._notification_result(False, "skipped", "admin_not_found", "Admin Project not found")
 
         # If the leader has made the change , we do not send the email
-        if user_email and user_email.lower() == leader_email.lower():
-                return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
+        # if user_email and user_email.lower() == leader_email.lower():
+        #     return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
 
         leader_data = leader_doc.to_dict() or {}
         leader_name = leader_data.get("name", "")
@@ -361,7 +361,7 @@ def _maybe_send_subtask_assignment_notification(
 
     except Exception as e:
         import traceback
-        print(f"🔥 ERROR EN NOTIFICACIÓN DE ASIGNACIÓN DE SUBTAREA: {e}")
+        print(f"ERROR EN NOTIFICACIÓN DE ASIGNACIÓN DE SUBTAREA: {e}")
         traceback.print_exc()
         return NotificationService()._notification_result(False, "failed", "error", "Subtask assignment notification failed.")
 

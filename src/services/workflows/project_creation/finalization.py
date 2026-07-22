@@ -660,10 +660,10 @@ async def _finalize_from_epic_generation(
         project_id=project_id,
         epics=epics_list,
     )
-    user_story_generation, generated_user_stories_count = await _generate_missing_user_stories_for_epics(
-        user_data=user_data,
-        epics=created_epics,
-    )
+    # user_story_generation, generated_user_stories_count = await _generate_missing_user_stories_for_epics(
+    #     user_data=user_data,
+    #     epics=created_epics,
+    # )
 
     # Use one timestamp across all writes for consistency.
     now = current_timestamp_iso()
@@ -688,8 +688,10 @@ async def _finalize_from_epic_generation(
         technical_stack=technical_stack if isinstance(technical_stack, list) else [],
         roles=roles if isinstance(roles, list) else [],
         epics=created_epics,
-        generated_user_stories_count=generated_user_stories_count,
-        user_story_generation=user_story_generation,
+        generated_user_stories_count=0,
+        user_story_generation=[]
+        # generated_user_stories_count=generated_user_stories_count,
+        # user_story_generation=user_story_generation,
     )
 
 
