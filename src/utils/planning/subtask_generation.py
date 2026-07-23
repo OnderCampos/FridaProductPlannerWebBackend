@@ -10,7 +10,7 @@ from src.services.notifications import NotificationService
 from src.prompts.subtask_generation import GENERATE_SUBTASKS_PROMPT
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
-from src.services.azure_services import AzureChatService
+from src.intelligence.runtime import AgentName, run_agent
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.services.setup.variables_setup import LLMOPS_API_KEY
 from src.utils.authz.permissions import get_project_access
@@ -742,13 +742,14 @@ async def _estimate_project_task_fields(
     }
 
     try:
-        azure_services = AzureChatService(LLMOPS_API_KEY, user_data, None)
-        raw = await azure_services.simple_completion(
+        raw = await run_agent(
+            AgentName.TASK_ESTIMATION,
             TASK_ESTIMATION_PROMPT.format(
                 task_type=task_type,
                 title=title.strip() or "Untitled task",
                 description=description.strip() or "No additional description provided.",
             ),
+            user_data,
             model_tier="mini",
         )
 
@@ -796,8 +797,8 @@ async def _generate_project_task_tips(
     )
 
     try:
-        azure_services = AzureChatService(LLMOPS_API_KEY, user_data, None)
-        raw = await azure_services.simple_completion(
+        raw = await run_agent(
+            AgentName.IMPLEMENTATION_GUIDANCE,
             TASK_TIPS_PROMPT.format(
                 tech_stack=tech_stack_text,
                 task_type=task_type,
@@ -805,6 +806,7 @@ async def _generate_project_task_tips(
                 description=fallback_description,
                 repository_context=repository_context_text,
             ),
+            user_data,
             model_tier="mini",
         )
         normalized = str(raw or "").strip()
@@ -829,9 +831,10 @@ async def _generate_project_tasks_from_text(
     }
 
     try:
-        azure_services = AzureChatService(LLMOPS_API_KEY, user_data, None)
-        raw = await azure_services.simple_completion(
+        raw = await run_agent(
+            AgentName.TASK_PLANNING,
             PROJECT_TASK_BATCH_PROMPT.format(source_text=cleaned_text),
+            user_data,
             model_tier="mini",
         )
         payload_text = get_code_block(raw) or raw
@@ -1521,7 +1524,6 @@ async def generate_subtasks_for_user_story(
             for field in story_data["fields"]:
                 additional_fields_text += f"- {field['name']}: {field['value']}\n"
 
-        azure_services = AzureChatService(LLMOPS_API_KEY, user_data, None)
         prompt = GENERATE_SUBTASKS_PROMPT.format(
             user_story=story_data.get("user_story", ""),
             description=story_data.get("description", ""),
@@ -1531,7 +1533,7 @@ async def generate_subtasks_for_user_story(
             additional_fields=additional_fields_text if additional_fields_text else "No additional fields",
         )
 
-        response = await azure_services.simple_completion(prompt, model_tier="gpt")
+        response = await run_agent(AgentName.TASK_PLANNING, prompt, user_data, model_tier="gpt")
         subtasks_json = get_code_block(response)
 
         if subtasks_json:

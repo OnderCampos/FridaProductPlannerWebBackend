@@ -6,7 +6,7 @@ from src.intelligence.agents.json_executor import parse_json_response
 from src.intelligence.graphs.user_story_graph import run_user_story_generation_graph
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
-from src.services.azure_services import AzureChatService
+from src.intelligence.runtime import AgentName, run_agent
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
 from src.utils.planning.user_stories import create_multiple_user_stories, _current_timestamp_iso
@@ -182,8 +182,7 @@ Return ONLY valid JSON with EXACTLY {len(payload)} items in the same order:
 
     parsed: Any = None
     try:
-        azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-        raw = await azure.simple_completion(prompt, model_tier="mini")
+        raw = await run_agent(AgentName.USER_STORY_GENERATION, prompt, user_data, model_tier="mini")
         parsed = parse_json_response(raw)
     except Exception as exc:
         logging.warning("Failed to enrich acceptanceCriteria/outOfScope: %s", exc)
@@ -324,8 +323,7 @@ Expected JSON format:
 
     parsed: Any = None
     try:
-        azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-        raw = await azure.simple_completion(prompt, model_tier="mini")
+        raw = await run_agent(AgentName.USER_STORY_GENERATION, prompt, user_data, model_tier="mini")
         parsed = parse_json_response(raw)
     except Exception as exc:
         logging.warning("Failed to enrich user story details: %s", exc)
@@ -493,6 +491,27 @@ async def generate_user_stories(
         ResponseModel: Generated user stories
     """
     try:
+        # Generation can be retried by the project-creation UI when a request is
+        # interrupted.  Keep that retry idempotent so a successful first write is
+        # not duplicated if its response never reached the browser.
+        existing_response = get_user_stories_by_epic(epic_id, user_data.get_user_id())
+        existing_stories = (
+            existing_response.data
+            if existing_response.success and isinstance(existing_response.data, list)
+            else []
+        )
+        if existing_stories:
+            return ResponseModel(
+                success=True,
+                message="User stories already exist for this epic.",
+                data={
+                    "user_stories": existing_stories,
+                    "generated_count": 0,
+                    "existing_count": len(existing_stories),
+                    "skipped": True,
+                },
+            )
+
         graph_state = run_user_story_generation_graph(
             user_data=user_data,
             epic_id=epic_id,

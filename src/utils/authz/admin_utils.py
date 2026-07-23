@@ -8,8 +8,7 @@ from types import SimpleNamespace
 from firebase_admin import auth
 from datetime import datetime, timedelta
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
-from src.services.azure_services import AzureChatService
-from src.services.setup.variables_setup import LLMOPS_API_KEY
+from src.intelligence.runtime import AgentName, run_agent
 from src.utils.core.validation_utils import get_code_block
 from src.schemas.response import ResponseModel
 from src.prompts.admin_prompts import TRANSFORM_USER_DATA_PROMPT, TRANSFORM_TEXT_TO_USER_JSON_PROMPT
@@ -404,16 +403,16 @@ async def transform_user_data(user_data: dict) -> dict:
     """
     try:
         # Initialize Azure Chat Service
-        azure_chat_service = AzureChatService(LLMOPS_API_KEY, user_data, None)
-        
         # Format the prompt with user data
         formatted_prompt = TRANSFORM_USER_DATA_PROMPT.format(
             user_data=json.dumps(user_data)
         )
         
         # Call the Azure Chat Service with the prompt
-        response = await azure_chat_service.simple_completion(
-            prompt=formatted_prompt,
+        response = await run_agent(
+            AgentName.CONTENT_CLEANUP,
+            formatted_prompt,
+            user_data,
             model_tier="mini",
         )
         transformed_data = json.loads(response)
@@ -436,11 +435,6 @@ async def transform_user_data_with_llm(user_data: dict, team_id: str, text_data:
     try:
         print("Transforming user data with LLM...")
         # Initialize ChatSession
-        chat_session = AzureChatService(
-            LLMOPS_API_KEY,
-            user_data,
-            None
-        )
         print("Chat session initialized, team_id:", team_id, "and text_data:", text_data)
         # Format the prompt with team_id and text_data
         formatted_prompt = TRANSFORM_TEXT_TO_USER_JSON_PROMPT.format(
@@ -450,8 +444,10 @@ async def transform_user_data_with_llm(user_data: dict, team_id: str, text_data:
         print("Formatted Prompt:", formatted_prompt)
         
         # Get completion from Azure OpenAI
-        result = await chat_session.simple_completion(
-            prompt=formatted_prompt,
+        result = await run_agent(
+            AgentName.CONTENT_CLEANUP,
+            formatted_prompt,
+            user_data,
             model_tier="mini",
         )
 

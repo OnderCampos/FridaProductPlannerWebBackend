@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
-from src.services.azure_services import AzureChatService
+from src.intelligence.runtime import AgentName, run_agent
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.utils.core.validation_utils import get_code_block
 
@@ -175,8 +175,7 @@ Rules:
 - If complete is true, questions must be an empty array.
 """.strip()
 
-    azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-    raw = await azure.simple_completion(prompt, model_tier="mini")
+    raw = await run_agent(AgentName.CONTENT_CLEANUP, prompt, user_data, model_tier="mini")
     parsed = _safe_json_load(raw)
     if not isinstance(parsed, dict):
         return {"complete": False, "questions": []}
@@ -267,8 +266,7 @@ Rules:
 - outOfScope must contain at least 1 item (use \"N/A\" if truly none).
 """.strip()
 
-    azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-    raw = await azure.simple_completion(prompt, model_tier="gpt")
+    raw = await run_agent(AgentName.USER_STORY_GENERATION, prompt, user_data, model_tier="gpt")
     parsed = _safe_json_load(raw)
     if not isinstance(parsed, dict):
         return {}

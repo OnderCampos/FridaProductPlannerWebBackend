@@ -4,10 +4,10 @@ from typing import Any, Dict, List
 
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
-from src.services.azure_services import AzureChatService
-from src.services.setup.variables_setup import LLMOPS_API_KEY
+from src.intelligence.runtime import AgentName, run_agent
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.prompts.user_story_dependencies import GENERATE_USER_STORY_DEPENDENCIES_PROMPT
+from src.utils.core.validation_utils import get_code_block
 
 
 def _build_valid_story_ids(user_stories: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -141,12 +141,17 @@ async def generate_user_story_dependencies(
             user_stories_json=json.dumps(user_stories),
         )
 
-        azure_services = AzureChatService(LLMOPS_API_KEY, user_data, None)
-        dependencies_response = await azure_services.completion_without_knowledge_base(
+        raw_response = await run_agent(
+            AgentName.DEPENDENCY_ANALYSIS,
             prompt,
-            key="dependencies",
-            expected_keys=["story_id", "depends_on"],
+            user_data,
             model_tier="mini",
+        )
+        parsed_response = json.loads(get_code_block(raw_response) or raw_response)
+        dependencies_response = (
+            parsed_response.get("dependencies")
+            if isinstance(parsed_response, dict)
+            else parsed_response
         )
 
         if dependencies_response is None:

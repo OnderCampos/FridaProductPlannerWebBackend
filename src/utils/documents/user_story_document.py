@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
-from src.services.azure_services import AzureChatService
+from src.intelligence.runtime import AgentName, run_agent
 from src.services.setup.firebase_setup import FIREBASE, FIRESTORE_CLIENT
 from src.services.setup.language_setup import get_default_llm_language, normalize_language
 from src.utils.core.validation_utils import get_code_block
@@ -211,8 +211,7 @@ Input JSON:
 """.strip()
 
     try:
-        azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-        raw = await azure.simple_completion(prompt, model_tier="mini")
+        raw = await run_agent(AgentName.USER_STORY_DOCUMENT, prompt, user_data, model_tier="mini")
         parsed = _safe_json_load(raw)
         if not isinstance(parsed, dict):
             return document

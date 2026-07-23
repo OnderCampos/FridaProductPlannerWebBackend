@@ -16,7 +16,8 @@ from langchain_core.tools import StructuredTool
 
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
-from src.services.setup.variables_setup import gpt40_mini_client
+from src.schemas.workflow_status import coerce_workflow_status, normalize_workflow_status
+from src.intelligence.runtime import AgentName, bind_agent_tools
 from src.services.setup.language_setup import get_default_llm_language, normalize_language
 from src.utils.planning.epics import (
     create_epic,
@@ -121,7 +122,7 @@ def _story_title(story: Dict[str, Any]) -> str:
 
 
 def _story_status(story: Dict[str, Any]) -> str:
-    return story.get("status") or "To Do"
+    return coerce_workflow_status(story.get("status"), default="To Do")
 
 
 def _normalize_history(history: Optional[List[Dict[str, Any]]]) -> List[BaseMessage]:
@@ -140,37 +141,8 @@ def _normalize_history(history: Optional[List[Dict[str, Any]]]) -> List[BaseMess
     return messages
 
 
-VALID_ITEM_STATUSES = {
-    "To Do",
-    "In Progress",
-    "In Review",
-    "Stopped",
-    "Done",
-}
-
-
 def _normalize_item_status(status_value: Any) -> Optional[str]:
-    if status_value is None:
-        return None
-
-    normalized = str(status_value).strip().lower().replace("_", " ")
-    status_map = {
-        "todo": "To Do",
-        "to do": "To Do",
-        "in progress": "In Progress",
-        "inprogress": "In Progress",
-        "in review": "In Review",
-        "inreview": "In Review",
-        "testing": "In Review",
-        "stopped": "Stopped",
-        "blocked": "Stopped",
-        "done": "Done",
-        "rework": "In Progress",
-    }
-    status = status_map.get(normalized)
-    if status in VALID_ITEM_STATUSES:
-        return status
-    return None
+    return normalize_workflow_status(status_value)
 
 
 def _project_id_for_item(item_type: str, item_id: str) -> Optional[str]:
@@ -452,7 +424,7 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
                 "priority": fields.get("priority"),
                 "story_points": fields.get("storyPoints", fields.get("story_points", 0)),
                 "dueDate": fields.get("dueDate", fields.get("due_date")),
-                "status": _normalize_item_status(fields.get("status")) or fields.get("status") or "To Do",
+                "status": coerce_workflow_status(fields.get("status"), default="To Do"),
                 "effortHours": fields.get("effortHours", fields.get("effort_hours", 0)),
                 "dependencies": fields.get("dependencies") if isinstance(fields.get("dependencies"), list) else [],
             },
@@ -760,7 +732,7 @@ def execute_project_chat_action(user_data: UserData, action: Dict[str, Any]) -> 
                 "estimated_hours": fields.get("estimated_hours", 0),
                 "complexity": str(fields.get("complexity") or "Medium").strip() or "Medium",
                 "dependencies": fields.get("dependencies") if isinstance(fields.get("dependencies"), list) else [],
-                "status": _normalize_item_status(fields.get("status")) or fields.get("status") or "To Do",
+                "status": coerce_workflow_status(fields.get("status"), default="To Do"),
             },
         )
         return _action_result(action_type, action_id, operation)
@@ -1262,7 +1234,7 @@ def run_project_chat_agent(
                         "project_id": scoped_project_id,
                         "project_name": project_name,
                         "project_key": project_key,
-                        "status": epic.get("status"),
+                        "status": coerce_workflow_status(epic.get("status"), default="To Do"),
                         "score": score,
                         "match_basis": match_basis,
                     }
@@ -1526,7 +1498,7 @@ def run_project_chat_agent(
                     "project_name": candidate.get("project_name"),
                     "epic_id": candidate.get("epic_id"),
                     "epic_name": candidate.get("epic_name"),
-                    "status": candidate.get("status"),
+                    "status": coerce_workflow_status(candidate.get("status"), default="To Do"),
                 }
                 for candidate in candidates[:5]
             ],
@@ -1643,7 +1615,7 @@ def run_project_chat_agent(
                     "order": task.get("order"),
                     "title": task.get("title"),
                     "description": task.get("description"),
-                    "status": task.get("status"),
+                    "status": coerce_workflow_status(task.get("status"), default="To Do"),
                     "estimated_hours": task.get("estimated_hours"),
                     "complexity": task.get("complexity"),
                     "assignee": task.get("assignee"),
@@ -1673,7 +1645,7 @@ def run_project_chat_agent(
             {
                 "id": epic.get("id"),
                 "name": epic.get("name"),
-                "status": epic.get("status"),
+                "status": coerce_workflow_status(epic.get("status"), default="To Do"),
                 "priority": epic.get("priority"),
                 "story_count": len(epic.get("userStories") or []),
             }
@@ -1737,7 +1709,7 @@ def run_project_chat_agent(
                 "id": epic.get("id"),
                 "name": epic.get("name"),
                 "description": epic.get("description"),
-                "status": epic.get("status"),
+                "status": coerce_workflow_status(epic.get("status"), default="To Do"),
                 "priority": epic.get("priority"),
                 "assignee": epic.get("assignee"),
                 "labels": epic.get("labels") or [],
@@ -2975,7 +2947,7 @@ def run_project_chat_agent(
                                     "story_title": story_title,
                                     "subtask_id": task.get("id"),
                                     "title": task_title,
-                                    "status": task.get("status"),
+                                    "status": coerce_workflow_status(task.get("status"), default="To Do"),
                                     "match": task_title if text in task_title.lower() else task_description[:200],
                                 }
                             )
@@ -3183,7 +3155,7 @@ def run_project_chat_agent(
     ]
 
     tool_map = {tool.name: tool for tool in tools}
-    llm = gpt40_mini_client.bind_tools(tools)
+    llm = bind_agent_tools(AgentName.PROJECT_CHAT, tools, model_tier="mini")
 
     def _assistant_node(state: AgentState) -> Dict[str, List[BaseMessage]]:
         response = llm.invoke(state["messages"])

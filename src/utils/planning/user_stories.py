@@ -16,7 +16,7 @@ from src.utils.planning.assignees import (
     is_frida_assignee_name,
 )
 from src.utils.firebase.identifier import get_next_US_identifier
-from src.schemas.workflow_status import WORKFLOW_STATUS_VALUES, normalize_workflow_status
+from src.schemas.workflow_status import WORKFLOW_STATUS_VALUES, coerce_workflow_status, normalize_workflow_status
 
 
 def _current_timestamp_iso() -> str:
@@ -106,7 +106,7 @@ def _extract_markdown_section_list(text: str, headings: List[str]) -> List[str]:
 
 
 def _normalize_story_payload(story_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure user story payload includes effortHours and createdDate."""
+    """Ensure user story payload includes canonical workflow and display fields."""
     created_date = story_data.get("createdDate")
     if created_date is None:
         created_date = story_data.get("created_date")
@@ -159,6 +159,10 @@ def _normalize_story_payload(story_data: Dict[str, Any]) -> Dict[str, Any]:
 
     story_data["createdDate"] = created_date
     story_data["effortHours"] = effort_hours
+    story_data["status"] = coerce_workflow_status(
+        story_data.get("status") or _find_story_field_value(fields, ["status"]),
+        default="To Do",
+    )
     story_data["acceptanceCriteria"] = acceptance
     story_data["outOfScope"] = out_scope
     ensure_assignee_email(story_data)
@@ -556,6 +560,7 @@ def create_user_story(
             "acceptance_criteria",
             "outOfScope",
             "out_of_scope",
+            "status",
         }
 
         raw_effort = user_story_data.get("effortHours")
@@ -590,6 +595,7 @@ def create_user_story(
             "updated_at": now,
             "effortHours": effort_hours,
             "storyPoints": story_points,
+            "status": coerce_workflow_status(user_story_data.get("status"), default="To Do"),
             "fields": []
         }
         

@@ -8,7 +8,7 @@ from fastapi import UploadFile
 
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
-from src.services.azure_services import AzureChatService
+from src.intelligence.runtime import AgentName, run_agent
 from src.utils.core.validation_utils import get_code_block
 
 logger = logging.getLogger(__name__)
@@ -286,11 +286,10 @@ Rules:
 - document.entry_points, document.output_points, and document.success_flow must be short strings, not arrays.
 """.strip()
 
-    azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
     raw = (
-        await azure.simple_completion_with_images(prompt, image_payloads, model_tier="gpt")
+        await run_agent(AgentName.USER_STORY_EXPANSION, prompt, user_data, model_tier="gpt", images=image_payloads)
         if image_payloads
-        else await azure.simple_completion(prompt, model_tier="gpt")
+        else await run_agent(AgentName.USER_STORY_EXPANSION, prompt, user_data, model_tier="gpt")
     )
     parsed = _safe_json_load(raw)
     if not isinstance(parsed, dict):

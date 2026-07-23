@@ -5,6 +5,7 @@ import logging
 from src.services.notifications import NotificationService
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.schemas.response import ResponseModel
+from src.schemas.workflow_status import coerce_workflow_status
 from src.utils.authz.users import get_user_profile
 from src.utils.planning.projects import get_project_for_user
 from src.utils.authz.permissions import get_project_access
@@ -749,7 +750,7 @@ def get_sprint_items(
                     "source": "story",
                     "storyId": item_id,
                     "story_id": item_id,
-                    "status": story.get("status"),
+                    "status": coerce_workflow_status(story.get("status"), default="To Do"),
                     "assignee": story.get("assignee"),
                     "startDate": story.get("startDate"),
                     "createdDate": story.get("createdDate"),
@@ -785,7 +786,7 @@ def get_sprint_items(
                     "source": "story" if story_id else "project",
                     "taskType": subtask.get("task_type") or subtask.get("type"),
                     "task_type": subtask.get("task_type") or subtask.get("type"),
-                    "status": subtask.get("status"),
+                    "status": coerce_workflow_status(subtask.get("status"), default="To Do"),
                     "assignee": subtask.get("assignee"),
                     "createdDate": subtask.get("createdDate"),
                     "created_at": subtask.get("created_at"),
@@ -887,7 +888,7 @@ def list_available_items(
                     "source": "story",
                     "storyId": story_id,
                     "story_id": story_id,
-                    "status": story.get("status"),
+                    "status": coerce_workflow_status(story.get("status"), default="To Do"),
                     "assignee": story.get("assignee"),
                     "startDate": story.get("startDate"),
                     "createdDate": story.get("createdDate"),
@@ -927,7 +928,7 @@ def list_available_items(
                     "source": "story" if story else "project",
                     "taskType": subtask.get("task_type") or subtask.get("type"),
                     "task_type": subtask.get("task_type") or subtask.get("type"),
-                    "status": subtask.get("status"),
+                    "status": coerce_workflow_status(subtask.get("status"), default="To Do"),
                     "assignee": subtask.get("assignee"),
                     "createdDate": subtask.get("createdDate"),
                     "created_at": subtask.get("created_at"),

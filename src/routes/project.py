@@ -29,6 +29,7 @@ from src.schemas.resources_response import (
 from src.schemas.member_schemas import ProjectInvitationRequest, TeamMemberCreateRequest, TeamMemberUpdate
 
 from src.schemas.user_data import UserData
+from src.schemas.workflow_status import coerce_workflow_status
 from src.utils.authz.auth import get_current_user
 
 from src.utils.planning.projects import (
@@ -1357,7 +1358,7 @@ async def get_project_stats_timeline_route(
             payload_epics.append({
                 "id": epic_id,
                 "name": epic.get("name"),
-                "status": epic.get("status") or "To Do",
+                "status": coerce_workflow_status(epic.get("status"), default="To Do"),
                 "userStories": normalized_stories,
             })
 
