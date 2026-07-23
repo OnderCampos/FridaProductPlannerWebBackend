@@ -18,6 +18,7 @@ from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
 from src.schemas.workflow_status import coerce_workflow_status, normalize_workflow_status
 from src.intelligence.runtime import AgentName, bind_agent_tools
+from src.integrations.jira_mcp.tools import get_jira_connection_status, search_project_jira_issues
 from src.services.setup.language_setup import get_default_llm_language, normalize_language
 from src.utils.planning.epics import (
     create_epic,
@@ -2994,6 +2995,22 @@ def run_project_chat_agent(
         )
         return {"confirmation_required": True, "pending_action": action}
 
+    def get_jira_connection_tool(project_id_arg: Optional[str] = None) -> Dict[str, Any]:
+        resolved_project_id = _resolve_project_arg(project_id_arg)
+        if not resolved_project_id:
+            return {"error": "Project not found or not accessible"}
+        return get_jira_connection_status(resolved_project_id, user_data.get_user_id())
+
+    def search_jira_issues_tool(
+        query: str,
+        limit: int = 8,
+        project_id_arg: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        resolved_project_id = _resolve_project_arg(project_id_arg)
+        if not resolved_project_id:
+            return {"error": "Project not found or not accessible"}
+        return search_project_jira_issues(resolved_project_id, user_data.get_user_id(), query, limit)
+
     tools = [
         StructuredTool.from_function(
             func=get_project_details,
@@ -3137,6 +3154,19 @@ def run_project_chat_agent(
             func=search_work_items_tool,
             name="search_work_items",
             description="Search epics, stories, and subtasks by keyword within the current scoped project.",
+        ),
+        StructuredTool.from_function(
+            func=get_jira_connection_tool,
+            name="get_jira_connection",
+            description="Check whether Jira is connected and configured for the current project.",
+        ),
+        StructuredTool.from_function(
+            func=search_jira_issues_tool,
+            name="search_jira_issues",
+            description=(
+                "Search read-only Jira issues through the project's Atlassian Rovo MCP connection. "
+                "Use this only for the current project; it never creates or updates Jira issues."
+            ),
         ),
         StructuredTool.from_function(
             func=propose_implement_frida_tasks_tool,

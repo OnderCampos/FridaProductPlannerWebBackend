@@ -1,3 +1,7 @@
+import json
+import re
+from typing import Any, Dict, List
+
 from fastapi import APIRouter, Depends, HTTPException, Path
 from fastapi.responses import JSONResponse
 
@@ -27,9 +31,122 @@ from src.utils.planning.subtask_generation import (
     update_subtask_fields,
     update_subtask_status,
 )
+from src.integrations.jira_mcp.tools import search_project_jira_issues
+from src.intelligence.runtime import AgentName, run_agent
+from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 
 
 router = APIRouter()
+
+JIRA_SEARCH_MAX_ATTEMPTS = 4
+JIRA_SEARCH_STOP_WORDS = {
+    "about", "after", "again", "also", "and", "are", "been", "being", "but", "can", "could",
+    "error", "for", "from", "have", "into", "issue", "new", "not", "only", "our", "that",
+    "the", "their", "this", "to", "was", "with", "when", "where", "will", "your",
+}
+
+
+def _jira_issue_summaries(search_response: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Normalize Jira REST and Rovo-MCP wrapped issue responses for an LLM prompt."""
+    raw_result = (search_response or {}).get("result")
+    payloads: List[Any] = [raw_result]
+    issues: List[Dict[str, Any]] = []
+    seen_keys = set()
+
+    while payloads:
+        payload = payloads.pop()
+        if isinstance(payload, str):
+            try:
+                payloads.append(json.loads(payload))
+            except (TypeError, ValueError):
+                continue
+            continue
+        if isinstance(payload, list):
+            payloads.extend(payload)
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        if isinstance(payload.get("issues"), list):
+            for issue in payload["issues"]:
+                if not isinstance(issue, dict):
+                    continue
+                fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else issue
+                key = str(issue.get("key") or issue.get("id") or "").strip()
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                status = fields.get("status")
+                issues.append({
+                    "key": key,
+                    "summary": fields.get("summary") or "",
+                    "description": fields.get("description") or "",
+                    "status": status.get("name") if isinstance(status, dict) else status,
+                    "issue_type": (fields.get("issuetype") or {}).get("name") if isinstance(fields.get("issuetype"), dict) else fields.get("issuetype"),
+                    "updated": fields.get("updated") or "",
+                })
+
+        # Rovo returns the Jira JSON as a string in a text content block.
+        content = payload.get("content")
+        if isinstance(content, list):
+            payloads.extend(item.get("text") for item in content if isinstance(item, dict) and item.get("text"))
+
+    return issues
+
+
+def _task_jira_search_queries(title: str, description: str) -> List[Dict[str, str]]:
+    clean_title = re.sub(r'\s+', ' ', (title or '').replace('"', ' ')).strip()[:120]
+    query_specs: List[Dict[str, str]] = []
+    if clean_title:
+        query_specs.append({"purpose": "exact task title", "jql": f'text ~ "\\"{clean_title}\\""'})
+
+    terms: List[str] = []
+    max_keywords = JIRA_SEARCH_MAX_ATTEMPTS - (2 if clean_title else 1)
+    for token in re.findall(r"[A-Za-z0-9_-]{3,}", f"{title or ''} {description or ''}".lower()):
+        if token in JIRA_SEARCH_STOP_WORDS or token in terms:
+            continue
+        terms.append(token)
+        if len(terms) == max_keywords:
+            break
+
+    for term in terms:
+        query_specs.append({"purpose": f"keyword: {term}", "jql": f'text ~ "\\"{term}\\""'})
+
+    # The final fallback is useful when the wording differs completely, but it
+    # is deliberately marked as recent context rather than a direct match.
+    query_specs.append({"purpose": "recent project issues fallback", "jql": "ORDER BY updated DESC"})
+    return query_specs[:JIRA_SEARCH_MAX_ATTEMPTS]
+
+
+def _load_task_jira_context(project_id: str, user_id: str, title: str, description: str) -> Dict[str, Any]:
+    attempts: List[Dict[str, Any]] = []
+    matched_issues: List[Dict[str, Any]] = []
+    seen_keys = set()
+    queries = _task_jira_search_queries(title, description)
+
+    for search in queries:
+        # Recent issues are only a fallback after all related searches found no match.
+        if search["purpose"] == "recent project issues fallback" and matched_issues:
+            break
+        response = search_project_jira_issues(project_id, user_id, search["jql"], limit=5)
+        issues = _jira_issue_summaries(response)
+        attempts.append({
+            "purpose": search["purpose"],
+            "query": search["jql"],
+            "source": response.get("source"),
+            "issue_count": len(issues),
+            "error": response.get("error"),
+        })
+        for issue in issues:
+            if issue["key"] not in seen_keys:
+                seen_keys.add(issue["key"])
+                matched_issues.append(issue)
+
+    return {
+        "attempts": attempts,
+        "matching_issues": matched_issues,
+        "used_recent_fallback": bool(attempts and attempts[-1]["purpose"] == "recent project issues fallback"),
+    }
 
 
 def _status_from_response(response: ResponseModel, success_code: int = 200) -> int:
@@ -139,6 +256,52 @@ async def create_task_route(
         status_code=_status_from_response(response, success_code=201),
         content=response.dict(),
     )
+
+
+@router.get("/{project_id}/tasks/{task_id}/related-context")
+async def task_related_context_route(
+    project_id: str,
+    task_id: str,
+    user_data: UserData = Depends(get_current_user),
+):
+    access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
+    if not access.success:
+        raise HTTPException(status_code=403, detail=access.message)
+    task_response = get_subtask_by_id(task_id, user_data.get_user_id(), allow_member=True, user_email=user_data.get_email())
+    if not task_response.success or str((task_response.data or {}).get("project_id") or "") != project_id:
+        raise HTTPException(status_code=404, detail="Task not found for this project")
+    task = task_response.data or {}
+    project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
+    project = project_doc.to_dict() if project_doc.exists else {}
+    github = (project or {}).get("github_config") or {}
+    task_title = str(task.get("title") or "").strip()
+    jira_context = _load_task_jira_context(
+        project_id,
+        user_data.get_user_id(),
+        task_title,
+        str(task.get("description") or ""),
+    )
+    github_context = {
+        "connected": bool(github.get("repository_url") and (github.get("api_token") or github.get("installation_id"))),
+        "repository_url": github.get("repository_url"), "branch": github.get("branch"),
+    }
+    prompt = (
+        "Write a concise Markdown implementation recommendation for this task. Start with 'Based on the available Jira items'. "
+        "Use only matching_issues as direct Jira evidence. If used_recent_fallback is true, make clear those issues are only potentially related. "
+        "State clearly when Jira/GitHub context is unavailable. Do not claim code was implemented. "
+        f"Task: {task.get('title')}\nDescription: {task.get('description')}\n"
+        f"Jira context: {jira_context}\nGitHub context: {github_context}"
+    )
+    try:
+        recommendation = await run_agent(AgentName.TASK_PLANNING, prompt, user_data, model_tier="mini")
+        recommendation = str(recommendation).strip()
+    except Exception:
+        recommendation = "Based on the available Jira items and GitHub connection status, review the related context before implementing this task."
+    # Jira MCP/REST output can contain complete issue payloads. It is deliberately
+    # kept server-side and used only as task-planning agent context.
+    return ResponseModel(success=True, message="Task related context generated", data={
+        "recommendation": recommendation,
+    })
 
 
 @router.post(

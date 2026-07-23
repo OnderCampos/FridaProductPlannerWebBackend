@@ -776,7 +776,10 @@ def get_user_stories_by_epic(epic_id: str, user_id: str = None, allow_member: bo
             _normalize_story_payload(story_data)
             story_data["sprint_id"] = sprint_id_by_story.get(story_id)
 
-            story_data["effortHours"] = story_data.get("effortHours", 0) + subtask_hours_by_story.get(story_id, 0.0)
+            story_data["effortHours"] = subtask_hours_by_story.get(
+                story_id,
+                story_data.get("effortHours", 0),
+            )
 
             user_stories.append(story_data)
         
@@ -889,6 +892,28 @@ def update_user_story(
         
         # Update the document
         story_ref.update(update_data)
+
+        # Story Tasks inherit ownership from their parent User Story. Keep the
+        # persisted task records synchronized whenever the story is reassigned.
+        assignee_keys = {
+            "assignee",
+            "assigneeId",
+            "assigneeEmail",
+            "assignee_email",
+            "assigned_to",
+        }
+        if assignee_keys.intersection(update_data):
+            subtask_assignee_update = {
+                key: update_data.get(key)
+                for key in assignee_keys
+                if key in update_data
+            }
+            subtask_assignee_update["updated_at"] = update_data["updated_at"]
+            subtask_docs = FIRESTORE_CLIENT.collection("subtasks").where(
+                "user_story_id", "==", story_id
+            ).get()
+            for subtask_doc in subtask_docs:
+                subtask_doc.reference.update(subtask_assignee_update)
         
         # Get updated user story
         updated_doc = story_ref.get()
@@ -1081,7 +1106,9 @@ def update_user_story_fields(
         logging.error(f"Error updating user story fields: {e}")
         return ResponseModel(success=False, message=f"Error updating user story fields: {str(e)}", data=None)
 
-def delete_user_story(story_id: str, user_id: str) -> ResponseModel:
+def delete_user_story(
+    story_id: str, user_id: str, user_email: Optional[str] = None
+) -> ResponseModel:
     """
     Deletes a specific user story.
     
@@ -1105,21 +1132,32 @@ def delete_user_story(story_id: str, user_id: str) -> ResponseModel:
         
         story_data = story_doc.to_dict()
         
-        # Check if user owns the user story
+        # Project leads may delete stories created by other members.
         if story_data.get("user_id") != user_id:
-            return ResponseModel(
-                success=False,
-                message="Unauthorized: You don't own this user story",
-                data=None
-            )
-        
-        # Delete the user story
-        story_ref.delete()
-        
+            project_id = get_project_id_for_epic(story_data.get("epic_id"))
+            access = get_project_access(project_id, user_id, user_email) if project_id else None
+            if not access or not access.success or not (access.data or {}).get("is_lead"):
+                return ResponseModel(
+                    success=False,
+                    message="Unauthorized: You don't own this user story",
+                    data=None
+                )
+
+        batch = FIRESTORE_CLIENT.batch()
+        subtasks = FIRESTORE_CLIENT.collection("subtasks").where(
+            "user_story_id", "==", story_id
+        ).stream()
+        deleted_subtasks = 0
+        for subtask in subtasks:
+            batch.delete(subtask.reference)
+            deleted_subtasks += 1
+        batch.delete(story_ref)
+        batch.commit()
+
         return ResponseModel(
             success=True,
             message="User story deleted successfully",
-            data=None
+            data={"deleted_subtasks": deleted_subtasks}
         )
     except Exception as e:
         logging.error(f"Error deleting user story {story_id}: {e}")

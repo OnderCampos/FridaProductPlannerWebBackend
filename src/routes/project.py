@@ -70,12 +70,19 @@ from src.services.workflows.project_import.project_import_from_jira.initializati
     JiraApiError,
     JiraAuthenticationError,
     JiraImportError,
-    list_jira_projects,
+    list_jira_projects_with_oauth,
 )
+from src.integrations.jira_mcp.service import JiraIntegrationError, begin_import_oauth, list_sites
 from src.services.notifications import NotificationService
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.utils.ai.project_creation_source_spec import generate_spec_from_source
-from src.utils.integrations.github import get_github_file_content, list_github_app_repositories, list_github_repository_branches, list_github_repository_files
+from src.utils.integrations.github import (
+    get_github_file_content,
+    list_github_app_repositories,
+    list_github_repository_branches,
+    list_github_repository_files,
+    uninstall_github_app_installation,
+)
 
 
 from src.utils.authz.permissions import get_project_access, get_global_user_role
@@ -418,6 +425,50 @@ async def update_project_route(
     except Exception:
         logger.exception("Failed to update project")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.delete(
+    "/{project_id}/github/installation",
+    response_description="Uninstall the project's GitHub App installation and clear its configuration.",
+)
+async def uninstall_project_github_app_route(
+    project_id: str,
+    user_data: UserData = Depends(get_current_user),
+):
+    access = get_project_access(project_id, user_data.user_id, user_data.email)
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Only the project leader can uninstall the GitHub App")
+
+    project_data = access.data.get("project") or {}
+    github_config = project_data.get("github_config") or {}
+    installation_id = str(github_config.get("installation_id") or "").strip()
+    if not installation_id:
+        raise HTTPException(status_code=400, detail="No GitHub App installation is configured for this project")
+
+    try:
+        uninstall_github_app_installation(installation_id)
+        update_response = update_project(
+            project_id=project_id,
+            user_id=user_data.user_id,
+            github_config={
+                "repository_url": "",
+                "branch": None,
+                "clear_api_token": True,
+                "clear_installation_id": True,
+            },
+        )
+        if not update_response.success:
+            logger.error("GitHub App was uninstalled but project %s configuration could not be cleared", project_id)
+            raise HTTPException(status_code=500, detail="GitHub App was uninstalled, but Product Planner could not clear the project configuration")
+        return JSONResponse(status_code=200, content=update_response.dict())
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to uninstall GitHub App installation for project %s", project_id)
+        raise HTTPException(status_code=502, detail="Failed to uninstall the GitHub App")
 
 @router.get(
     "/{project_id}/github/repositories",
@@ -799,14 +850,14 @@ async def create_project_from_qa_route(
 
 @router.post(
     "/creation/jira/projects",
-    response_description="List Jira projects available to the given credentials.",
+    response_description="List Jira projects available through the user's Jira OAuth connection.",
 )
 async def list_jira_projects_route(
     req: ListJiraProjectsRequest,
     user_data: UserData = Depends(get_current_user),
 ) -> ResponseModel:
     """
-    Fetches Jira projects for the UI flow.
+    Fetches Jira projects for the selected OAuth-connected Jira Cloud site.
 
     The user must be a project leader to use this endpoint.
     """
@@ -815,10 +866,9 @@ async def list_jira_projects_route(
         raise HTTPException(status_code=403, detail="Forbidden: Team members cannot create projects")
 
     try:
-        projects = await list_jira_projects(
-            jira_base_url=req.jira_base_url,
-            jira_email=req.jira_email,
-            jira_api_token=req.jira_api_token,
+        projects = await list_jira_projects_with_oauth(
+            user_id=user_data.get_user_id(),
+            cloud_id=req.cloud_id,
         )
         response = ResponseModel(
             success=True,
@@ -837,6 +887,43 @@ async def list_jira_projects_route(
     except Exception:
         logger.exception("Failed to list Jira projects")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get(
+    "/creation/jira/sites",
+    response_description="List the current user's OAuth-connected Jira Cloud sites.",
+)
+async def list_jira_oauth_sites_route(
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    role_info = get_global_user_role(user_data)
+    if role_info.get("role") == "member":
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot create projects")
+    return ResponseModel(
+        success=True,
+        message="Jira OAuth sites retrieved.",
+        data=list_sites(user_data.get_user_id()),
+    )
+
+
+@router.post(
+    "/creation/jira/connection/start",
+    response_description="Start Jira OAuth for a project import.",
+)
+async def start_jira_import_oauth_route(
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    role_info = get_global_user_role(user_data)
+    if role_info.get("role") == "member":
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot create projects")
+    try:
+        return ResponseModel(
+            success=True,
+            message="Jira authorization started",
+            data={"authorization_url": begin_import_oauth(user_data.get_user_id(), user_data.get_email())},
+        )
+    except JiraIntegrationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.post(
@@ -862,9 +949,7 @@ async def import_project_from_jira_route(
             name=req.name,
             description=req.description,
             project_key=req.project_key,
-            jira_base_url=req.jira_base_url,
-            jira_email=req.jira_email,
-            jira_api_token=req.jira_api_token,
+            cloud_id=req.cloud_id,
             jira_project_key=req.jira_project_key,
             issue_types=req.issue_types,
         )
@@ -1630,8 +1715,8 @@ async def update_project_member_route(
     """
     Updates role or seniority for a project member.
     """
-    if not req or (req.role is None and req.seniority is None and req.member_type is None):
-        raise HTTPException(status_code=400, detail="At least one field (role, seniority, member_type) is required")
+    if not req or (req.role is None and req.seniority is None and req.member_type is None and req.workload_hours_per_day is None):
+        raise HTTPException(status_code=400, detail="At least one member field is required")
 
     try:
         access = get_project_access(project_id, user_data.user_id, user_data.email)
@@ -1652,9 +1737,13 @@ async def update_project_member_route(
         target_member_type = normalize_membership_role(existing_member.get("member_type"))
         requested_member_type = normalize_membership_role(req.member_type) if req.member_type is not None else None
 
-        if target_member_type == "leader":
+        if target_member_type == "leader" and any(
+            value is not None for value in (req.role, req.seniority, req.member_type)
+        ):
             raise HTTPException(status_code=403, detail="The project leader cannot be updated here")
-        if target_member_type == "coleader" and requester_member_type != "leader":
+        if target_member_type == "coleader" and requester_member_type != "leader" and any(
+            value is not None for value in (req.role, req.seniority, req.member_type)
+        ):
             raise HTTPException(status_code=403, detail="Forbidden: Only the leader can update a coleader")
         if requested_member_type == "leader":
             raise HTTPException(status_code=400, detail="The project leader is always the project creator")
@@ -1673,6 +1762,7 @@ async def update_project_member_route(
             role=req.role,
             seniority=req.seniority,
             member_type=req.member_type,
+            workload_hours_per_day=req.workload_hours_per_day,
         )
 
         if not updated_member:

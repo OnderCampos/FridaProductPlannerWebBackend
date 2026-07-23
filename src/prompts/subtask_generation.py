@@ -10,6 +10,9 @@ GENERATE_SUBTASKS_PROMPT = """You are an expert project manager and software dev
 **Additional Fields:**
 {additional_fields}
 
+**Repository Context:**
+{repository_context}
+
 **Instructions:**
 1. Analyze the user story and its description carefully
 2. Break down the user story into specific, actionable subtasks
@@ -20,6 +23,7 @@ GENERATE_SUBTASKS_PROMPT = """You are an expert project manager and software dev
 7. Consider all aspects: frontend, backend, testing, documentation, etc.
 8. Assign an order number to each subtask (1, 2, 3, etc.) based on logical sequence
 9. Identify dependencies - which subtasks must be completed before this one can start
+10. When repository context is available, use its listed paths and excerpts to make the subtasks fit the existing codebase. Do not invent repository files or implementation details that are not in that context.
 
 **Output Format:**
 Return a JSON array of subtasks. Each subtask must have:

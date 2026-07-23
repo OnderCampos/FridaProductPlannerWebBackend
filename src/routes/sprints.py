@@ -243,7 +243,7 @@ async def list_sprint_items_route(
     user_data: UserData = Depends(get_current_user),
 ):
     """
-    Returns all stories and subtasks assigned to the sprint.
+    Returns all user stories and independent tasks assigned to the sprint.
     """
     try:
         response = get_sprint_items(
@@ -275,7 +275,7 @@ async def assign_sprint_item_route(
     user_data: UserData = Depends(get_current_user),
 ):
     """
-    Assigns a user story or subtask to a sprint.
+    Assigns a user story or independent task to a sprint.
     """
     access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
     if not access.success:
@@ -319,7 +319,7 @@ async def unassign_sprint_item_route(
     user_data: UserData = Depends(get_current_user),
 ):
     """
-    Unassigns a user story or subtask from a sprint.
+    Unassigns a user story or independent task from a sprint.
     """
     resolved_type = (req.type if req else None) or item_type
     resolved_id = (req.id if req else None) or item_id

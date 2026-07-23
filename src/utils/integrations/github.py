@@ -16,7 +16,8 @@ MAX_GITHUB_FILE_SIZE_BYTES = 200_000
 
 BASE_DIR = Path(__file__).resolve().parent
 
-def get_installation_token(installation_id: str) -> str:
+
+def get_github_app_jwt() -> str:
     app_id = os.environ.get("GITHUB_APP_ID")
     if not app_id:
         raise Exception("GITHUB_APP_ID environment variable is not set.")
@@ -35,12 +36,19 @@ def get_installation_token(installation_id: str) -> str:
         private_key = pem_file.read()
 
     # Generate a JWT using the private key and app ID
+    issued_at = int(time.time())
     payload = {
-        "iat": int(time.time()),
-        "exp": int(time.time()) + (10 * 60),  # JWT valid for 10 minutes
+        # GitHub recommends allowing for server/GitHub clock drift. Keep the
+        # expiry below its 10-minute maximum rather than exactly on the limit.
+        "iat": issued_at - 60,
+        "exp": issued_at + (9 * 60),
         "iss": app_id
     }
-    encoded_jwt = jwt.encode(payload, private_key, algorithm="RS256")
+    return jwt.encode(payload, private_key, algorithm="RS256")
+
+
+def get_installation_token(installation_id: str) -> str:
+    encoded_jwt = get_github_app_jwt()
 
     # We ask the Installation Token
     headers = {
@@ -56,6 +64,28 @@ def get_installation_token(installation_id: str) -> str:
             raise Exception(f"Failed to get installation token: {response.status_code} - {response.text}")
 
     return response.json()["token"]
+
+
+def uninstall_github_app_installation(installation_id: str) -> None:
+    """Uninstall this GitHub App from an account or organization installation."""
+    encoded_jwt = get_github_app_jwt()
+    response = requests.delete(
+        f"{GITHUB_API_BASE}/app/installations/{installation_id}",
+        headers={
+            "Authorization": f"Bearer {encoded_jwt}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "frida-product-planner",
+        },
+        timeout=30,
+    )
+    # A 404 means the installation was already removed in GitHub. Treat it as
+    # a successful idempotent uninstall so Product Planner can still clear its
+    # now-stale project configuration.
+    if response.status_code in {202, 404}:
+        return
+    if response.status_code != 202:
+        _raise_for_github_error(response, "Failed to uninstall the GitHub App")
 
 def parse_github_repository_reference(repository_url: str) -> Tuple[str, str]:
     raw_value = str(repository_url or "").strip()

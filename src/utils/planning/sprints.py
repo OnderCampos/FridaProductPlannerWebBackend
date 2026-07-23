@@ -536,14 +536,27 @@ def assign_item_to_sprint(
             return ResponseModel(success=False, message="Unauthorized: You don't own this sprint", data=None)
 
         normalized_type = (item_type or "").strip().lower()
+        if normalized_type not in {"story", "subtask"}:
+            return ResponseModel(success=False, message="Invalid item type", data=None)
 
-        # Handle of the story or subtask 
+        # Retained in the request contract for backwards compatibility only.
+        # Story tasks are never cascaded into a sprint assignment.
+        include_subtasks = False
+
+        # A story task belongs to its parent user story's sprint plan. Only
+        # standalone project tasks may be assigned as sprint subtasks.
         if normalized_type == "story":
             story_res = _get_story_for_project(item_id, project_id, user_id)
             if not story_res.success: return story_res
         else:
             subtask_res = _get_subtask_for_project(item_id, project_id, user_id)
             if not subtask_res.success: return subtask_res
+            if str(subtask_res.data.get("user_story_id") or "").strip():
+                return ResponseModel(
+                    success=False,
+                    message="Story tasks are planned through their parent user story and cannot be assigned to a sprint.",
+                    data=None,
+                )
 
         # Reassign (If already exists in another sprint, move it)
         existing_assigments = FIRESTORE_CLIENT.collection(SPRINT_ITEMS_COLLECTION).where(
@@ -752,6 +765,8 @@ def get_sprint_items(
                     "story_id": item_id,
                     "status": coerce_workflow_status(story.get("status"), default="To Do"),
                     "assignee": story.get("assignee"),
+                    "assigneeId": story.get("assigneeId") or story.get("assigned_to"),
+                    "assigneeEmail": story.get("assignee_email") or story.get("assigneeEmail"),
                     "startDate": story.get("startDate"),
                     "createdDate": story.get("createdDate"),
                     "created_at": story.get("created_at"),
@@ -764,15 +779,11 @@ def get_sprint_items(
                     continue
                 subtask = subtask_response.data
                 story_id = subtask.get("user_story_id")
+                if str(story_id or "").strip():
+                    # Ignore legacy assignments: story tasks follow the sprint
+                    # selected for their parent user story.
+                    continue
                 story_title = ""
-                if story_id:
-                    if story_id not in story_cache:
-                        story_response = _get_story_for_project(story_id, project_id, user_id, allow_member=allow_members, user_email=user_email)
-                        if story_response.success:
-                            story_cache[story_id] = story_response.data
-                    story = story_cache.get(story_id)
-                    if story:
-                        story_title = story.get("user_story") or story.get("user_story_id") or ""
 
                 items_with_order.append((item_order, {
                     "type": "subtask",
@@ -788,6 +799,8 @@ def get_sprint_items(
                     "task_type": subtask.get("task_type") or subtask.get("type"),
                     "status": coerce_workflow_status(subtask.get("status"), default="To Do"),
                     "assignee": subtask.get("assignee"),
+                    "assigneeId": subtask.get("assigneeId") or subtask.get("assigned_to"),
+                    "assigneeEmail": subtask.get("assignee_email") or subtask.get("assigneeEmail"),
                     "createdDate": subtask.get("createdDate"),
                     "created_at": subtask.get("created_at"),
                     "estimated_hours": subtask.get("estimated_hours"),
@@ -905,6 +918,8 @@ def list_available_items(
                 if f"subtask:{subtask_id}" in assigned_keys:
                     continue
                 story_id = subtask.get("user_story_id")
+                if str(story_id or "").strip():
+                    continue
                 story = story_map.get(story_id) if story_id else None
                 title = subtask.get("title") or subtask.get("description") or ""
                 if search_term and search_term not in title.lower():

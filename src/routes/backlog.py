@@ -586,6 +586,14 @@ async def update_backlog_item_status(
         "status": status,
         "updated_at": _current_timestamp_iso(),
     }
+    if normalized_type == "story":
+        current_status = coerce_workflow_status(item_data.get("status"), default="To Do")
+        is_moving_to_started = status != "To Do" and current_status == "To Do"
+        has_start_date = bool(item_data.get("startDate") or item_data.get("start_date"))
+        if is_moving_to_started and not has_start_date:
+            # Keep Backlog transitions consistent with the User Story details modal
+            # and give the sprint timeline a real start point.
+            update_data["startDate"] = _current_timestamp_iso()
     if normalized_type == "subtask":
         if status == "Done":
             update_data["completed_date"] = _current_timestamp_iso()

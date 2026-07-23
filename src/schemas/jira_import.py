@@ -11,9 +11,7 @@ class ImportProjectFromJiraRequest(BaseModel):
     - `jira_project_key` refers to the Jira project key (often longer than 3 chars).
     """
 
-    jira_base_url: str
-    jira_email: str
-    jira_api_token: str
+    cloud_id: str
     jira_project_key: str
 
     name: Optional[str] = None
@@ -25,8 +23,6 @@ class ImportProjectFromJiraRequest(BaseModel):
 
 
 class ListJiraProjectsRequest(BaseModel):
-    """Request model for listing Jira projects available to the given credentials."""
+    """Request model for listing Jira projects available through the user's OAuth connection."""
 
-    jira_base_url: str
-    jira_email: str
-    jira_api_token: str
+    cloud_id: str

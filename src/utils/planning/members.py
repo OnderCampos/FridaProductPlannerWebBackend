@@ -49,6 +49,7 @@ def _build_fallback_leader_member(project_id: str) -> Optional[Dict[str, Any]]:
         "email": owner_email or user_data.get("email"),
         "role": "PM",
         "seniority": "Lead",
+        "workload_hours_per_day": 8,
         "member_type": "leader",
         "status": "Active",
         "joined_date": project_data.get("created_at") or datetime.utcnow().isoformat() + "Z",
@@ -65,6 +66,7 @@ def create_team_member(
     seniority: str,
     avatar: Optional[str] = None,
     member_type: Optional[str] = None,
+    workload_hours_per_day: float = 8,
 ) -> Dict[str, Any]:
     """
     Create a new team member in Firestore.
@@ -98,6 +100,7 @@ def create_team_member(
             "email": email,
             "role": role,
             "seniority": seniority,
+            "workload_hours_per_day": workload_hours_per_day,
             "member_type": normalize_membership_role(member_type),
             "status": "Active",
             "joined_date": datetime.utcnow().isoformat() + "Z",
@@ -320,6 +323,7 @@ def update_team_member(
     role: Optional[str] = None,
     seniority: Optional[str] = None,
     member_type: Optional[str] = None,
+    workload_hours_per_day: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Update a team member's role or seniority.
@@ -339,7 +343,15 @@ def update_team_member(
         member_doc = member_ref.get()
         
         if not member_doc.exists:
-            return None
+            fallback_leader = _build_fallback_leader_member(project_id)
+            if not fallback_leader or fallback_leader.get("id") != member_id:
+                return None
+            # Older projects can expose a virtual leader record. Materialize it on
+            # first update so its planning capacity can be persisted like any member.
+            fallback_leader["created_at"] = firestore.SERVER_TIMESTAMP
+            fallback_leader["updated_at"] = firestore.SERVER_TIMESTAMP
+            member_ref.set(fallback_leader)
+            member_doc = member_ref.get()
         
         member_data = member_doc.to_dict()
         
@@ -358,6 +370,8 @@ def update_team_member(
             update_data["seniority"] = seniority
         if member_type is not None:
             update_data["member_type"] = normalize_membership_role(member_type)
+        if workload_hours_per_day is not None:
+            update_data["workload_hours_per_day"] = workload_hours_per_day
         
         # Update in Firestore
         member_ref.update(update_data)
@@ -503,6 +517,7 @@ def format_team_member_response(member_data: Dict[str, Any]) -> Dict[str, Any]:
         "email": member_data.get("email"),
         "role": member_data.get("role"),
         "seniority": member_data.get("seniority"),
+        "workloadHoursPerDay": member_data.get("workload_hours_per_day", 8),
         "memberType": derive_membership_role(
             member_data.get("role"),
             member_data.get("seniority"),

@@ -40,6 +40,7 @@ from src.utils.planning.user_stories import (
     get_user_story_by_id,
     update_user_story,
     update_user_story_fields,
+    delete_user_story,
 )
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
@@ -1235,6 +1236,44 @@ async def update_subtask_fields_route(
             status_code=200 if response.success else 404 if "not found" in response.message.lower() else 400,
             content=response.dict(),
         )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@router.delete(
+    "/{story_id}/",
+    response_description="Delete a user story",
+)
+async def delete_user_story_route(
+    story_id: str = Path(..., description="The user story ID"),
+    user_data: UserData = Depends(get_current_user),
+) -> ResponseModel:
+    """Deletes a user story and its linked subtasks. Project leads only."""
+    try:
+        story_response = get_user_story_by_id(
+            story_id,
+            user_data.get_user_id(),
+            allow_member=True,
+            user_email=user_data.get_email(),
+        )
+        if not story_response.success:
+            status_code = 404 if "not found" in story_response.message.lower() else 403
+            return JSONResponse(status_code=status_code, content=story_response.dict())
+
+        epic_id = story_response.data.get("epic_id")
+        epic_response = get_epic_by_id(epic_id) if epic_id else None
+        if not epic_response or not epic_response.success:
+            raise HTTPException(status_code=404, detail="Epic not found")
+        _require_project_lead(epic_response.data.get("project_id"), user_data)
+
+        response = delete_user_story(
+            story_id,
+            user_data.get_user_id(),
+            user_data.get_email(),
+        )
+        status_code = 200 if response.success else 404 if "not found" in response.message.lower() else 400
+        return JSONResponse(status_code=status_code, content=response.dict())
     except HTTPException:
         raise
     except Exception:
