@@ -541,6 +541,7 @@ async def accept_user_story_qa_route(
         "description": str(story_draft.get("description") or "").strip(),
         "order": story_draft.get("order", 0),
         "dependencies": story_draft.get("dependencies") or [],
+        "tshirt_size": story_draft.get("tshirt_size") or story_draft.get("tshirtSize") or "",
         "effortHours": story_draft.get("effortHours", 0),
         "story_points": story_draft.get("story_points", 0),
     }

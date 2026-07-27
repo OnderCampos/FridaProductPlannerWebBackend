@@ -15,6 +15,10 @@ from src.utils.planning.assignees import (
     is_frida_assignee_id,
     is_frida_assignee_name,
 )
+from src.utils.planning.story_estimation import (
+    parse_effort_hours,
+    resolve_story_estimation,
+)
 from src.utils.firebase.identifier import get_next_US_identifier
 from src.schemas.workflow_status import WORKFLOW_STATUS_VALUES, coerce_workflow_status, normalize_workflow_status
 
@@ -116,8 +120,11 @@ def _normalize_story_payload(story_data: Dict[str, Any]) -> Dict[str, Any]:
     effort_hours = story_data.get("effortHours")
     if effort_hours is None:
         effort_hours = story_data.get("effort_hours")
-    if effort_hours is None:
-        effort_hours = 0
+    tshirt_size = (
+        story_data.get("tshirt_size")
+        if story_data.get("tshirt_size") is not None
+        else story_data.get("tshirtSize")
+    )
 
     # Normalize acceptance/out-of-scope fields for backward compatibility:
     # - some flows store them as strings in `document` or inside `fields`
@@ -158,7 +165,11 @@ def _normalize_story_payload(story_data: Dict[str, Any]) -> Dict[str, Any]:
         out_scope = ["N/A"]
 
     story_data["createdDate"] = created_date
-    story_data["effortHours"] = effort_hours
+    resolved_size, resolved_effort = resolve_story_estimation(tshirt_size, effort_hours)
+    story_data["tshirt_size"] = resolved_size
+    story_data["tshirtSize"] = resolved_size
+    story_data["effortHours"] = resolved_effort
+    story_data["effort_hours"] = story_data["effortHours"]
     story_data["status"] = coerce_workflow_status(
         story_data.get("status") or _find_story_field_value(fields, ["status"]),
         default="To Do",
@@ -167,16 +178,6 @@ def _normalize_story_payload(story_data: Dict[str, Any]) -> Dict[str, Any]:
     story_data["outOfScope"] = out_scope
     ensure_assignee_email(story_data)
     return story_data
-
-
-def _parse_effort_hours(raw_effort: Optional[Any]) -> float:
-    if raw_effort is None:
-        return 0
-    try:
-        return float(raw_effort)
-    except (TypeError, ValueError):
-        return 0
-
 
 def _parse_order_value(raw_order: Optional[Any]) -> float:
     if raw_order is None:
@@ -258,6 +259,21 @@ def _get_story_subtask_hours_map(story_ids: List[str]) -> Dict[str, float]:
                 estimated_hours = 0
             hours_map[story_id] = hours_map.get(story_id, 0.0) + estimated_hours
     return hours_map
+
+
+def _resolve_story_effort_hours(
+    story_data: Dict[str, Any],
+    fallback_subtask_hours: Optional[Any] = None,
+) -> float:
+    stored_effort = parse_effort_hours(
+        story_data.get("effortHours")
+        if story_data.get("effortHours") is not None
+        else story_data.get("effort_hours")
+    )
+    if stored_effort > 0:
+        return stored_effort
+    fallback_effort = parse_effort_hours(fallback_subtask_hours)
+    return fallback_effort if fallback_effort > 0 else 0
 
 """
 ---------------------------------------------------------------------------------------------------------------------------------------
@@ -418,6 +434,7 @@ def _maybe_send_user_story_updated_notification(
     try:
         fields_to_watch = {
             "status": "Status",
+            "tshirt_size": "Complexity Size",
             "effortHours": "Effort Hours",
             "storyPoints": "Story Points",
             "priority": "Priority"
@@ -549,6 +566,8 @@ def create_user_story(
             "user_story_id",
             "order",
             "dependencies",
+            "tshirt_size",
+            "tshirtSize",
             "effortHours",
             "effort_hours",
             "createdDate",
@@ -566,7 +585,12 @@ def create_user_story(
         raw_effort = user_story_data.get("effortHours")
         if raw_effort is None:
             raw_effort = user_story_data.get("effort_hours")
-        effort_hours = _parse_effort_hours(raw_effort)
+        raw_tshirt_size = (
+            user_story_data.get("tshirt_size")
+            if user_story_data.get("tshirt_size") is not None
+            else user_story_data.get("tshirtSize")
+        )
+        tshirt_size, effort_hours = resolve_story_estimation(raw_tshirt_size, raw_effort)
 
         try:
             story_points = int(user_story_data.get("story_points", 0))
@@ -593,6 +617,8 @@ def create_user_story(
             "created_at": now,
             "createdDate": now,
             "updated_at": now,
+            "tshirt_size": tshirt_size,
+            "tshirtSize": tshirt_size,
             "effortHours": effort_hours,
             "storyPoints": story_points,
             "status": coerce_workflow_status(user_story_data.get("status"), default="To Do"),
@@ -703,6 +729,12 @@ def get_user_story_by_id(story_id: str, user_id: str, allow_member: bool = False
         story_data = story_doc.to_dict()
         story_data["id"] = story_doc.id
         _normalize_story_payload(story_data)
+        story_effort_hours = _resolve_story_effort_hours(
+            story_data,
+            _get_story_subtask_hours_map([story_id]).get(story_id, 0),
+        )
+        story_data["effortHours"] = story_effort_hours
+        story_data["effort_hours"] = story_effort_hours
         
         # Verify ownership or membership
         if story_data.get("user_id") != user_id:
@@ -775,11 +807,12 @@ def get_user_stories_by_epic(epic_id: str, user_id: str = None, allow_member: bo
 
             _normalize_story_payload(story_data)
             story_data["sprint_id"] = sprint_id_by_story.get(story_id)
-
-            story_data["effortHours"] = subtask_hours_by_story.get(
-                story_id,
-                story_data.get("effortHours", 0),
+            story_effort_hours = _resolve_story_effort_hours(
+                story_data,
+                subtask_hours_by_story.get(story_id, 0),
             )
+            story_data["effortHours"] = story_effort_hours
+            story_data["effort_hours"] = story_effort_hours
 
             user_stories.append(story_data)
         
@@ -991,6 +1024,8 @@ def update_user_story_fields(
             "assigneeId",
             "assigneeEmail",
             "assignee_email",
+            "tshirt_size",
+            "tshirtSize",
             "storyPoints",
             "story_points",
             "dueDate",
@@ -1032,6 +1067,11 @@ def update_user_story_fields(
         if "assigneeEmail" in filtered_update:
             filtered_update["assignee_email"] = filtered_update.get("assigneeEmail")
 
+        if "tshirtSize" in filtered_update and "tshirt_size" not in filtered_update:
+            filtered_update["tshirt_size"] = filtered_update.get("tshirtSize")
+        if "tshirt_size" in filtered_update and "tshirtSize" not in filtered_update:
+            filtered_update["tshirtSize"] = filtered_update.get("tshirt_size")
+
         if "acceptance_criteria" in filtered_update and "acceptanceCriteria" not in filtered_update:
             filtered_update["acceptanceCriteria"] = filtered_update.pop("acceptance_criteria")
 
@@ -1043,6 +1083,25 @@ def update_user_story_fields(
 
         if "outOfScope" in filtered_update:
             filtered_update["outOfScope"] = _normalize_string_list(filtered_update.get("outOfScope"))
+
+        resolved_size, resolved_effort = resolve_story_estimation(
+            filtered_update.get("tshirt_size", user_story_data.get("tshirt_size", user_story_data.get("tshirtSize"))),
+            filtered_update.get("effortHours", user_story_data.get("effortHours", user_story_data.get("effort_hours"))),
+        )
+        if resolved_size:
+            filtered_update["tshirt_size"] = resolved_size
+            filtered_update["tshirtSize"] = resolved_size
+        elif "tshirt_size" in filtered_update or "tshirtSize" in filtered_update:
+            filtered_update["tshirt_size"] = ""
+            filtered_update["tshirtSize"] = ""
+
+        if (
+            "effortHours" in filtered_update
+            or "effort_hours" in update_data
+            or "tshirt_size" in filtered_update
+            or "tshirtSize" in filtered_update
+        ):
+            filtered_update["effortHours"] = resolved_effort
 
         incoming_status = filtered_update.get("status")
         if isinstance(incoming_status, str):

@@ -8,6 +8,7 @@ from src.intelligence.agents.user_story_generation.generation_agent import (
 from src.schemas.user_data import UserData
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
+from src.utils.planning.story_estimation import resolve_story_estimation
 from src.utils.planning.templates import (
     generate_template_formating,
     get_selected_template_by_project,
@@ -121,6 +122,7 @@ def _load_context_node(state: UserStoryGraphState) -> Dict[str, Any]:
         "user_story_id",
         "order",
         "dependencies",
+        "tshirt_size",
         "story_points",
         "effortHours",
     ] + template_field_keys
@@ -148,6 +150,7 @@ def _brainstorm_node(state: UserStoryGraphState) -> Dict[str, Any]:
         "user_story_id",
         "order",
         "dependencies",
+        "tshirt_size",
         "story_points",
         "effortHours",
     ]
@@ -250,8 +253,14 @@ def _normalize_generated_story(
     normalized["description"] = description
     normalized["user_story_id"] = user_story_id
     normalized["order"] = order
+    tshirt_size, effort_hours = resolve_story_estimation(
+        story.get("tshirt_size", story.get("tshirtSize")),
+        story.get("effortHours", story.get("effort_hours")),
+    )
+    normalized["tshirt_size"] = tshirt_size
+    normalized["tshirtSize"] = tshirt_size
     normalized["story_points"] = int(story.get("story_points") or story.get("storyPoints") or 0)
-    normalized["effortHours"] = float(story.get("effortHours") or story.get("effort_hours") or 0)
+    normalized["effortHours"] = effort_hours
     normalized["dependencies"] = dependencies
     normalized["acceptanceCriteria"] = acceptance
     normalized["outOfScope"] = out_of_scope

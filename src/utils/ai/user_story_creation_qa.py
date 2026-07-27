@@ -10,6 +10,7 @@ from src.schemas.user_data import UserData
 from src.intelligence.runtime import AgentName, run_agent
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.utils.core.validation_utils import get_code_block
+from src.utils.planning.story_estimation import resolve_story_estimation
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +237,7 @@ Return ONLY valid JSON for a single object with this shape:
   "user_story_id": "Optional short ID like US-123 (omit if unsure).",
   "order": 0,
   "dependencies": ["Optional IDs or titles this depends on"],
+  "tshirt_size": "M",
   "effortHours": 0,
   "story_points": 0,
   "acceptanceCriteria": ["Acceptance criterion 1", "Acceptance criterion 2"],
@@ -259,7 +261,14 @@ Return ONLY valid JSON for a single object with this shape:
 
 Rules:
 - Keep the story small and testable.
-- If order/effort/story_points are unknown, set them to 0.
+- Use these exact complexity ranges:
+  - XS: 2-4 hours
+  - S: 4-8 hours
+  - M: 8-16 hours
+  - L: 16-32 hours
+  - XL: 32-60 hours
+- If the story can be estimated, set `tshirt_size` and choose `effortHours` inside that range.
+- If order/effort/story_points are unknown, set them to 0 and `tshirt_size` to an empty string.
 - dependencies must be an array (can be empty).
 - For any document section that cannot be determined, use an empty string or 'N/A'.
 - acceptanceCriteria must contain at least 3 items.
@@ -277,6 +286,7 @@ Rules:
         "user_story_id": str(parsed.get("user_story_id") or "").strip(),
         "order": parsed.get("order", 0),
         "dependencies": parsed.get("dependencies", []),
+        "tshirt_size": str(parsed.get("tshirt_size") or parsed.get("tshirtSize") or "").strip().upper(),
         "effortHours": parsed.get("effortHours", 0),
         "story_points": parsed.get("story_points", 0),
     }
@@ -321,6 +331,10 @@ Rules:
         draft["effortHours"] = float(draft.get("effortHours") or 0)
     except Exception:
         draft["effortHours"] = 0
+    draft["tshirt_size"], draft["effortHours"] = resolve_story_estimation(
+        draft.get("tshirt_size"),
+        draft.get("effortHours"),
+    )
     try:
         draft["story_points"] = int(draft.get("story_points") or 0)
     except Exception:

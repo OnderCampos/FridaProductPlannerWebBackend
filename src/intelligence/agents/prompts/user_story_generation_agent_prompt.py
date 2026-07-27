@@ -36,8 +36,15 @@ STORY CREATION GUIDELINES:
 - Consider responsive/mobile behavior only when it is relevant to the epic.
 
 ESTIMATION AND DEPENDENCY RULES:
-- `story_points` must use Fibonacci values: 1, 2, 3, 5, 8, 13, 21.
-- `effortHours` must be a positive number greater than 0.
+- `tshirt_size` is the primary complexity estimate and must be one of XS, S, M, L, XL.
+- Use these exact effort ranges:
+  - XS: 2-4 hours
+  - S: 4-8 hours
+  - M: 8-16 hours
+  - L: 16-32 hours
+  - XL: 32-60 hours
+- `effortHours` must be a positive number greater than 0 and MUST stay inside the chosen `tshirt_size` range.
+- `story_points` is a legacy compatibility field. Set it to 0 unless the surrounding context explicitly requires a specific point value.
 - `dependencies` must be an array of `user_story_id` values that should be completed first.
 - Foundation stories may use an empty dependency array.
 - Dependencies must reflect a logical build order and should not create cycles.
@@ -54,6 +61,7 @@ For each user story, provide the following information:
 - Description
 - User Story ID
 - Order
+- T-Shirt Size
 - Story Points
 - Effort Hours
 - Dependencies
@@ -74,7 +82,8 @@ Respond ONLY with valid JSON in this exact top-level shape:
       "description": "",
       "user_story_id": "",
       "order": 1,
-      "story_points": 3,
+      "tshirt_size": "M",
+      "story_points": 0,
       "effortHours": 4,
       "dependencies": [],
       "acceptanceCriteria": ["..."],

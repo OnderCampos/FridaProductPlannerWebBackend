@@ -10,7 +10,10 @@ from src.utils.authz.users import get_user_profile
 from src.utils.planning.projects import get_project_for_user
 from src.utils.authz.permissions import get_project_access
 from src.utils.planning.user_stories import get_user_story_by_id, get_user_stories_by_epic
-from src.utils.planning.subtask_generation import get_subtasks_by_user_story
+from src.utils.planning.subtask_generation import (
+    get_subtasks_by_user_story,
+    get_subtask_by_id as get_normalized_subtask_by_id,
+)
 from src.utils.planning.epics import get_epics_for_project, get_epic_by_id
 
 
@@ -165,33 +168,38 @@ def _get_sprint_doc(sprint_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[
     return sprint_data, sprint_ref
 
 
+def _get_sprint_item_assignment_doc(
+    sprint_id: str,
+    project_id: str,
+    item_type: str,
+    item_id: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    assignments = FIRESTORE_CLIENT.collection(SPRINT_ITEMS_COLLECTION).where(
+        "sprint_id", "==", sprint_id
+    ).where(
+        "project_id", "==", project_id
+    ).where(
+        "item_type", "==", item_type
+    ).where(
+        "item_id", "==", item_id
+    ).limit(1).get()
+
+    for doc in assignments:
+        assignment = doc.to_dict() or {}
+        assignment["id"] = doc.id
+        return assignment, doc.reference
+
+    return None, None
+
+
 def _get_subtask_by_id(subtask_id: str, user_id: str, allow_member: bool = False, user_email: Optional[str] = None) -> ResponseModel:
     try:
-        subtask_ref = FIRESTORE_CLIENT.collection("subtasks").document(subtask_id)
-        subtask_doc = subtask_ref.get()
-        if not subtask_doc.exists:
-            return ResponseModel(success=False, message="Subtask not found", data=None)
-
-        subtask_data = subtask_doc.to_dict()
-        subtask_data["id"] = subtask_doc.id
-
-        if subtask_data.get("user_id") != user_id and not allow_member:
-            return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
-        if subtask_data.get("user_id") != user_id and allow_member:
-            project_id = subtask_data.get("project_id")
-            if project_id:
-                access = get_project_access(project_id, user_id, user_email)
-                if not access.success:
-                    return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
-            else:
-                story_id = subtask_data.get("user_story_id")
-                if not story_id:
-                    return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
-                story_response = get_user_story_by_id(story_id, user_id, allow_member=True, user_email=user_email)
-                if not story_response.success:
-                    return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
-
-        return ResponseModel(success=True, message="Subtask retrieved successfully", data=subtask_data)
+        return get_normalized_subtask_by_id(
+            subtask_id,
+            user_id,
+            allow_member=allow_member,
+            user_email=user_email,
+        )
     except Exception as e:
         logging.error(f"Error retrieving subtask {subtask_id}: {e}")
         return ResponseModel(success=False, message=f"Error retrieving subtask: {str(e)}", data=None)
@@ -586,6 +594,7 @@ def assign_item_to_sprint(
             "user_id": user_id,
             "item_type": normalized_type,
             "item_id": item_id,
+            "plannedStartDate": None,
             "order": max_order + 1,
             "created_at": now,
             "updated_at": now,
@@ -757,6 +766,7 @@ def get_sprint_items(
                     "type": "story",
                     "id": item_id,
                     "item_id": item_id,
+                    "plannedStartDate": assignment.get("plannedStartDate"),
                     "title": title,
                     "user_story_id": story.get("user_story_id"),
                     "epicName": epic_cache.get(epic_id, "") if epic_id else "",
@@ -789,6 +799,7 @@ def get_sprint_items(
                     "type": "subtask",
                     "id": item_id,
                     "item_id": item_id,
+                    "plannedStartDate": assignment.get("plannedStartDate"),
                     "title": subtask.get("title", ""),
                     "task_id": subtask.get("task_id"),
                     "storyTitle": story_title,
@@ -801,6 +812,7 @@ def get_sprint_items(
                     "assignee": subtask.get("assignee"),
                     "assigneeId": subtask.get("assigneeId") or subtask.get("assigned_to"),
                     "assigneeEmail": subtask.get("assignee_email") or subtask.get("assigneeEmail"),
+                    "startDate": subtask.get("startDate"),
                     "createdDate": subtask.get("createdDate"),
                     "created_at": subtask.get("created_at"),
                     "estimated_hours": subtask.get("estimated_hours"),
@@ -812,6 +824,57 @@ def get_sprint_items(
     except Exception as e:
         logging.error(f"Error retrieving sprint items for sprint {sprint_id}: {e}")
         return ResponseModel(success=False, message=f"Error retrieving sprint items: {str(e)}", data=None)
+
+
+def update_sprint_item_schedule(
+    sprint_id: str,
+    project_id: str,
+    user_id: str,
+    item_type: str,
+    item_id: str,
+    planned_start_date: Optional[str] = None,
+) -> ResponseModel:
+    try:
+        project_response = _get_project_or_error(project_id, user_id)
+        if not project_response.success:
+            return project_response
+
+        sprint_data, _ = _get_sprint_doc(sprint_id)
+        if not sprint_data:
+            return ResponseModel(success=False, message="Sprint not found", data=None)
+        if sprint_data.get("project_id") != project_id:
+            return ResponseModel(success=False, message="Sprint does not belong to this project", data=None)
+        if sprint_data.get("user_id") != user_id:
+            return ResponseModel(success=False, message="Unauthorized: You don't own this sprint", data=None)
+
+        normalized_type = (item_type or "").strip().lower()
+        if normalized_type not in {"story", "subtask"}:
+            return ResponseModel(success=False, message="Invalid item type", data=None)
+
+        assignment, assignment_ref = _get_sprint_item_assignment_doc(
+            sprint_id=sprint_id,
+            project_id=project_id,
+            item_type=normalized_type,
+            item_id=item_id,
+        )
+        if not assignment or not assignment_ref:
+            return ResponseModel(success=False, message="Assignment not found", data=None)
+
+        update_data = {
+            "plannedStartDate": planned_start_date,
+            "updated_at": _current_timestamp_iso(),
+        }
+        assignment_ref.update(update_data)
+
+        assignment.update(update_data)
+        return ResponseModel(
+            success=True,
+            message="Sprint item schedule updated successfully",
+            data=assignment,
+        )
+    except Exception as e:
+        logging.error(f"Error updating sprint item schedule for sprint {sprint_id}: {e}")
+        return ResponseModel(success=False, message=f"Error updating sprint item schedule: {str(e)}", data=None)
 
 
 def list_available_items(
@@ -945,6 +1008,7 @@ def list_available_items(
                     "task_type": subtask.get("task_type") or subtask.get("type"),
                     "status": coerce_workflow_status(subtask.get("status"), default="To Do"),
                     "assignee": subtask.get("assignee"),
+                    "startDate": subtask.get("startDate"),
                     "createdDate": subtask.get("createdDate"),
                     "created_at": subtask.get("created_at"),
                     "estimated_hours": subtask.get("estimated_hours"),

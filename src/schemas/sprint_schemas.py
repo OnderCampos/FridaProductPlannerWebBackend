@@ -33,3 +33,9 @@ class SprintOrderRequest(BaseModel):
 
 class SprintItemsOrderRequest(BaseModel):
     order: List[str]
+
+
+class UpdateSprintItemScheduleRequest(BaseModel):
+    type: str
+    id: str
+    plannedStartDate: Optional[str] = None

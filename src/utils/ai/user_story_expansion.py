@@ -10,6 +10,7 @@ from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
 from src.intelligence.runtime import AgentName, run_agent
 from src.utils.core.validation_utils import get_code_block
+from src.utils.planning.story_estimation import resolve_story_estimation
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +267,7 @@ Return ONLY valid JSON with this structure:
       "user_story_id": "Optional short ID (omit if unsure)",
       "order": 0,
       "dependencies": [],
+      "tshirt_size": "M",
       "effortHours": 0,
       "story_points": 0
     }}
@@ -278,6 +280,13 @@ Rules:
 - dependencies must be an array (can be empty).
 - acceptanceCriteria must be a non-empty array.
 - outOfScope must be a non-empty array (use \"N/A\" if none).
+- Use these exact complexity ranges:
+  - XS: 2-4 hours
+  - S: 4-8 hours
+  - M: 8-16 hours
+  - L: 16-32 hours
+  - XL: 32-60 hours
+- When you choose a `tshirt_size`, `effortHours` must stay inside that range.
 - If images are attached, inspect them first and extract visible UI components, forms, buttons, navigation, empty/loading/error states, and important fields.
 - Use image-derived UI evidence to complement the written goal/instruction, especially in description, acceptanceCriteria, and document.* fields.
 - Do not invent unsupported details from the images. Be explicit but conservative.
@@ -347,6 +356,11 @@ Rules:
                 title,
             )
 
+        tshirt_size, effort_hours = resolve_story_estimation(
+            item.get("tshirt_size", item.get("tshirtSize")),
+            item.get("effortHours"),
+        )
+
         next_item = {
             "epic": epic_name or "",
             "user_story": title,
@@ -354,7 +368,9 @@ Rules:
             "user_story_id": story_id,
             "order": _normalize_number(item.get("order"), 0),
             "dependencies": dependencies,
-            "effortHours": _normalize_float(item.get("effortHours"), 0),
+            "tshirt_size": tshirt_size,
+            "tshirtSize": tshirt_size,
+            "effortHours": effort_hours,
             "story_points": _normalize_number(item.get("story_points"), 0),
             "acceptanceCriteria": acceptance_criteria,
             "outOfScope": out_of_scope,

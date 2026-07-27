@@ -89,6 +89,7 @@ def _build_story_backlog_item(story: dict, project_id: str, project_name: str, p
         "user_story": story.get("user_story"),
         "status": status,
         "priority": priority,
+        "tshirt_size": story.get("tshirt_size") or story.get("tshirtSize"),
         "storyPoints": story_points,
         "dueDate": due_date,
         "effort_hours": story.get("effort_hours") or story.get("effortHours"),
@@ -595,6 +596,10 @@ async def update_backlog_item_status(
             # and give the sprint timeline a real start point.
             update_data["startDate"] = _current_timestamp_iso()
     if normalized_type == "subtask":
+        # Keep actual start dates consistent with the task status endpoints.
+        # The sprint's plannedStartDate is persisted independently.
+        if status == "In Progress":
+            update_data["startDate"] = _current_timestamp_iso()
         if status == "Done":
             update_data["completed_date"] = _current_timestamp_iso()
         else:

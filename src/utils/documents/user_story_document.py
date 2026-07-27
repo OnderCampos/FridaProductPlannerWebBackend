@@ -1311,14 +1311,14 @@ def build_user_story_document_bytes(
     )
     estimation_table = doc.add_table(rows=3, cols=4)
     _set_table_style(estimation_table)
-    for idx, header in enumerate(["User Points", "Time Estimated", "Estimated by", "Estimation Date"]):
+    for idx, header in enumerate(["Complexity Size", "Time Estimated", "Estimated by", "Estimation Date"]):
         estimation_table.cell(0, idx).text = header
     _style_table_header_row(estimation_table)
-    estimation_table.cell(1, 0).text = "<#>User Points"
+    estimation_table.cell(1, 0).text = "<Size>"
     estimation_table.cell(1, 1).text = "<Time>"
     estimation_table.cell(1, 2).text = "<Name>"
     estimation_table.cell(1, 3).text = "DD.MM.YYYY"
-    estimation_table.cell(2, 0).text = str(story.get("storyPoints") or story.get("story_points") or "")
+    estimation_table.cell(2, 0).text = str(story.get("tshirt_size") or story.get("tshirtSize") or "")
     estimation_table.cell(2, 1).text = str(document.get("estimation_dev") or "")
     estimation_table.cell(2, 2).text = str(document.get("estimated_by") or "")
     estimation_table.cell(2, 3).text = _now_display_date().replace(".", "/")

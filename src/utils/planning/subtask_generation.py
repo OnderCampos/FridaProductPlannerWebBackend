@@ -694,7 +694,17 @@ def _serialize_subtask(subtask_data: Dict[str, Any], subtask_id: Optional[str] =
     serialized["type"] = task_type
     serialized["status"] = coerce_workflow_status(serialized.get("status"), default="To Do")
     serialized["dependencies"] = serialized.get("dependencies") or []
-    serialized["estimated_hours"] = serialized.get("estimated_hours", 0)
+    serialized["estimated_hours"] = (
+        serialized.get("estimated_hours")
+        if serialized.get("estimated_hours") is not None
+        else serialized.get("estimatedHours")
+    )
+    if serialized["estimated_hours"] is None:
+        serialized["estimated_hours"] = (
+            serialized.get("effortHours")
+            if serialized.get("effortHours") is not None
+            else serialized.get("effort_hours", 0)
+        )
     serialized["complexity"] = serialized.get("complexity") or "Medium"
     tips_markdown = str(serialized.get("tips_markdown") or serialized.get("tipsMarkdown") or "").strip()
     if not tips_markdown:
@@ -1399,7 +1409,7 @@ async def batch_create_project_tasks_from_text(
         return ResponseModel(success=False, message=f"Error batch creating project tasks: {str(e)}", data=None)
 
 
-def _sync_parent_story_status_from_subtasks(user_story_id: str) -> Optional[str]:
+def _sync_parent_story_status_from_subtasks(user_story_id: str) -> Optional[Dict[str, Any]]:
     story_id = str(user_story_id or "").strip()
     if not story_id:
         return None
@@ -1410,26 +1420,44 @@ def _sync_parent_story_status_from_subtasks(user_story_id: str) -> Optional[str]
     if not subtask_docs:
         return None
 
-    all_subtasks_done = all(
-        coerce_workflow_status((doc.to_dict() or {}).get("status"), default="To Do") == "Done"
+    subtask_statuses = [
+        coerce_workflow_status((doc.to_dict() or {}).get("status"), default="To Do")
         for doc in subtask_docs
-    )
+    ]
+    all_subtasks_done = all(status == "Done" for status in subtask_statuses)
+    any_subtask_started = any(status != "To Do" for status in subtask_statuses)
     story_ref = FIRESTORE_CLIENT.collection("user_stories").document(story_id)
     story_doc = story_ref.get()
     if not story_doc.exists:
         return None
 
+    story_data = story_doc.to_dict() or {}
     current_status = coerce_workflow_status(
-        (story_doc.to_dict() or {}).get("status"),
+        story_data.get("status"),
         default="To Do",
     )
-    next_status = "Done" if all_subtasks_done else (
-        "In Progress" if current_status == "Done" else current_status
-    )
-    if next_status != current_status:
-        story_ref.update({"status": next_status, "updated_at": _current_timestamp_iso()})
+    current_start_date = story_data.get("startDate")
 
-    return next_status
+    if all_subtasks_done:
+        next_status = "Done"
+    elif any_subtask_started:
+        next_status = "In Progress"
+    else:
+        next_status = "To Do"
+
+    update_data: Dict[str, Any] = {}
+    if next_status != current_status:
+        update_data["status"] = next_status
+    if next_status == "In Progress" and not current_start_date:
+        update_data["startDate"] = _current_timestamp_iso()
+    if update_data:
+        update_data["updated_at"] = _current_timestamp_iso()
+        story_ref.update(update_data)
+
+    return {
+        "status": next_status,
+        "startDate": update_data.get("startDate") or current_start_date,
+    }
 
 
 def update_subtask_status(subtask_id: str, user_id: str, status: str, completed_date: str = None, user_name: Optional[str] = None, user_email: Optional[str] = None) -> ResponseModel:
@@ -1461,15 +1489,21 @@ def update_subtask_status(subtask_id: str, user_id: str, status: str, completed_
             "updated_at": now,
             "completed_date": completed_date if canonical_status == "Done" and completed_date else (now if canonical_status == "Done" else None),
         }
+        # A task's actual start must reflect when work began, rather than a
+        # previously planned future date. Sprint plannedStartDate stays on the
+        # sprint assignment and is intentionally not changed here.
+        if canonical_status == "In Progress":
+            update_data["startDate"] = now
 
         subtask_ref.update(update_data)
         updated_doc = subtask_ref.get()
         updated_data = _serialize_subtask(updated_doc.to_dict() or {}, updated_doc.id)
-        parent_story_status = _sync_parent_story_status_from_subtasks(
+        parent_story_sync = _sync_parent_story_status_from_subtasks(
             str(current_data.get("user_story_id") or "")
         )
-        if parent_story_status:
-            updated_data["parent_story_status"] = parent_story_status
+        if parent_story_sync:
+            updated_data["parent_story_status"] = parent_story_sync.get("status")
+            updated_data["parent_story_startDate"] = parent_story_sync.get("startDate")
 
         try:
             updated_data_for_notif = updated_data.copy()

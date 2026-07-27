@@ -9,6 +9,7 @@ from src.schemas.user_data import UserData
 from src.intelligence.runtime import AgentName, run_agent
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
+from src.utils.planning.story_estimation import resolve_story_estimation
 from src.utils.planning.user_stories import create_multiple_user_stories, _current_timestamp_iso
 
 
@@ -41,6 +42,8 @@ def transform_user_story_to_structured_format(story_data: Dict[str, Any], templa
         "updated_at",
         "order",
         "dependencies",
+        "tshirt_size",
+        "tshirtSize",
         "effortHours",
         "effort_hours",
         "fields",
@@ -60,6 +63,8 @@ def transform_user_story_to_structured_format(story_data: Dict[str, Any], templa
         "user_story_id": story_data.get("user_story_id", ""),
         "order": story_data.get("order", 0),
         "dependencies": story_data.get("dependencies", []),
+        "tshirt_size": story_data.get("tshirt_size", story_data.get("tshirtSize", "")),
+        "tshirtSize": story_data.get("tshirt_size", story_data.get("tshirtSize", "")),
         "effortHours": story_data.get("effortHours", story_data.get("effort_hours", 0)),
         "acceptanceCriteria": story_data.get("acceptanceCriteria", []),
         "outOfScope": story_data.get("outOfScope", []),
@@ -239,8 +244,8 @@ async def enrich_user_story_details(
                 "user_story_id": str(story.get("user_story_id") or "").strip(),
                 "user_story": str(story.get("user_story") or "").strip(),
                 "description": str(story.get("description") or "").strip(),
+                "existing_tshirt_size": str(story.get("tshirt_size") or story.get("tshirtSize") or "").strip(),
                 "existing_effort_hours": str(story.get("effortHours") or story.get("effort_hours") or "").strip(),
-                "existing_story_points": str(story.get("storyPoints") or story.get("story_points") or "").strip(),
             }
         )
 
@@ -253,8 +258,8 @@ You are a senior product owner and QA analyst.
 For EACH user story below, generate detailed requirement content that can be stored directly in a planning tool.
 
 Return for every item:
-- effortHours: a positive numeric effort estimate in hours when one is missing or zero
-- storyPoints: a positive integer story point estimate when one is missing or zero
+- tshirt_size: one of XS, S, M, L, XL
+- effortHours: a positive numeric effort estimate in hours that stays inside the chosen tshirt_size range
 - acceptanceCriteria: 3-6 short, testable bullet points
 - outOfScope: 1-4 bullet points (use ["N/A"] if truly none)
 - document: an object with these exact string keys:
@@ -278,6 +283,12 @@ Rules:
 - Use concise bullet-style text where it helps readability.
 - If a detail is unknown, use "N/A".
 - If an existing estimate is already provided and greater than zero, preserve it unless it is clearly inconsistent.
+- Use these exact complexity ranges:
+  - XS: 2-4 hours
+  - S: 4-8 hours
+  - M: 8-16 hours
+  - L: 16-32 hours
+  - XL: 32-60 hours
 - acceptance_criteria in the document must align with acceptanceCriteria.
 - out_of_scope in the document must align with outOfScope.
 - test_scenarios should cover happy path, edge cases, and failure/validation cases when relevant.
@@ -297,8 +308,8 @@ Expected JSON format:
 {{
   "items": [
     {{
+      "tshirt_size": "M",
       "effortHours": 6,
-      "storyPoints": 3,
       "acceptanceCriteria": ["..."],
       "outOfScope": ["..."],
       "document": {{
@@ -345,17 +356,10 @@ Expected JSON format:
             enriched.append(next_story)
             continue
 
-        effort_hours = _normalize_positive_float(extra.get("effortHours"))
-        if effort_hours <= 0:
-            effort_hours = _normalize_positive_float(
-                next_story.get("effortHours", next_story.get("effort_hours"))
-            )
-
-        story_points = _normalize_story_points(extra.get("storyPoints"))
-        if story_points <= 0:
-            story_points = _normalize_story_points(
-                next_story.get("storyPoints", next_story.get("story_points"))
-            )
+        tshirt_size, effort_hours = resolve_story_estimation(
+            extra.get("tshirt_size", extra.get("tshirtSize", next_story.get("tshirt_size", next_story.get("tshirtSize")))),
+            extra.get("effortHours", next_story.get("effortHours", next_story.get("effort_hours"))),
+        )
 
         acceptance = _normalize_string_list(extra.get("acceptanceCriteria"))
         if not acceptance:
@@ -384,10 +388,9 @@ Expected JSON format:
             "estimation_dev": str(document.get("estimation_dev") or "N/A").strip(),
         }
 
+        next_story["tshirt_size"] = tshirt_size
+        next_story["tshirtSize"] = tshirt_size
         next_story["effortHours"] = effort_hours
-        if story_points > 0:
-            next_story["story_points"] = story_points
-            next_story["storyPoints"] = story_points
         next_story["acceptanceCriteria"] = acceptance
         next_story["outOfScope"] = out_scope
         next_story["document"] = normalized_document
@@ -568,6 +571,8 @@ async def generate_user_stories(
                     "created_at": now,
                     "updated_at": now,
                     "createdDate": now,
+                    "tshirt_size": story.get("tshirt_size", story.get("tshirtSize", "")),
+                    "tshirtSize": story.get("tshirt_size", story.get("tshirtSize", "")),
                     "effortHours": story.get("effortHours", story.get("effort_hours", 0)),
                     "storyPoints": story.get("story_points", 0),
                 }
