@@ -1,9 +1,15 @@
 import logging
 import os
 from dotenv import load_dotenv
-from langchain_openai import AzureChatOpenAI
+# from langchain_openai import AzureChatOpenAI
+from langchain_openai import ChatOpenAI
 
 """The API key for the LLMOPS API."""
+FRIDA_API_ENDPOINT = os.getenv("FRIDA_API_ENDPOINT")
+FRIDA_API_KEY = os.getenv("FRIDA_API_KEY")
+MODEL_OLYMPUS_PEAK = os.getenv("MODEL_OLYMPUS_PEAK")
+MODEL_PUCK_SWIFT = os.getenv("MODEL_PUCK_SWIFT")
+
 LLMOPS_API_KEY = os.getenv("LLMOPS_API_KEY")
 LOGGING_ENDPOINT = os.getenv("LOGGING_ENDPOINT")
 
@@ -40,14 +46,26 @@ NOTIFICATION_SENDER_NAME = os.getenv(
 
 logging.getLogger(__name__).info("Setting up Azure Chat OpenAI clients...")
 
-gpt_client = AzureChatOpenAI(
-    azure_deployment=GPT_DEPLOYMENT or MINI_DEPLOYMENT,
-    api_version=os.getenv("API_VERSION"),
+# gpt_client = AzureChatOpenAI(
+#     azure_deployment=GPT_DEPLOYMENT or MINI_DEPLOYMENT,
+#     api_version=os.getenv("API_VERSION"),
+# )
+
+# gpt_mini_client = AzureChatOpenAI(
+#     azure_deployment=MINI_DEPLOYMENT or GPT_DEPLOYMENT,
+#     api_version=os.getenv("API_VERSION"),
+# )
+
+gpt_client = ChatOpenAI(
+    model=MODEL_OLYMPUS_PEAK or MODEL_PUCK_SWIFT,
+    base_url=FRIDA_API_ENDPOINT,
+    api_key=FRIDA_API_KEY,
 )
 
-gpt_mini_client = AzureChatOpenAI(
-    azure_deployment=MINI_DEPLOYMENT or GPT_DEPLOYMENT,
-    api_version=os.getenv("API_VERSION"),
+gpt_mini_client = ChatOpenAI(
+    model=MODEL_PUCK_SWIFT or MODEL_OLYMPUS_PEAK,
+    base_url=FRIDA_API_ENDPOINT,
+    api_key=FRIDA_API_KEY,
 )
 
 # Backward-compatible aliases for existing imports.

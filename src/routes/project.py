@@ -6,6 +6,7 @@ import re
 import secrets
 import string
 
+from src.schemas.workflow_status import coerce_workflow_status
 from src.schemas.resources_request import (
     GetProjectsRequest,
     GetProjectRequest,

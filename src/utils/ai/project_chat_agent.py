@@ -17,6 +17,9 @@ from langchain_core.tools import StructuredTool
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
 from src.services.setup.variables_setup import gpt40_mini_client
+from src.services.setup.firebase_setup import FIRESTORE_CLIENT
+from src.services.setup.variables_setup import FRIDA_API_ENDPOINT, FRIDA_API_KEY, MODEL_PUCK_SWIFT
+from langchain_openai import ChatOpenAI
 from src.services.setup.language_setup import get_default_llm_language, normalize_language
 from src.utils.planning.epics import (
     create_epic,
@@ -3182,8 +3185,81 @@ def run_project_chat_agent(
         ),
     ]
 
+    # tool_map = {tool.name: tool for tool in tools}
+    # llm = gpt40_mini_client.bind_tools(tools)
+
     tool_map = {tool.name: tool for tool in tools}
-    llm = gpt40_mini_client.bind_tools(tools)
+
+    # Leemos el modelo en tiempo real desde Firebase
+    # fallback = MODEL_PUCK_SWIFT or "PUCK-SWIFT"
+    # active_model = fallback
+    # try:
+    #     doc = FIRESTORE_CLIENT.collection("llm_settings").document("ai_settings").get()
+    #     if doc.exists:
+    #         active_model = doc.to_dict().get("active_model_id", fallback)
+    # except Exception:
+    #     pass
+
+    # active_model = str(active_model).replace("_", "-")
+
+    # # Creamos el cliente fresco y seguro
+    # fresh_client = ChatOpenAI(
+    #     model=active_model,
+    #     base_url=FRIDA_API_ENDPOINT,
+    #     api_key=FRIDA_API_KEY
+    # )
+
+    # # Inyectamos los datos del usuario en el extra_body
+    # user_id_val = user_data.get_user_id()
+    # user_email_val = user_data.get_email()
+    # if user_id_val or user_email_val:
+    #     fresh_client = fresh_client.bind(
+    #         extra_body={
+    #             "email": user_email_val or "unknown@email.com",
+    #             "user_id": user_id_val or "unknown_user"
+    #         }
+    #     )
+
+    # # Atamos las herramientas al cliente configurado
+    # llm = fresh_client.bind_tools(tools)
+
+    # Leemos el modelo en tiempo real desde Firebase
+    fallback = MODEL_PUCK_SWIFT or "PUCK-SWIFT"
+    active_model = fallback
+    try:
+        doc = FIRESTORE_CLIENT.collection("llm_settings").document("ai_settings").get()
+        if doc.exists:
+            active_model = doc.to_dict().get("active_model_id", fallback)
+    except Exception:
+        pass
+        
+    active_model = str(active_model).replace("_", "-")
+
+    print(f"[PROJECT_CHAT_AGENT] MODELO USADO DE FIREBASE: {active_model}")
+
+    # Preparamos los datos del usuario DESDE ANTES (model_kwargs)
+    extra_body_data = None
+    user_id_val = user_data.get_user_id()
+    user_email_val = user_data.get_email()
+
+    print(F"[AZURE_SERVICE] USER EMAIL: {user_email_val} Y USER ID: {user_id_val}")
+
+    if user_id_val or user_email_val:
+        extra_body_data = {
+            "email": user_email_val or "unknown_email",
+            "user_id": user_id_val or "unknown_user"
+        }
+
+    # Creamos el cliente inyectándole el extra_body directamente en su configuración
+    fresh_client = ChatOpenAI(
+        model=active_model,
+        base_url=FRIDA_API_ENDPOINT,
+        api_key=FRIDA_API_KEY,
+        extra_body=extra_body_data
+    )
+
+    # Atamos las herramientas (ya no usamos otro .bind() extra)
+    llm = fresh_client.bind_tools(tools)
 
     def _assistant_node(state: AgentState) -> Dict[str, List[BaseMessage]]:
         response = llm.invoke(state["messages"])

@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 # Third-Party Library Imports
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
 # Local Application Imports
 from src.utils.ai.llmops_utils import log_to_llmops
@@ -14,12 +15,16 @@ from src.utils.core.logging import add_request_log
 from src.utils.planning.team import get_team_name
 from src.utils.core.validation_utils import has_expected_epic_structure, get_code_block
 from src.utils.ai.llm_graph import invoke_model_with_graph
+from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.services.setup.variables_setup import (
     gpt_client,
     gpt_mini_client,
     GPT_DEPLOYMENT,
     MINI_DEPLOYMENT,
     LLMOPS_API_KEY,
+    FRIDA_API_ENDPOINT, 
+    FRIDA_API_KEY, 
+    MODEL_PUCK_SWIFT
 )
 from src.services.setup.language_setup import build_llm_language_system_prompt, get_default_llm_language
 from src.utils.knowledge_bases import schemas, general
@@ -164,19 +169,81 @@ class AzureChatService:
             "image_url": {"url": image_data},
         }
 
+    # def _resolve_client(self, model_tier: str = "mini", use_images: bool = False):
+    #     normalized_tier = "gpt" if str(model_tier or "").strip().lower() == "gpt" else "mini"
+    #     logger = logging.getLogger(__name__)
+
+    #     if use_images or normalized_tier == "gpt":
+    #         if use_images:
+    #             logger.info("Using GPT deployment with image support")
+    #         else:
+    #             logger.info("Using GPT deployment")
+    #         return gpt_client, GPT_DEPLOYMENT or MINI_DEPLOYMENT
+
+    #     logger.info("Using mini deployment")
+    #     return gpt_mini_client, MINI_DEPLOYMENT or GPT_DEPLOYMENT
+
+    # def _resolve_client(self, model_tier: str = "mini", use_images: bool = False):
+    #     logger = logging.getLogger(__name__)
+    #     logger.info(f"Resolving dynamic client for tier: {model_tier}")
+
+    #     # Leemos el modelo en tiempo real desde Firebase
+    #     fallback = MODEL_PUCK_SWIFT or "PUCK-SWIFT"
+    #     active_model = fallback
+        
+    #     try:
+    #         doc = FIRESTORE_CLIENT.collection("llm_settings").document("ai_settings").get()
+    #         if doc.exists:
+    #             active_model = doc.to_dict().get("active_model_id", fallback)
+    #     except Exception as e:
+    #         logger.warning(f"Error reading model from Firebase: {e}")
+
+    #     # Blindamos el string contra guiones bajos
+    #     active_model = str(active_model).replace("_", "-")
+
+    #     print(F"[AZURE_SERVICES] MODELO USADO DE FIREBASE: {active_model}")
+
+    #     # Creamos el cliente fresco
+    #     fresh_client = ChatOpenAI(
+    #         model=active_model,
+    #         base_url=FRIDA_API_ENDPOINT,
+    #         api_key=FRIDA_API_KEY
+    #     )
+
+    #     return fresh_client, active_model
+
     def _resolve_client(self, model_tier: str = "mini", use_images: bool = False):
-        normalized_tier = "gpt" if str(model_tier or "").strip().lower() == "gpt" else "mini"
         logger = logging.getLogger(__name__)
 
-        if use_images or normalized_tier == "gpt":
-            if use_images:
-                logger.info("Using GPT deployment with image support")
-            else:
-                logger.info("Using GPT deployment")
-            return gpt_client, GPT_DEPLOYMENT or MINI_DEPLOYMENT
+        # Leemos de Firebase
+        fallback = MODEL_PUCK_SWIFT or "PUCK-SWIFT"
+        active_model = fallback
+        try:
+            doc = FIRESTORE_CLIENT.collection("llm_settings").document("ai_settings").get()
+            if doc.exists:
+                active_model = doc.to_dict().get("active_model_id", fallback)
+        except Exception:
+            pass
 
-        logger.info("Using mini deployment")
-        return gpt_mini_client, MINI_DEPLOYMENT or GPT_DEPLOYMENT
+        active_model = str(active_model).replace("_", "-")
+
+        # Preparamos los datos
+        extra_body_data = None
+        if getattr(self, "user_id", None) or getattr(self, "user_email", None):
+            extra_body_data = {
+                "email": self.user_email or "unknown_email",
+                "user_id": self.user_id or "unknown_user"
+            }
+
+        # Instanciamos con extra_body
+        fresh_client = ChatOpenAI(
+            model=active_model,
+            base_url=FRIDA_API_ENDPOINT,
+            api_key=FRIDA_API_KEY,
+            extra_body=extra_body_data
+        )
+
+        return fresh_client, active_model
 
     async def call_with_retry(
         self,
@@ -273,10 +340,25 @@ class AzureChatService:
             messages_list.insert(insert_at, language_message)
 
         # Invoke the chat service
+        # client, selected_deployment = self._resolve_client(
+        #     model_tier=model_tier,
+        #     use_images=use_images,
+        # )
+        # if self.user_id or self.user_email:
+        #     client = client.bind(
+        #         extra_body={
+        #             "email": self.user_email or "unknown_email",
+        #             "user_id": self.user_id or "unknown_user"
+        #         }
+        #     )
+
         client, selected_deployment = self._resolve_client(
             model_tier=model_tier,
             use_images=use_images,
         )
+
+        print(F"[AZURE_SERVICE] USER EMAIL: {self.user_email} Y USER ID: {self.user_id}")
+
         response = invoke_model_with_graph(client=client, messages=messages_list)
 
         prompt_tokens = response.response_metadata["token_usage"]["prompt_tokens"]
@@ -304,30 +386,31 @@ class AzureChatService:
             "team_name": team_name,
         }
         logger.debug("Logging to LLMOPS with additional kwargs: %s", additional_kwargs)
-        try:
-            prompt = ""
-            for message in messages_list:
-                prompt += f" {message.content}\n"
+        # try:
+        #     prompt = ""
+        #     for message in messages_list:
+        #         prompt += f" {message.content}\n"
 
-            logger.debug("Final prompt for LLMOPS logging: %s", prompt)
-            log_to_llmops(
-                prompt=prompt,
-                response=response.content,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens,
-                call_start=global_start,
-                created=datetime.now(timezone.utc).isoformat(),
-                uid="",
-                api_key=LLMOPS_API_KEY,
-                model=selected_deployment,
-                additional_kwargs=additional_kwargs,
-                email=self.user_email,
-                status="success",
-                team_id=self.team_id,
-            )
-        except Exception as e:
-            logger.warning("Error logging to LLMOPS: %s", e)
+        #     logger.debug("Final prompt for LLMOPS logging: %s", prompt)
+        #     log_to_llmops(
+        #         prompt=prompt,
+        #         response=response.content,
+        #         prompt_tokens=prompt_tokens,
+        #         completion_tokens=completion_tokens,
+        #         total_tokens=prompt_tokens + completion_tokens,
+        #         call_start=global_start,
+        #         created=datetime.now(timezone.utc).isoformat(),
+        #         uid="",
+        #         api_key=LLMOPS_API_KEY,
+        #         model=selected_deployment,
+        #         additional_kwargs=additional_kwargs,
+        #         email=self.user_email,
+        #         status="success",
+        #         team_id=self.team_id,
+        #     )
+        # except Exception as e:
+        #     logger.warning("Error logging to LLMOPS: %s", e)
+
         return response.content
 
     async def completion_without_knowledge_base(
