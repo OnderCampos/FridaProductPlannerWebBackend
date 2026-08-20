@@ -7,9 +7,13 @@ from time import perf_counter_ns
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_openai import AzureChatOpenAI
+# from langchain_openai import AzureChatOpenAI
+from langchain_openai import ChatOpenAI
 
-from src.services.setup.variables_setup import LLMOPS_API_KEY
+from firebase_admin import firestore
+from src.services.setup.firebase_setup import FIRESTORE_CLIENT
+
+from src.services.setup.variables_setup import LLMOPS_API_KEY, FRIDA_API_ENDPOINT, FRIDA_API_KEY, MODEL_PUCK_SWIFT
 from src.services.setup.language_setup import build_llm_language_system_prompt, get_default_llm_language, normalize_language
 from src.utils.ai.llm_graph import invoke_model_with_graph
 from src.utils.ai.llmops_utils import log_to_llmops
@@ -54,11 +58,23 @@ class Agent:
         self.__system_message_str = system_message
         self.__task = task
         self.__args = list(args) if args else None
-        self.__azure_deployment = (
-            azure_deployment
-            or os.getenv("AZURE_DEPLOYMENT")
-            or os.getenv("AZURE_DEPLOYMENT_MINI")
-        )
+        # self.__azure_deployment = (
+        #     azure_deployment
+        #     or os.getenv("AZURE_DEPLOYMENT")
+        #     or os.getenv("AZURE_DEPLOYMENT_MINI")
+        # )
+
+        # self.__fallback_deployment = (
+        #     azure_deployment
+        #     or MODEL_PUCK_SWIFT
+        #     or "PUCK-SWIFT"
+        # )
+        # self.__azure_deployment = None
+
+        raw_fallback = azure_deployment or MODEL_PUCK_SWIFT or "PUCK-SWIFT"
+        self.__fallback_deployment = str(raw_fallback).replace("_", "-")
+        self.__azure_deployment = None
+
         self.__api_version = os.getenv("API_VERSION")
         self.__tools = list(tools) if tools else []
         self.__tool_handlers = dict(tool_handlers) if tool_handlers else {}
@@ -69,7 +85,19 @@ class Agent:
             raise ValueError("Agent args list must not contain duplicates.")
         if self.__tools:
             self.__validate_tools_config()
-        self.__create_agent()
+        # self.__create_agent()
+
+    def __get_active_model_from_firebase(self, fallback: str) -> str:
+        try:
+            doc_ref = FIRESTORE_CLIENT.collection("llm_settings").document("ai_settings")
+            doc = doc_ref.get()
+            
+            if doc.exists:
+                return doc.to_dict().get("active_model_id", fallback)
+            return fallback
+        except Exception as e:
+            logger.warning(f"Error fetching model from Firebase, using fallback: {e}")
+            return fallback
 
     def __validate_tools_config(self):
         tool_names = []
@@ -98,21 +126,26 @@ class Agent:
                 f"Missing tool handlers for {self.__name}: {', '.join(sorted(missing_handlers))}"
             )
 
-    def __create_agent(self):
-        self.agent = AzureChatOpenAI(
-            azure_deployment=self.__azure_deployment,
-            api_version=self.__api_version,
-        )
-        self.agent_with_tools = (
-            self.agent.bind_tools(self.__tools, tool_choice=self.__tool_choice)
-            if self.__tools
-            else self.agent
-        )
-        self.__system_message = (
-            SystemMessage(content=self.__system_message_str)
-            if self.__system_message_str
-            else None
-        )
+    # def __create_agent(self):
+    #     # self.agent = AzureChatOpenAI(
+    #     #     azure_deployment=self.__azure_deployment,
+    #     #     api_version=self.__api_version,
+    #     # )
+    #     self.agent = ChatOpenAI(
+    #         model=self.__azure_deployment,
+    #         base_url=FRIDA_API_ENDPOINT,
+    #         api_key=FRIDA_API_KEY
+    #     )
+    #     self.agent_with_tools = (
+    #         self.agent.bind_tools(self.__tools, tool_choice=self.__tool_choice)
+    #         if self.__tools
+    #         else self.agent
+    #     )
+    #     self.__system_message = (
+    #         SystemMessage(content=self.__system_message_str)
+    #         if self.__system_message_str
+    #         else None
+    #     )
 
     def __format_value(self, value: Any) -> str:
         if isinstance(value, (dict, list)):
@@ -183,8 +216,53 @@ class Agent:
         except TypeError:
             return handler(tool_args)
 
-    def __invoke(self, messages: List[Any], use_tools: bool = False):
-        client = self.agent_with_tools if use_tools else self.agent
+    # def __invoke(self, messages: List[Any], use_tools: bool = False, execution_kwargs: Optional[Dict[str, Any]] = None):
+    #     client = self.agent_with_tools if use_tools else self.agent
+
+    #     if execution_kwargs:
+    #         user_id, _, email, _ = self.__extract_user_context(execution_kwargs)
+    #         if user_id or email:
+    #             client = client.bind(
+    #                 extra_body={
+    #                     "email": email or "unknown_email",
+    #                     "user_id": user_id or "unknown_user"
+    #                 }
+    #             )
+
+    #     return invoke_model_with_graph(client=client, messages=messages)
+
+    def __invoke(self, messages: List[Any], use_tools: bool = False, execution_kwargs: Optional[Dict[str, Any]] = None):
+        # Recuperamos el modelo activo
+        active_model = execution_kwargs.get("active_model", self.__fallback_deployment) if execution_kwargs else self.__fallback_deployment
+
+        print(F"[BASE_AGENT] MODELO USADO DE FIREBASE: {active_model}")
+
+        # Preparamos el extra_body seguro
+        extra_body_data = None
+        if execution_kwargs:
+            user_id, _, email, _ = self.__extract_user_context(execution_kwargs)
+            print(F"[BASE_AGENT] USER EMAIL: {email} Y USER ID: {user_id}")
+            if user_id or email:
+                extra_body_data = {
+                    "email": email or "unknown_email",
+                    "user_id": user_id or "unknown_user"
+                }
+
+        # Creamos el cliente de IA inyectando el extra_body
+        base_client = ChatOpenAI(
+            model=active_model,
+            base_url=FRIDA_API_ENDPOINT,
+            api_key=FRIDA_API_KEY,
+            extra_body=extra_body_data
+        )
+
+        # Atamos las herramientas si se requieren
+        client = (
+            base_client.bind_tools(self.__tools, tool_choice=self.__tool_choice)
+            if use_tools and self.__tools
+            else base_client
+        )
+
         return invoke_model_with_graph(client=client, messages=messages)
 
     def __run_with_tools(
@@ -193,11 +271,11 @@ class Agent:
         execution_kwargs: Dict[str, Any],
     ):
         if not self.__tools or self.__max_tool_calls <= 0:
-            return self.__invoke(messages=messages, use_tools=False)
+            return self.__invoke(messages=messages, use_tools=False, execution_kwargs=execution_kwargs)
 
         iterations = 0
         while iterations < self.__max_tool_calls:
-            response = self.__invoke(messages=messages, use_tools=True)
+            response = self.__invoke(messages=messages, use_tools=True, execution_kwargs=execution_kwargs)
             messages.append(response)
             tool_calls = getattr(response, "tool_calls", None) or []
             if not tool_calls:
@@ -221,7 +299,7 @@ class Agent:
                 )
             iterations += 1
 
-        return self.__invoke(messages=messages, use_tools=True)
+        return self.__invoke(messages=messages, use_tools=True, execution_kwargs=execution_kwargs)
 
     def bind_context(self, context: Optional[Dict[str, Any]] = None) -> BoundAgent:
         return BoundAgent(self, context)
@@ -294,41 +372,56 @@ class Agent:
         prompt_text = "\n".join(self.__to_text(getattr(msg, "content", msg)) for msg in messages)
         response_text = self.__to_text(getattr(response, "content", response))
 
-        try:
-            log_to_llmops(
-                prompt=prompt_text,
-                response=response_text,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens,
-                call_start=call_start_ns,
-                created=end_time.isoformat(),
-                uid=user_id or "",
-                api_key=LLMOPS_API_KEY,
-                model=self.__azure_deployment,
-                additional_kwargs={
-                    "agent_name": self.__name,
-                    "team_name": team_name,
-                    "duration_ms": int(elapsed_s * 1000),
-                },
-                email=email or "unknown_email",
-                status="success",
-                team_id=team_id,
-            )
-        except Exception:
-            logger.warning("Error logging agent call to LLMOPS.", exc_info=True)
+        # try:
+        #     log_to_llmops(
+        #         prompt=prompt_text,
+        #         response=response_text,
+        #         prompt_tokens=prompt_tokens,
+        #         completion_tokens=completion_tokens,
+        #         total_tokens=prompt_tokens + completion_tokens,
+        #         call_start=call_start_ns,
+        #         created=end_time.isoformat(),
+        #         uid=user_id or "",
+        #         api_key=LLMOPS_API_KEY,
+        #         # model=self.__azure_deployment,
+        #         model=execution_context.get("active_model", self.__fallback_deployment),
+        #         additional_kwargs={
+        #             "agent_name": self.__name,
+        #             "team_name": team_name,
+        #             "duration_ms": int(elapsed_s * 1000),
+        #         },
+        #         email=email or "unknown_email",
+        #         status="success",
+        #         team_id=team_id,
+        #     )
+        # except Exception:
+        #     logger.warning("Error logging agent call to LLMOPS.", exc_info=True)
 
     def _execute_with_context(
         self,
         prompt_kwargs: Dict[str, Any],
         execution_context: Optional[Dict[str, Any]] = None,
     ):
+        # self.__azure_deployment = self.__get_active_model_from_firebase(self.__fallback_deployment)
+
+        # self.__create_agent()
+
+        active_model = self.__get_active_model_from_firebase(self.__fallback_deployment)
+
         prompt_kwargs = dict(prompt_kwargs or {})
         execution_context = dict(execution_context or {})
 
         messages: List[Any] = []
-        if self.__system_message:
-            messages.append(self.__system_message)
+        # if self.__system_message:
+        #     messages.append(self.__system_message)
+
+        system_message_obj = (
+            SystemMessage(content=self.__system_message_str)
+            if self.__system_message_str
+            else None
+        )
+        if system_message_obj:
+            messages.append(system_message_obj)
 
         language_override = None
         if isinstance(prompt_kwargs.get("language"), str) and prompt_kwargs["language"].strip():
@@ -375,6 +468,7 @@ class Agent:
 
         combined_execution_kwargs = dict(prompt_kwargs)
         combined_execution_kwargs.update(execution_context)
+        combined_execution_kwargs["active_model"] = active_model
 
         global_start = perf_counter_ns()
         start_time = datetime.now(timezone.utc)
