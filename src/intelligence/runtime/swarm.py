@@ -1,18 +1,12 @@
-"""Swarm-style runtime for named Product Planner agents.
-
-Feature modules must call ``run_agent`` instead of constructing an LLM client.
-The Azure transport remains behind this boundary while the application migrates to
-the OpenAI Agents SDK. This keeps existing Azure deployment routing, language
-handling, token accounting, and LLMOps tracing stable during the rollout.
-"""
+"""Strands-backed runtime for named Product Planner agents."""
 
 from __future__ import annotations
 
 from enum import Enum
 from typing import Any, Optional, Sequence
 
+from src.intelligence.runtime.strands_runtime import invoke_swarm_async
 from src.schemas.user_data import UserData
-from src.services.azure_services import AzureChatService
 from src.services.setup.variables_setup import gpt_client, gpt_mini_client
 
 
@@ -50,16 +44,19 @@ async def run_agent(
     images: Optional[Sequence[str]] = None,
     knowledge_base_id: Optional[str] = None,
 ) -> str:
-    """Run a named agent through the sole supported LLM execution boundary."""
-    service = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=knowledge_base_id)
-    composed_prompt = f"{_agent_instruction(agent)}\n\n{prompt}"
-    if images:
-        return await service.simple_completion_with_images(
-            composed_prompt,
-            list(images),
-            model_tier=model_tier,
-        )
-    return await service.simple_completion(composed_prompt, model_tier=model_tier)
+    """Run a named agent through the shared two-agent Strands swarm boundary."""
+    result = await invoke_swarm_async(
+        agent_name=agent.value,
+        prompt=prompt,
+        system_prompt=_agent_instruction(agent),
+        model_tier=model_tier,
+        execution_context={
+            "user_data": user_data,
+            "knowledge_base_id": knowledge_base_id,
+        },
+        images=images,
+    )
+    return result.content
 
 
 def bind_agent_tools(
@@ -68,6 +65,6 @@ def bind_agent_tools(
     *,
     model_tier: str = "mini",
 ) -> Any:
-    """Bind tools for an agent-owned orchestration loop during the LangGraph transition."""
+    """Legacy LangChain tool binding kept for the project-chat orchestration loop."""
     client = gpt_client if str(model_tier).lower() == "gpt" else gpt_mini_client
     return client.bind_tools(list(tools))
