@@ -11,6 +11,7 @@ from src.schemas.sprint_schemas import (
     SprintItemsBulkRequest,
     SprintItemsOrderRequest,
     SprintOrderRequest,
+    UpdateSprintItemScheduleRequest,
 )
 from src.schemas.user_data import UserData
 from src.utils.authz.auth import get_current_user
@@ -27,6 +28,7 @@ from src.utils.planning.sprints import (
     bulk_update_sprint_items,
     reorder_sprint_items,
     reorder_sprints,
+    update_sprint_item_schedule,
 )
 
 router = APIRouter()
@@ -243,7 +245,7 @@ async def list_sprint_items_route(
     user_data: UserData = Depends(get_current_user),
 ):
     """
-    Returns all stories and subtasks assigned to the sprint.
+    Returns all user stories and independent tasks assigned to the sprint.
     """
     try:
         response = get_sprint_items(
@@ -275,7 +277,7 @@ async def assign_sprint_item_route(
     user_data: UserData = Depends(get_current_user),
 ):
     """
-    Assigns a user story or subtask to a sprint.
+    Assigns a user story or independent task to a sprint.
     """
     access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
     if not access.success:
@@ -306,6 +308,50 @@ async def assign_sprint_item_route(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.patch(
+    "/{project_id}/sprints/{sprint_id}/items",
+    response_description="Update sprint item schedule metadata",
+)
+async def update_sprint_item_schedule_route(
+    req: UpdateSprintItemScheduleRequest,
+    project_id: str = Path(..., description="The project ID"),
+    sprint_id: str = Path(..., description="The sprint ID"),
+    user_data: UserData = Depends(get_current_user),
+):
+    """
+    Updates sprint-specific planning fields for an assigned user story or
+    independent task.
+    """
+    if not req.type or not req.id:
+        raise HTTPException(status_code=400, detail="type and id are required")
+
+    access = get_project_access(project_id, user_data.get_user_id(), user_data.get_email())
+    if not access.success:
+        status_code = 404 if "not found" in access.message.lower() else 403
+        return JSONResponse(status_code=status_code, content=access.dict())
+    if not access.data.get("is_lead"):
+        raise HTTPException(status_code=403, detail="Forbidden: Team members cannot update sprint items")
+
+    try:
+        response = update_sprint_item_schedule(
+            sprint_id=sprint_id,
+            project_id=project_id,
+            user_id=user_data.get_user_id(),
+            item_type=req.type,
+            item_id=req.id,
+            planned_start_date=req.plannedStartDate,
+        )
+        return JSONResponse(
+            status_code=_status_from_response(response),
+            content=response.dict(),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to update sprint item schedule")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.delete(
     "/{project_id}/sprints/{sprint_id}/items",
     response_description="Unassign an item from a sprint",
@@ -319,7 +365,7 @@ async def unassign_sprint_item_route(
     user_data: UserData = Depends(get_current_user),
 ):
     """
-    Unassigns a user story or subtask from a sprint.
+    Unassigns a user story or independent task from a sprint.
     """
     resolved_type = (req.type if req else None) or item_type
     resolved_id = (req.id if req else None) or item_id

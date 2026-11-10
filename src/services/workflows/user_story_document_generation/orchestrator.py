@@ -139,6 +139,7 @@ def _trim_story_for_agent(story: Dict[str, Any]) -> Dict[str, Any]:
         "acceptanceCriteria": _coerce_list(story.get("acceptanceCriteria") or story.get("acceptance_criteria")),
         "outOfScope": _coerce_list(story.get("outOfScope") or story.get("out_of_scope")),
         "dependencies": _coerce_list(story.get("dependencies")),
+        "tshirt_size": str(story.get("tshirt_size") or story.get("tshirtSize") or "").strip(),
         "story_points": story.get("story_points") if story.get("story_points") is not None else story.get("storyPoints"),
         "effortHours": story.get("effortHours") if story.get("effortHours") is not None else story.get("effort_hours"),
     }

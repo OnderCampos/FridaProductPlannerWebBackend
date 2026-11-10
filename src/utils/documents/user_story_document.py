@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
-from src.services.azure_services import AzureChatService
+from src.intelligence.runtime import AgentName, run_agent
 from src.services.setup.firebase_setup import FIREBASE, FIRESTORE_CLIENT
 from src.services.setup.language_setup import get_default_llm_language, normalize_language
 from src.utils.core.validation_utils import get_code_block
@@ -211,8 +211,7 @@ Input JSON:
 """.strip()
 
     try:
-        azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-        raw = await azure.simple_completion(prompt, model_tier="mini")
+        raw = await run_agent(AgentName.USER_STORY_DOCUMENT, prompt, user_data, model_tier="mini")
         parsed = _safe_json_load(raw)
         if not isinstance(parsed, dict):
             return document
@@ -1312,14 +1311,14 @@ def build_user_story_document_bytes(
     )
     estimation_table = doc.add_table(rows=3, cols=4)
     _set_table_style(estimation_table)
-    for idx, header in enumerate(["User Points", "Time Estimated", "Estimated by", "Estimation Date"]):
+    for idx, header in enumerate(["Complexity Size", "Time Estimated", "Estimated by", "Estimation Date"]):
         estimation_table.cell(0, idx).text = header
     _style_table_header_row(estimation_table)
-    estimation_table.cell(1, 0).text = "<#>User Points"
+    estimation_table.cell(1, 0).text = "<Size>"
     estimation_table.cell(1, 1).text = "<Time>"
     estimation_table.cell(1, 2).text = "<Name>"
     estimation_table.cell(1, 3).text = "DD.MM.YYYY"
-    estimation_table.cell(2, 0).text = str(story.get("storyPoints") or story.get("story_points") or "")
+    estimation_table.cell(2, 0).text = str(story.get("tshirt_size") or story.get("tshirtSize") or "")
     estimation_table.cell(2, 1).text = str(document.get("estimation_dev") or "")
     estimation_table.cell(2, 2).text = str(document.get("estimated_by") or "")
     estimation_table.cell(2, 3).text = _now_display_date().replace(".", "/")

@@ -14,6 +14,7 @@ import httpx
 
 from src.schemas.project_creation import ProjectCreationInitializationData
 from src.schemas.user_data import UserData
+from src.schemas.workflow_status import coerce_workflow_status
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.services.workflows.project_creation.common import (
     ProjectKeyConflictError,
@@ -25,6 +26,8 @@ from src.utils.planning.epics import create_epic
 from src.utils.planning.user_story_dependencies import generate_and_persist_user_story_dependencies
 from src.utils.planning.user_stories import create_user_story, get_user_stories_by_epic
 from src.utils.planning.user_story_generation import enrich_user_story_details
+from src.utils.planning.subtask_generation import create_subtask_for_user_story
+from src.utils.firebase.identifier import get_next_TK_identifier
 
 
 logger = logging.getLogger(__name__)
@@ -75,6 +78,13 @@ def _sanitize_jira_base_url(value: str) -> str:
     host = parsed.netloc.lower()
     origin = f"{parsed.scheme}://{parsed.netloc}"
     path = parsed.path or ""
+
+    # OAuth requests to Jira Cloud must retain the Atlassian API gateway scope:
+    # https://api.atlassian.com/ex/jira/{cloudId}. Treat it as a base URL, not
+    # as a deep Jira UI path that can be shortened.
+    gateway_match = re.match(r"^/ex/jira/[^/]+", path)
+    if host == "api.atlassian.com" and gateway_match:
+        return f"{origin}{gateway_match.group(0)}".rstrip("/")
 
     # Jira Cloud: always use site origin (strip any `/jira/...` or `/wiki/...`).
     if host.endswith(".atlassian.net"):
@@ -167,8 +177,9 @@ class JiraApiError(JiraImportError):
 @dataclass(frozen=True)
 class JiraCredentials:
     base_url: str
-    email: str
-    api_token: str
+    email: str = ""
+    api_token: str = ""
+    access_token: str = ""
 
 
 class JiraClient:
@@ -191,11 +202,10 @@ class JiraClient:
         timeout = kwargs.pop("timeout", httpx.Timeout(30.0))
 
         last_error: Optional[Exception] = None
-        async with httpx.AsyncClient(
-            auth=(self.credentials.email, self.credentials.api_token),
-            timeout=timeout,
-            follow_redirects=True,
-        ) as client:
+        if self.credentials.access_token:
+            headers.setdefault("Authorization", f"Bearer {self.credentials.access_token}")
+        auth = (self.credentials.email, self.credentials.api_token) if self.credentials.email and self.credentials.api_token else None
+        async with httpx.AsyncClient(auth=auth, timeout=timeout, follow_redirects=True) as client:
             for api_version in self._api_versions:
                 url = self._build_url(api_version, path)
                 response = await client.request(method, url, headers=headers, **kwargs)
@@ -751,6 +761,9 @@ async def _persist_jira_import_metadata(
     jira_project_key: str,
     jira_base_url: str,
     status: str,
+    cloud_id: Optional[str] = None,
+    site_name: Optional[str] = None,
+    account_email: Optional[str] = None,
     stats: Optional[Dict[str, Any]] = None,
 ) -> None:
     update: Dict[str, Any] = {
@@ -759,6 +772,13 @@ async def _persist_jira_import_metadata(
         "jira_project_key": jira_project_key,
         "jira_base_url": jira_base_url,
     }
+    if cloud_id:
+        update["jira_config"] = {
+            "cloud_id": cloud_id,
+            "project_key": jira_project_key.strip().upper(),
+            "site_name": site_name,
+            "account_email": account_email,
+        }
     if stats:
         update["jira_import_stats"] = stats
 
@@ -785,32 +805,36 @@ def _derive_project_description_from_jira(project_payload: Dict[str, Any]) -> st
     return _jira_description_to_text(raw)
 
 
-async def list_jira_projects(
-    *,
-    jira_base_url: str,
-    jira_email: str,
-    jira_api_token: str,
-) -> List[Dict[str, str]]:
-    """
-    List Jira projects visible to the given credentials.
-
-    Intended for the UI flow where the user enters Jira credentials first and then
-    selects which Jira project to import.
-    """
-
-    credentials = JiraCredentials(
-        base_url=_sanitize_jira_base_url(jira_base_url),
-        email=str(jira_email or "").strip(),
-        api_token=str(jira_api_token or "").strip(),
+def _oauth_jira_client(*, user_id: str, cloud_id: str) -> Tuple[JiraClient, Dict[str, Any]]:
+    """Build the full-import REST client from a stored Jira Cloud OAuth connection."""
+    from src.integrations.jira_mcp.service import (
+        JiraIntegrationError,
+        get_connection,
+        get_jira_rest_access_token,
     )
-    if not credentials.base_url:
-        raise JiraImportError("jira_base_url is required")
-    if not credentials.email:
-        raise JiraImportError("jira_email is required")
-    if not credentials.api_token:
-        raise JiraImportError("jira_api_token is required")
 
-    client = JiraClient(credentials)
+    cloud_id = str(cloud_id or "").strip()
+    connection = get_connection(user_id, cloud_id)
+    if not connection:
+        raise JiraAuthenticationError("Connect the selected Jira site before importing it.")
+    try:
+        access_token = get_jira_rest_access_token(user_id, cloud_id)
+    except JiraIntegrationError as exc:
+        raise JiraAuthenticationError(str(exc)) from exc
+
+    return JiraClient(JiraCredentials(
+        base_url=f"https://api.atlassian.com/ex/jira/{cloud_id}",
+        access_token=access_token,
+    )), connection
+
+
+async def list_jira_projects_with_oauth(
+    *,
+    user_id: str,
+    cloud_id: str,
+) -> List[Dict[str, str]]:
+    """List Jira projects using the signed-in user's existing Jira Cloud OAuth connection."""
+    client, _connection = _oauth_jira_client(user_id=user_id, cloud_id=cloud_id)
     raw_projects = await client.list_projects()
 
     projects: List[Dict[str, str]] = []
@@ -830,9 +854,7 @@ async def list_jira_projects(
 async def import_project_from_jira(
     *,
     user_data: UserData,
-    jira_base_url: str,
-    jira_email: str,
-    jira_api_token: str,
+    cloud_id: str,
     jira_project_key: str,
     name: Optional[str] = None,
     description: Optional[str] = None,
@@ -853,19 +875,11 @@ async def import_project_from_jira(
     if not jira_project_key:
         raise JiraImportError("jira_project_key is required")
 
-    credentials = JiraCredentials(
-        base_url=_sanitize_jira_base_url(jira_base_url),
-        email=str(jira_email or "").strip(),
-        api_token=str(jira_api_token or "").strip(),
-    )
-    if not credentials.base_url:
-        raise JiraImportError("jira_base_url is required")
-    if not credentials.email:
-        raise JiraImportError("jira_email is required")
-    if not credentials.api_token:
-        raise JiraImportError("jira_api_token is required")
-
-    client = JiraClient(credentials)
+    cloud_id = str(cloud_id or "").strip()
+    if not cloud_id:
+        raise JiraImportError("cloud_id is required")
+    client, connection = _oauth_jira_client(user_id=user_data.get_user_id(), cloud_id=cloud_id)
+    jira_site_url = str(connection.get("site_url") or client.credentials.base_url)
 
     project_payload = await client.get_project(jira_project_key)
     resolved_name = (name or "").strip() or _derive_project_name_from_jira(project_payload, jira_project_key)
@@ -927,12 +941,18 @@ async def import_project_from_jira(
     await _persist_jira_import_metadata(
         project_id=project_id,
         jira_project_key=jira_project_key,
-        jira_base_url=credentials.base_url,
+        jira_base_url=jira_site_url,
         status="importing",
+        cloud_id=cloud_id,
+        site_name=connection.get("site_name"),
+        account_email=connection.get("account_email"),
     )
 
     epic_jql = f'project = "{jira_project_key}" AND issuetype = Epic ORDER BY created ASC'
-    story_issue_types = issue_types or ["Story"]
+    # Jira Cloud sites use both names in practice. Importing both preserves the
+    # Jira hierarchy instead of silently omitting teams that call their work
+    # item type "User Story".
+    story_issue_types = issue_types or ["Story", "User Story"]
     quoted_types = ", ".join(f'"{t}"' for t in story_issue_types if str(t or "").strip())
     if not quoted_types:
         quoted_types = '"Story"'
@@ -1103,11 +1123,14 @@ async def import_project_from_jira(
 
     imported_stories = 0
     story_order = 0
+    jira_story_key_to_firestore: Dict[str, str] = {}
     unlinked_batch: List[Dict[str, Any]] = []
     unlinked_by_key: Dict[str, Dict[str, Any]] = {}
     affected_epic_ids: set[str] = set()
 
-    async def _create_user_story_in_epic(*, epic_id: str, epic_name: str, story: Dict[str, Any]) -> None:
+    async def _create_user_story_in_epic(
+        *, epic_id: str, epic_name: str, story: Dict[str, Any]
+    ) -> Optional[str]:
         nonlocal imported_stories
 
         jira_key = str(story.get("key") or "").strip()
@@ -1122,10 +1145,10 @@ async def import_project_from_jira(
             "description": description_text,
             "order": order,
             "dependencies": [],
-            "jira_base_url": credentials.base_url,
+            "jira_base_url": jira_site_url,
             "document": {
                 "jira_id": jira_key,
-                "jira_base_url": credentials.base_url,
+                "jira_base_url": jira_site_url,
             },
             "effortHours": effort_hours,
         }
@@ -1144,9 +1167,13 @@ async def import_project_from_jira(
             logger.warning(
                 "Failed to create user story from Jira issue %s: %s", jira_key, created_story.message
             )
-            return
+            return None
+        story_id = str((created_story.data or {}).get("id") or "").strip()
+        if jira_key and story_id:
+            jira_story_key_to_firestore[jira_key] = story_id
         affected_epic_ids.add(epic_id)
         imported_stories += 1
+        return story_id or None
 
     def _get_or_create_agent_epic(*, epic_name: str, description: str) -> Optional[Tuple[str, str]]:
         nonlocal imported_epics
@@ -1238,6 +1265,7 @@ async def import_project_from_jira(
 
         if grouped:
             logger.info("Jira import: grouping agent produced %s epic group(s).", len(grouped))
+            processed_story_keys: set[str] = set()
             for group in grouped:
                 epic_name = str(group.get("name") or "").strip()
                 story_keys = group.get("story_keys") or []
@@ -1245,9 +1273,11 @@ async def import_project_from_jira(
                 resolved = _get_or_create_agent_epic(epic_name=epic_name, description=description)
                 if not resolved:
                     for story_key in story_keys:
-                        story = unlinked_by_key.get(str(story_key))
-                        if not story:
+                        normalized_story_key = str(story_key)
+                        story = unlinked_by_key.get(normalized_story_key)
+                        if not story or normalized_story_key in processed_story_keys:
                             continue
+                        processed_story_keys.add(normalized_story_key)
                         summary = str(story.get("summary") or "").strip()
                         story_labels = list(story.get("labels") or [])
                         story_components = list(story.get("components") or [])
@@ -1273,10 +1303,33 @@ async def import_project_from_jira(
                     continue
                 epic_id, resolved_epic_name = resolved
                 for story_key in story_keys:
-                    story = unlinked_by_key.get(str(story_key))
-                    if not story:
+                    normalized_story_key = str(story_key)
+                    story = unlinked_by_key.get(normalized_story_key)
+                    if not story or normalized_story_key in processed_story_keys:
                         continue
+                    processed_story_keys.add(normalized_story_key)
                     await _create_user_story_in_epic(epic_id=epic_id, epic_name=resolved_epic_name, story=story)
+
+            # Agent output is advisory. Never discard a Jira story merely
+            # because a model returned an incomplete or duplicated grouping.
+            for story in unlinked_batch:
+                jira_key = str(story.get("key") or "").strip()
+                if jira_key and jira_key in processed_story_keys:
+                    continue
+                summary = str(story.get("summary") or "").strip()
+                story_labels = list(story.get("labels") or [])
+                story_components = list(story.get("components") or [])
+                matched = _find_matching_epic(
+                    components=story_components,
+                    labels=story_labels,
+                    summary=summary,
+                )
+                if matched:
+                    epic_id, epic_name = matched
+                else:
+                    group_type, group_value = _derive_story_group(story_components, story_labels)
+                    epic_id, epic_name = _ensure_group_epic(group_type=group_type, group_value=group_value)
+                await _create_user_story_in_epic(epic_id=epic_id, epic_name=epic_name, story=story)
         else:
             logger.warning(
                 "Jira import: grouping agent unavailable/invalid; using heuristic grouping for %s stories.",
@@ -1368,6 +1421,107 @@ async def import_project_from_jira(
 
     await _flush_unlinked_batch()
 
+    # Create Jira Task/Sub-task records after all stories exist, so a task with
+    # `parent.key = STORY-123` can be attached to the matching imported story.
+    # Standalone Jira tasks remain project-level tasks, which keeps them visible
+    # in the Tasks tab without inventing a user-story relationship.
+    task_issue_types = ["Task", "Sub-task", "Subtask"]
+    quoted_task_types = ", ".join(f'"{item_type}"' for item_type in task_issue_types)
+    task_jql = f'project = "{jira_project_key}" AND issuetype in ({quoted_task_types}) ORDER BY created ASC'
+    imported_tasks = 0
+    standalone_task_order = 0
+
+    async for issue in client.iter_search_issues(
+        jql=task_jql,
+        fields=[
+            "summary",
+            "description",
+            "status",
+            "issuetype",
+            "parent",
+            "timeoriginalestimate",
+            "timeestimate",
+            "aggregatetimeoriginalestimate",
+            "*navigable",
+        ],
+    ):
+        jira_key = str(issue.get("key") or "").strip()
+        fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+        parent = fields.get("parent") if isinstance(fields.get("parent"), dict) else {}
+        parent_key = str(parent.get("key") or "").strip()
+        summary = str(fields.get("summary") or "").strip()
+        description_text = _jira_description_to_text(fields.get("description"))
+        status = fields.get("status") if isinstance(fields.get("status"), dict) else {}
+        jira_status = status.get("name")
+        effort_hours = _extract_jira_effort_hours(fields)
+
+        story_id = jira_story_key_to_firestore.get(parent_key)
+        if story_id:
+            created_task = create_subtask_for_user_story(
+                story_id,
+                user_data.get_user_id(),
+                {
+                    "title": summary or jira_key or "Jira task",
+                    "description": description_text,
+                    "estimated_hours": effort_hours,
+                    "complexity": "Medium",
+                    "task_type": "Implementation",
+                    "status": coerce_workflow_status(jira_status, default="To Do"),
+                },
+            )
+            task_id = str((created_task.data or {}).get("id") or "").strip() if created_task.success else ""
+            if not task_id:
+                logger.warning("Failed to create Jira task %s under story %s: %s", jira_key, parent_key, created_task.message)
+                continue
+            FIRESTORE_CLIENT.collection("subtasks").document(task_id).update(
+                {
+                    "jira_issue_key": jira_key,
+                    "jira_parent_key": parent_key,
+                    "jira_base_url": jira_site_url,
+                    "jira_imported": True,
+                }
+            )
+            imported_tasks += 1
+            continue
+
+        standalone_task_order += 1
+        task_identifier = get_next_TK_identifier()
+        now = _current_timestamp_iso()
+        task_document: Dict[str, Any] = {
+            "project_id": project_id,
+            "user_id": user_data.get_user_id(),
+            "source": "project",
+            "task_id": task_identifier,
+            "title": summary or jira_key or "Jira task",
+            "description": description_text,
+            "order": standalone_task_order,
+            "estimated_hours": effort_hours,
+            "complexity": "Medium",
+            "tips_markdown": "",
+            "dependencies": [],
+            "task_type": "Implementation",
+            "type": "Implementation",
+            "status": coerce_workflow_status(jira_status, default="To Do"),
+            "completed_date": None,
+            "created_at": now,
+            "updated_at": now,
+            "assignee": "",
+            "assigneeId": None,
+            "assigneeEmail": None,
+            "assignee_email": None,
+            "assigned_to": None,
+            "jira_issue_key": jira_key,
+            "jira_parent_key": parent_key or None,
+            "jira_base_url": jira_site_url,
+            "jira_imported": True,
+        }
+        parent_epic_key = _extract_epic_key_for_issue(issue, epic_key_to_firestore.keys())
+        if parent_epic_key and parent_epic_key in epic_key_to_firestore:
+            task_document["epic_id"] = epic_key_to_firestore[parent_epic_key]
+            task_document["epic_name"] = epic_key_to_name.get(parent_epic_key) or "Epic"
+        FIRESTORE_CLIENT.collection("subtasks").add(task_document)
+        imported_tasks += 1
+
     for epic_id in affected_epic_ids:
         existing_stories = get_user_stories_by_epic(
             epic_id,
@@ -1397,16 +1551,21 @@ async def import_project_from_jira(
     stats = {
         "imported_epics": imported_epics,
         "imported_user_stories": imported_stories,
+        "imported_tasks": imported_tasks,
         "imported_at": _current_timestamp_iso(),
         "jira_issue_types": story_issue_types,
+        "jira_task_issue_types": task_issue_types,
     }
 
     await _persist_jira_import_metadata(
         project_id=project_id,
         jira_project_key=jira_project_key,
-        jira_base_url=credentials.base_url,
+        jira_base_url=jira_site_url,
         status="created",
         stats=stats,
+        cloud_id=cloud_id,
+        site_name=connection.get("site_name"),
+        account_email=connection.get("account_email"),
     )
 
     return ProjectCreationInitializationData(project=project_record.project, clarification=None)

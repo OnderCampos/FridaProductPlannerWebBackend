@@ -58,6 +58,7 @@ class UserStory(BaseModel):
     user_story: str
     description: str
     user_story_id: str
+    tshirt_size: Optional[str] = None
     effortHours: float
     createdDate: str
     created_at: datetime

@@ -14,6 +14,11 @@ def _current_timestamp_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalize_epic_payload(epic_data: Dict[str, Any]) -> Dict[str, Any]:
+    epic_data["status"] = coerce_workflow_status(epic_data.get("status"), default="To Do")
+    return epic_data
+
+
 def get_epics_for_project(project_id: str, user_id: str = None) -> List[Dict[str, Any]]:
     """
     Retrieves all epics for a specific project.
@@ -33,6 +38,7 @@ def get_epics_for_project(project_id: str, user_id: str = None) -> List[Dict[str
         for doc in epics_docs:
             epic_data = doc.to_dict()
             epic_data["id"] = doc.id
+            _normalize_epic_payload(epic_data)
             project_epics.append(epic_data)
         
         print(f"[DEBUG] Found {len(project_epics)} epics for project {project_id}")
@@ -139,6 +145,7 @@ def get_epic_by_id(epic_id: str) -> ResponseModel:
 
         epic_data = epic_doc.to_dict()
         epic_data["id"] = epic_id
+        _normalize_epic_payload(epic_data)
 
         return ResponseModel(
             success=True,
@@ -276,6 +283,7 @@ def update_epic(epic_id: str, user_id: str, epic_update_data: Dict[str, Any]) ->
         updated_doc = epic_ref.get()
         updated_data = updated_doc.to_dict()
         updated_data["id"] = epic_id
+        _normalize_epic_payload(updated_data)
         
         return ResponseModel(
             success=True,
@@ -331,6 +339,7 @@ def update_epic_status(epic_id: str, user_id: str, status: str) -> ResponseModel
         updated_doc = epic_ref.get()
         updated_data = updated_doc.to_dict()
         updated_data["id"] = epic_id
+        _normalize_epic_payload(updated_data)
 
         return ResponseModel(
             success=True,

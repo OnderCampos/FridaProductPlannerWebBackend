@@ -23,6 +23,7 @@ _WORKFLOW_STATUS_MAP = {
     "stopped": "Stopped",
     "blocked": "Stopped",
     "done": "Done",
+    "completed": "Done",
     "rework": "In Progress",
 }
 

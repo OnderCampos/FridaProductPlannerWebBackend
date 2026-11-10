@@ -8,6 +8,7 @@ import traceback
 from src.schemas.resources_request import BacklogStatusUpdateRequest
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
+from src.schemas.workflow_status import coerce_workflow_status, normalize_workflow_status
 from src.services.notifications import NotificationService
 from src.utils.authz.auth import get_current_user
 from src.utils.authz.users import get_user_profile
@@ -52,20 +53,7 @@ def _extract_field_value(fields, *keys):
 
 
 def _normalize_status(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    normalized = str(value).strip().lower()
-    if normalized in {"to do", "todo"}:
-        return "To Do"
-    if normalized in {"in progress", "in_progress", "inprogress"}:
-        return "In Progress"
-    if normalized in {"in review", "in_review", "inreview"}:
-        return "In Review"
-    if normalized == "stopped":
-        return "Stopped"
-    if normalized == "done":
-        return "Done"
-    return None
+    return normalize_workflow_status(value)
 
 
 def _status_from_message(message: str) -> int:
@@ -86,7 +74,10 @@ def _build_story_backlog_item(story: dict, project_id: str, project_name: str, p
     priority = story.get("priority") or _extract_field_value(fields, "priority")
     story_points = story.get("storyPoints") or story.get("story_points") or _extract_field_value(fields, "storyPoints", "story_points", "storypoints")
     due_date = story.get("dueDate") or story.get("due_date") or _extract_field_value(fields, "dueDate", "due_date", "duedate")
-    status = story.get("status") or _extract_field_value(fields, "status") or "To Do"
+    status = coerce_workflow_status(
+        story.get("status") or _extract_field_value(fields, "status"),
+        default="To Do",
+    )
     return {
         "id": story.get("id"),
         "user_story_id": story.get("user_story_id"),
@@ -98,6 +89,7 @@ def _build_story_backlog_item(story: dict, project_id: str, project_name: str, p
         "user_story": story.get("user_story"),
         "status": status,
         "priority": priority,
+        "tshirt_size": story.get("tshirt_size") or story.get("tshirtSize"),
         "storyPoints": story_points,
         "dueDate": due_date,
         "effort_hours": story.get("effort_hours") or story.get("effortHours"),
@@ -127,7 +119,7 @@ def _build_subtask_backlog_item(
         "title": subtask.get("title") or subtask.get("description") or "Untitled task",
         "description": subtask.get("description") or "",
         "tips_markdown": subtask.get("tips_markdown"),
-        "status": subtask.get("status") or "To Do",
+        "status": coerce_workflow_status(subtask.get("status"), default="To Do"),
         "estimated_hours": subtask.get("estimated_hours"),
         "complexity": subtask.get("complexity"),
         "type": subtask.get("task_type") or subtask.get("type") or subtask.get("complexity"),
@@ -595,7 +587,19 @@ async def update_backlog_item_status(
         "status": status,
         "updated_at": _current_timestamp_iso(),
     }
+    if normalized_type == "story":
+        current_status = coerce_workflow_status(item_data.get("status"), default="To Do")
+        is_moving_to_started = status != "To Do" and current_status == "To Do"
+        has_start_date = bool(item_data.get("startDate") or item_data.get("start_date"))
+        if is_moving_to_started and not has_start_date:
+            # Keep Backlog transitions consistent with the User Story details modal
+            # and give the sprint timeline a real start point.
+            update_data["startDate"] = _current_timestamp_iso()
     if normalized_type == "subtask":
+        # Keep actual start dates consistent with the task status endpoints.
+        # The sprint's plannedStartDate is persisted independently.
+        if status == "In Progress":
+            update_data["startDate"] = _current_timestamp_iso()
         if status == "Done":
             update_data["completed_date"] = _current_timestamp_iso()
         else:

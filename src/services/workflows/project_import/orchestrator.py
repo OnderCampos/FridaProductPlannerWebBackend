@@ -32,9 +32,7 @@ class ProjectImportOrchestrator:
         name: Optional[str] = None,
         description: Optional[str] = None,
         project_key: Optional[str] = None,
-        jira_base_url: str,
-        jira_email: str,
-        jira_api_token: str,
+        cloud_id: str,
         jira_project_key: str,
         issue_types: Optional[List[str]] = None,
     ) -> ProjectCreationInitializationData:
@@ -48,9 +46,7 @@ class ProjectImportOrchestrator:
                 name=name,
                 description=description,
                 project_key=project_key,
-                jira_base_url=jira_base_url,
-                jira_email=jira_email,
-                jira_api_token=jira_api_token,
+                cloud_id=cloud_id,
                 jira_project_key=jira_project_key,
                 issue_types=issue_types,
             )

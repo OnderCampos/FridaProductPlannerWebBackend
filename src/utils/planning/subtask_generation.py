@@ -10,7 +10,7 @@ from src.services.notifications import NotificationService
 from src.prompts.subtask_generation import GENERATE_SUBTASKS_PROMPT
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
-from src.services.azure_services import AzureChatService
+from src.intelligence.runtime import AgentName, run_agent
 from src.services.setup.firebase_setup import FIRESTORE_CLIENT
 from src.services.setup.variables_setup import LLMOPS_API_KEY
 from src.utils.authz.permissions import get_project_access
@@ -249,8 +249,8 @@ def _maybe_send_subtask_updated_notification(
             return NotificationService()._notification_result(False, "skipped", "admin_not_found", "Admin Project not found")
 
         # If the leader has made the change , we do not send the email
-        if user_email and user_email.lower() == leader_email.lower():
-                return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
+        # if user_email and user_email.lower() == leader_email.lower():
+        #     return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
 
         leader_data = leader_doc.to_dict() or {}
         leader_name = leader_data.get("name", "")
@@ -361,7 +361,7 @@ def _maybe_send_subtask_assignment_notification(
 
     except Exception as e:
         import traceback
-        print(f"🔥 ERROR EN NOTIFICACIÓN DE ASIGNACIÓN DE SUBTAREA: {e}")
+        print(f"ERROR EN NOTIFICACIÓN DE ASIGNACIÓN DE SUBTAREA: {e}")
         traceback.print_exc()
         return NotificationService()._notification_result(False, "failed", "error", "Subtask assignment notification failed.")
 
@@ -587,6 +587,8 @@ def _load_repository_context_for_task(
             except Exception as e:
                 logging.error(f"Failed to generate GitHub App token: {e}")
 
+        active_token = active_token or str(api_token or "").strip()
+
         if not repository_url or not str(active_token or "").strip():
             return {
                 "available": False,
@@ -692,7 +694,17 @@ def _serialize_subtask(subtask_data: Dict[str, Any], subtask_id: Optional[str] =
     serialized["type"] = task_type
     serialized["status"] = coerce_workflow_status(serialized.get("status"), default="To Do")
     serialized["dependencies"] = serialized.get("dependencies") or []
-    serialized["estimated_hours"] = serialized.get("estimated_hours", 0)
+    serialized["estimated_hours"] = (
+        serialized.get("estimated_hours")
+        if serialized.get("estimated_hours") is not None
+        else serialized.get("estimatedHours")
+    )
+    if serialized["estimated_hours"] is None:
+        serialized["estimated_hours"] = (
+            serialized.get("effortHours")
+            if serialized.get("effortHours") is not None
+            else serialized.get("effort_hours", 0)
+        )
     serialized["complexity"] = serialized.get("complexity") or "Medium"
     tips_markdown = str(serialized.get("tips_markdown") or serialized.get("tipsMarkdown") or "").strip()
     if not tips_markdown:
@@ -742,13 +754,14 @@ async def _estimate_project_task_fields(
     }
 
     try:
-        azure_services = AzureChatService(LLMOPS_API_KEY, user_data, None)
-        raw = await azure_services.simple_completion(
+        raw = await run_agent(
+            AgentName.TASK_ESTIMATION,
             TASK_ESTIMATION_PROMPT.format(
                 task_type=task_type,
                 title=title.strip() or "Untitled task",
                 description=description.strip() or "No additional description provided.",
             ),
+            user_data,
             model_tier="mini",
         )
 
@@ -796,8 +809,8 @@ async def _generate_project_task_tips(
     )
 
     try:
-        azure_services = AzureChatService(LLMOPS_API_KEY, user_data, None)
-        raw = await azure_services.simple_completion(
+        raw = await run_agent(
+            AgentName.IMPLEMENTATION_GUIDANCE,
             TASK_TIPS_PROMPT.format(
                 tech_stack=tech_stack_text,
                 task_type=task_type,
@@ -805,6 +818,7 @@ async def _generate_project_task_tips(
                 description=fallback_description,
                 repository_context=repository_context_text,
             ),
+            user_data,
             model_tier="mini",
         )
         normalized = str(raw or "").strip()
@@ -829,9 +843,10 @@ async def _generate_project_tasks_from_text(
     }
 
     try:
-        azure_services = AzureChatService(LLMOPS_API_KEY, user_data, None)
-        raw = await azure_services.simple_completion(
+        raw = await run_agent(
+            AgentName.TASK_PLANNING,
             PROJECT_TASK_BATCH_PROMPT.format(source_text=cleaned_text),
+            user_data,
             model_tier="mini",
         )
         payload_text = get_code_block(raw) or raw
@@ -982,6 +997,11 @@ def _build_story_context(
         "epic_id": epic_id,
         "epic_name": epic_name,
         "project_id": project_id,
+        "assignee": str(story_data.get("assignee") or "").strip(),
+        "assigneeId": story_data.get("assigneeId") or story_data.get("assigned_to"),
+        "assigneeEmail": story_data.get("assigneeEmail") or story_data.get("assignee_email"),
+        "assignee_email": story_data.get("assignee_email") or story_data.get("assigneeEmail"),
+        "assigned_to": story_data.get("assigned_to") or story_data.get("assigneeId"),
     }
 
 
@@ -1072,7 +1092,10 @@ async def save_subtasks_to_firestore(
                     "order": subtask_data.get("order", 0),
                     "title": str(subtask_data.get("title") or "").strip(),
                     "description": str(subtask_data.get("description") or "").strip(),
-                    "estimated_hours": subtask_data.get("estimated_hours", 0),
+                    "estimated_hours": _normalize_positive_hours(
+                        subtask_data.get("estimated_hours"),
+                        default=0.0,
+                    ),
                     "complexity": subtask_data.get("complexity", "Medium"),
                     "dependencies": subtask_data.get("dependencies", []),
                     "task_type": task_type,
@@ -1114,6 +1137,11 @@ async def save_subtasks_to_firestore(
                 "completed_date": None,
                 "created_at": now,
                 "updated_at": now,
+                "assignee": story_context.get("assignee", ""),
+                "assigneeId": story_context.get("assigneeId"),
+                "assigneeEmail": story_context.get("assigneeEmail"),
+                "assignee_email": story_context.get("assignee_email"),
+                "assigned_to": story_context.get("assigned_to"),
             }
 
             doc_ref = FIRESTORE_CLIENT.collection("subtasks").add(subtask_document)
@@ -1127,6 +1155,24 @@ async def save_subtasks_to_firestore(
                     },
                     doc_ref[1].id,
                 )
+            )
+
+        total_estimated_hours = round(
+            sum(float(task.get("estimated_hours") or 0) for task in task_payloads),
+            1,
+        )
+        try:
+            FIRESTORE_CLIENT.collection("user_stories").document(user_story_id).update(
+                {
+                    "effortHours": total_estimated_hours,
+                    "updated_at": now,
+                }
+            )
+        except Exception as exc:
+            logging.warning(
+                "Saved subtasks for user story %s, but could not update its total effort hours: %s",
+                user_story_id,
+                exc,
             )
 
         return ResponseModel(
@@ -1363,6 +1409,57 @@ async def batch_create_project_tasks_from_text(
         return ResponseModel(success=False, message=f"Error batch creating project tasks: {str(e)}", data=None)
 
 
+def _sync_parent_story_status_from_subtasks(user_story_id: str) -> Optional[Dict[str, Any]]:
+    story_id = str(user_story_id or "").strip()
+    if not story_id:
+        return None
+
+    subtask_docs = FIRESTORE_CLIENT.collection("subtasks").where(
+        "user_story_id", "==", story_id
+    ).get()
+    if not subtask_docs:
+        return None
+
+    subtask_statuses = [
+        coerce_workflow_status((doc.to_dict() or {}).get("status"), default="To Do")
+        for doc in subtask_docs
+    ]
+    all_subtasks_done = all(status == "Done" for status in subtask_statuses)
+    any_subtask_started = any(status != "To Do" for status in subtask_statuses)
+    story_ref = FIRESTORE_CLIENT.collection("user_stories").document(story_id)
+    story_doc = story_ref.get()
+    if not story_doc.exists:
+        return None
+
+    story_data = story_doc.to_dict() or {}
+    current_status = coerce_workflow_status(
+        story_data.get("status"),
+        default="To Do",
+    )
+    current_start_date = story_data.get("startDate")
+
+    if all_subtasks_done:
+        next_status = "Done"
+    elif any_subtask_started:
+        next_status = "In Progress"
+    else:
+        next_status = "To Do"
+
+    update_data: Dict[str, Any] = {}
+    if next_status != current_status:
+        update_data["status"] = next_status
+    if next_status == "In Progress" and not current_start_date:
+        update_data["startDate"] = _current_timestamp_iso()
+    if update_data:
+        update_data["updated_at"] = _current_timestamp_iso()
+        story_ref.update(update_data)
+
+    return {
+        "status": next_status,
+        "startDate": update_data.get("startDate") or current_start_date,
+    }
+
+
 def update_subtask_status(subtask_id: str, user_id: str, status: str, completed_date: str = None, user_name: Optional[str] = None, user_email: Optional[str] = None) -> ResponseModel:
     try:
         canonical_status = normalize_workflow_status(status)
@@ -1379,12 +1476,12 @@ def update_subtask_status(subtask_id: str, user_id: str, status: str, completed_
             return ResponseModel(success=False, message="Subtask not found", data=None)
 
         subtask_data = subtask_doc.to_dict() or {}
-        if subtask_data.get("user_id") != user_id:
-            return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
-
         current_data = subtask_doc.to_dict() or {}
         if current_data.get("user_id") != user_id:
-            return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
+            project_id = str(current_data.get("project_id") or "").strip()
+            access = get_project_access(project_id, user_id, user_email) if project_id else None
+            if not access or not access.success or not (access.data or {}).get("is_lead"):
+                return ResponseModel(success=False, message="Unauthorized: You don't own this subtask", data=None)
 
         now = _current_timestamp_iso()
         update_data = {
@@ -1392,10 +1489,21 @@ def update_subtask_status(subtask_id: str, user_id: str, status: str, completed_
             "updated_at": now,
             "completed_date": completed_date if canonical_status == "Done" and completed_date else (now if canonical_status == "Done" else None),
         }
+        # A task's actual start must reflect when work began, rather than a
+        # previously planned future date. Sprint plannedStartDate stays on the
+        # sprint assignment and is intentionally not changed here.
+        if canonical_status == "In Progress":
+            update_data["startDate"] = now
 
         subtask_ref.update(update_data)
         updated_doc = subtask_ref.get()
         updated_data = _serialize_subtask(updated_doc.to_dict() or {}, updated_doc.id)
+        parent_story_sync = _sync_parent_story_status_from_subtasks(
+            str(current_data.get("user_story_id") or "")
+        )
+        if parent_story_sync:
+            updated_data["parent_story_status"] = parent_story_sync.get("status")
+            updated_data["parent_story_startDate"] = parent_story_sync.get("startDate")
 
         try:
             updated_data_for_notif = updated_data.copy()
@@ -1516,12 +1624,18 @@ async def generate_subtasks_for_user_story(
         )
         project_id = str(story_context.get("project_id") or "").strip()
         technical_stack = _get_project_tech_stack(project_id)
+        repository_context = _load_repository_context_for_task(
+            project_id=project_id,
+            title=str(story_data.get("user_story") or ""),
+            description=str(story_data.get("description") or ""),
+            task_type="Implementation",
+        )
+        repository_context_text = _build_repository_context_markdown(repository_context)
         additional_fields_text = ""
         if story_data.get("fields"):
             for field in story_data["fields"]:
                 additional_fields_text += f"- {field['name']}: {field['value']}\n"
 
-        azure_services = AzureChatService(LLMOPS_API_KEY, user_data, None)
         prompt = GENERATE_SUBTASKS_PROMPT.format(
             user_story=story_data.get("user_story", ""),
             description=story_data.get("description", ""),
@@ -1529,9 +1643,10 @@ async def generate_subtasks_for_user_story(
             user_story_id=story_data.get("user_story_id", ""),
             technical_stack=", ".join(technical_stack) if technical_stack else "Not specified",
             additional_fields=additional_fields_text if additional_fields_text else "No additional fields",
+            repository_context=repository_context_text,
         )
 
-        response = await azure_services.simple_completion(prompt, model_tier="gpt")
+        response = await run_agent(AgentName.TASK_PLANNING, prompt, user_data, model_tier="gpt")
         subtasks_json = get_code_block(response)
 
         if subtasks_json:
@@ -1636,11 +1751,11 @@ def create_subtask_for_user_story(story_id: str, user_id: str, subtask_data: Dic
             "completed_date": None,
             "created_at": now,
             "updated_at": now,
-            "assignee": subtask_data.get("assignee", ""),
-            "assigneeId": subtask_data.get("assigneeId"),
-            "assigneeEmail": subtask_data.get("assigneeEmail"),
-            "assignee_email": subtask_data.get("assignee_email") or subtask_data.get("assigneeEmail"),
-            "assigned_to": subtask_data.get("assigned_to"),
+            "assignee": story_context.get("assignee", ""),
+            "assigneeId": story_context.get("assigneeId"),
+            "assigneeEmail": story_context.get("assigneeEmail"),
+            "assignee_email": story_context.get("assignee_email"),
+            "assigned_to": story_context.get("assigned_to"),
         }
 
         doc_ref = FIRESTORE_CLIENT.collection("subtasks").add(new_subtask)
@@ -1719,11 +1834,11 @@ async def create_subtask_for_user_story_with_agent(
             "completed_date": None,
             "created_at": now,
             "updated_at": now,
-            "assignee": subtask_data.get("assignee", ""),
-            "assigneeId": subtask_data.get("assigneeId"),
-            "assigneeEmail": subtask_data.get("assigneeEmail"),
-            "assignee_email": subtask_data.get("assignee_email") or subtask_data.get("assigneeEmail"),
-            "assigned_to": subtask_data.get("assigned_to"),
+            "assignee": story_context.get("assignee", ""),
+            "assigneeId": story_context.get("assigneeId"),
+            "assigneeEmail": story_context.get("assigneeEmail"),
+            "assignee_email": story_context.get("assignee_email"),
+            "assigned_to": story_context.get("assigned_to"),
         }
 
         doc_ref = FIRESTORE_CLIENT.collection("subtasks").add(new_subtask)

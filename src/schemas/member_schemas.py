@@ -26,6 +26,7 @@ class TeamMemberCreateRequest(TeamMemberBase):
     """Schema for creating a team member via project members endpoints"""
     avatar: Optional[str] = Field(None, description="Optional avatar initials or URL")
     member_type: MemberType = Field("member", description="Project permission role")
+    workload_hours_per_day: float = Field(8, gt=0, le=24, description="Available planning hours per sprint day")
 
 
 class ProjectInvitationRequest(TeamMemberBase):
@@ -45,6 +46,7 @@ class TeamMemberUpdate(BaseModel):
     role: Optional[RoleType] = Field(None, description="Role of the team member")
     seniority: Optional[SeniorityType] = Field(None, description="Seniority level of the team member")
     member_type: Optional[MemberType] = Field(None, description="Project permission role")
+    workload_hours_per_day: Optional[float] = Field(None, gt=0, le=24, description="Available planning hours per sprint day")
 
 
 class TeamMemberResponse(TeamMemberBase):

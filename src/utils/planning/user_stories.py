@@ -15,8 +15,12 @@ from src.utils.planning.assignees import (
     is_frida_assignee_id,
     is_frida_assignee_name,
 )
+from src.utils.planning.story_estimation import (
+    parse_effort_hours,
+    resolve_story_estimation,
+)
 from src.utils.firebase.identifier import get_next_US_identifier
-from src.schemas.workflow_status import WORKFLOW_STATUS_VALUES, normalize_workflow_status
+from src.schemas.workflow_status import WORKFLOW_STATUS_VALUES, coerce_workflow_status, normalize_workflow_status
 
 
 def _current_timestamp_iso() -> str:
@@ -106,7 +110,7 @@ def _extract_markdown_section_list(text: str, headings: List[str]) -> List[str]:
 
 
 def _normalize_story_payload(story_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure user story payload includes effortHours and createdDate."""
+    """Ensure user story payload includes canonical workflow and display fields."""
     created_date = story_data.get("createdDate")
     if created_date is None:
         created_date = story_data.get("created_date")
@@ -116,8 +120,11 @@ def _normalize_story_payload(story_data: Dict[str, Any]) -> Dict[str, Any]:
     effort_hours = story_data.get("effortHours")
     if effort_hours is None:
         effort_hours = story_data.get("effort_hours")
-    if effort_hours is None:
-        effort_hours = 0
+    tshirt_size = (
+        story_data.get("tshirt_size")
+        if story_data.get("tshirt_size") is not None
+        else story_data.get("tshirtSize")
+    )
 
     # Normalize acceptance/out-of-scope fields for backward compatibility:
     # - some flows store them as strings in `document` or inside `fields`
@@ -158,21 +165,19 @@ def _normalize_story_payload(story_data: Dict[str, Any]) -> Dict[str, Any]:
         out_scope = ["N/A"]
 
     story_data["createdDate"] = created_date
-    story_data["effortHours"] = effort_hours
+    resolved_size, resolved_effort = resolve_story_estimation(tshirt_size, effort_hours)
+    story_data["tshirt_size"] = resolved_size
+    story_data["tshirtSize"] = resolved_size
+    story_data["effortHours"] = resolved_effort
+    story_data["effort_hours"] = story_data["effortHours"]
+    story_data["status"] = coerce_workflow_status(
+        story_data.get("status") or _find_story_field_value(fields, ["status"]),
+        default="To Do",
+    )
     story_data["acceptanceCriteria"] = acceptance
     story_data["outOfScope"] = out_scope
     ensure_assignee_email(story_data)
     return story_data
-
-
-def _parse_effort_hours(raw_effort: Optional[Any]) -> float:
-    if raw_effort is None:
-        return 0
-    try:
-        return float(raw_effort)
-    except (TypeError, ValueError):
-        return 0
-
 
 def _parse_order_value(raw_order: Optional[Any]) -> float:
     if raw_order is None:
@@ -255,6 +260,21 @@ def _get_story_subtask_hours_map(story_ids: List[str]) -> Dict[str, float]:
             hours_map[story_id] = hours_map.get(story_id, 0.0) + estimated_hours
     return hours_map
 
+
+def _resolve_story_effort_hours(
+    story_data: Dict[str, Any],
+    fallback_subtask_hours: Optional[Any] = None,
+) -> float:
+    stored_effort = parse_effort_hours(
+        story_data.get("effortHours")
+        if story_data.get("effortHours") is not None
+        else story_data.get("effort_hours")
+    )
+    if stored_effort > 0:
+        return stored_effort
+    fallback_effort = parse_effort_hours(fallback_subtask_hours)
+    return fallback_effort if fallback_effort > 0 else 0
+
 """
 ---------------------------------------------------------------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------------------------------------------------------------
@@ -334,14 +354,14 @@ def _maybe_send_user_story_assignment_notification(
                 "Assignment email was not sent because the assignee did not change.",
             )
 
-        actor_email = str(user_email or "").strip().lower()
-        if actor_email and updated_email == actor_email:
-            return NotificationService()._notification_result(
-                False,
-                "skipped",
-                "self_assigned",
-                "Assignment email was not sent because the user assigned the story to themselves.",
-            )
+        # actor_email = str(user_email or "").strip().lower()
+        # if actor_email and updated_email == actor_email:
+        #     return NotificationService()._notification_result(
+        #         False,
+        #         "skipped",
+        #         "self_assigned",
+        #         "Assignment email was not sent because the user assigned the story to themselves.",
+        #     )
 
         project_doc = FIRESTORE_CLIENT.collection("projects").document(project_id).get()
         project_name = ""
@@ -414,6 +434,7 @@ def _maybe_send_user_story_updated_notification(
     try:
         fields_to_watch = {
             "status": "Status",
+            "tshirt_size": "Complexity Size",
             "effortHours": "Effort Hours",
             "storyPoints": "Story Points",
             "priority": "Priority"
@@ -464,8 +485,8 @@ def _maybe_send_user_story_updated_notification(
         leader_name = leader_data.get("name", "")
 
         # If the leader has made the change , we do not send the email
-        if user_email and user_email.lower() == leader_email.lower():
-            return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
+        # if user_email and user_email.lower() == leader_email.lower():
+        #     return NotificationService()._notification_result(False, "skipped", "user_is_admin", "User is the admin, no email needed")
 
         # Get who has made the change
         user_story_title = str(updated_story.get("user_story") or "").strip()
@@ -545,6 +566,8 @@ def create_user_story(
             "user_story_id",
             "order",
             "dependencies",
+            "tshirt_size",
+            "tshirtSize",
             "effortHours",
             "effort_hours",
             "createdDate",
@@ -556,12 +579,18 @@ def create_user_story(
             "acceptance_criteria",
             "outOfScope",
             "out_of_scope",
+            "status",
         }
 
         raw_effort = user_story_data.get("effortHours")
         if raw_effort is None:
             raw_effort = user_story_data.get("effort_hours")
-        effort_hours = _parse_effort_hours(raw_effort)
+        raw_tshirt_size = (
+            user_story_data.get("tshirt_size")
+            if user_story_data.get("tshirt_size") is not None
+            else user_story_data.get("tshirtSize")
+        )
+        tshirt_size, effort_hours = resolve_story_estimation(raw_tshirt_size, raw_effort)
 
         try:
             story_points = int(user_story_data.get("story_points", 0))
@@ -588,8 +617,11 @@ def create_user_story(
             "created_at": now,
             "createdDate": now,
             "updated_at": now,
+            "tshirt_size": tshirt_size,
+            "tshirtSize": tshirt_size,
             "effortHours": effort_hours,
             "storyPoints": story_points,
+            "status": coerce_workflow_status(user_story_data.get("status"), default="To Do"),
             "fields": []
         }
         
@@ -697,6 +729,12 @@ def get_user_story_by_id(story_id: str, user_id: str, allow_member: bool = False
         story_data = story_doc.to_dict()
         story_data["id"] = story_doc.id
         _normalize_story_payload(story_data)
+        story_effort_hours = _resolve_story_effort_hours(
+            story_data,
+            _get_story_subtask_hours_map([story_id]).get(story_id, 0),
+        )
+        story_data["effortHours"] = story_effort_hours
+        story_data["effort_hours"] = story_effort_hours
         
         # Verify ownership or membership
         if story_data.get("user_id") != user_id:
@@ -769,8 +807,12 @@ def get_user_stories_by_epic(epic_id: str, user_id: str = None, allow_member: bo
 
             _normalize_story_payload(story_data)
             story_data["sprint_id"] = sprint_id_by_story.get(story_id)
-
-            story_data["effortHours"] = story_data.get("effortHours", 0) + subtask_hours_by_story.get(story_id, 0.0)
+            story_effort_hours = _resolve_story_effort_hours(
+                story_data,
+                subtask_hours_by_story.get(story_id, 0),
+            )
+            story_data["effortHours"] = story_effort_hours
+            story_data["effort_hours"] = story_effort_hours
 
             user_stories.append(story_data)
         
@@ -883,6 +925,28 @@ def update_user_story(
         
         # Update the document
         story_ref.update(update_data)
+
+        # Story Tasks inherit ownership from their parent User Story. Keep the
+        # persisted task records synchronized whenever the story is reassigned.
+        assignee_keys = {
+            "assignee",
+            "assigneeId",
+            "assigneeEmail",
+            "assignee_email",
+            "assigned_to",
+        }
+        if assignee_keys.intersection(update_data):
+            subtask_assignee_update = {
+                key: update_data.get(key)
+                for key in assignee_keys
+                if key in update_data
+            }
+            subtask_assignee_update["updated_at"] = update_data["updated_at"]
+            subtask_docs = FIRESTORE_CLIENT.collection("subtasks").where(
+                "user_story_id", "==", story_id
+            ).get()
+            for subtask_doc in subtask_docs:
+                subtask_doc.reference.update(subtask_assignee_update)
         
         # Get updated user story
         updated_doc = story_ref.get()
@@ -960,6 +1024,8 @@ def update_user_story_fields(
             "assigneeId",
             "assigneeEmail",
             "assignee_email",
+            "tshirt_size",
+            "tshirtSize",
             "storyPoints",
             "story_points",
             "dueDate",
@@ -1001,6 +1067,11 @@ def update_user_story_fields(
         if "assigneeEmail" in filtered_update:
             filtered_update["assignee_email"] = filtered_update.get("assigneeEmail")
 
+        if "tshirtSize" in filtered_update and "tshirt_size" not in filtered_update:
+            filtered_update["tshirt_size"] = filtered_update.get("tshirtSize")
+        if "tshirt_size" in filtered_update and "tshirtSize" not in filtered_update:
+            filtered_update["tshirtSize"] = filtered_update.get("tshirt_size")
+
         if "acceptance_criteria" in filtered_update and "acceptanceCriteria" not in filtered_update:
             filtered_update["acceptanceCriteria"] = filtered_update.pop("acceptance_criteria")
 
@@ -1012,6 +1083,25 @@ def update_user_story_fields(
 
         if "outOfScope" in filtered_update:
             filtered_update["outOfScope"] = _normalize_string_list(filtered_update.get("outOfScope"))
+
+        resolved_size, resolved_effort = resolve_story_estimation(
+            filtered_update.get("tshirt_size", user_story_data.get("tshirt_size", user_story_data.get("tshirtSize"))),
+            filtered_update.get("effortHours", user_story_data.get("effortHours", user_story_data.get("effort_hours"))),
+        )
+        if resolved_size:
+            filtered_update["tshirt_size"] = resolved_size
+            filtered_update["tshirtSize"] = resolved_size
+        elif "tshirt_size" in filtered_update or "tshirtSize" in filtered_update:
+            filtered_update["tshirt_size"] = ""
+            filtered_update["tshirtSize"] = ""
+
+        if (
+            "effortHours" in filtered_update
+            or "effort_hours" in update_data
+            or "tshirt_size" in filtered_update
+            or "tshirtSize" in filtered_update
+        ):
+            filtered_update["effortHours"] = resolved_effort
 
         incoming_status = filtered_update.get("status")
         if isinstance(incoming_status, str):
@@ -1075,7 +1165,9 @@ def update_user_story_fields(
         logging.error(f"Error updating user story fields: {e}")
         return ResponseModel(success=False, message=f"Error updating user story fields: {str(e)}", data=None)
 
-def delete_user_story(story_id: str, user_id: str) -> ResponseModel:
+def delete_user_story(
+    story_id: str, user_id: str, user_email: Optional[str] = None
+) -> ResponseModel:
     """
     Deletes a specific user story.
     
@@ -1099,21 +1191,32 @@ def delete_user_story(story_id: str, user_id: str) -> ResponseModel:
         
         story_data = story_doc.to_dict()
         
-        # Check if user owns the user story
+        # Project leads may delete stories created by other members.
         if story_data.get("user_id") != user_id:
-            return ResponseModel(
-                success=False,
-                message="Unauthorized: You don't own this user story",
-                data=None
-            )
-        
-        # Delete the user story
-        story_ref.delete()
-        
+            project_id = get_project_id_for_epic(story_data.get("epic_id"))
+            access = get_project_access(project_id, user_id, user_email) if project_id else None
+            if not access or not access.success or not (access.data or {}).get("is_lead"):
+                return ResponseModel(
+                    success=False,
+                    message="Unauthorized: You don't own this user story",
+                    data=None
+                )
+
+        batch = FIRESTORE_CLIENT.batch()
+        subtasks = FIRESTORE_CLIENT.collection("subtasks").where(
+            "user_story_id", "==", story_id
+        ).stream()
+        deleted_subtasks = 0
+        for subtask in subtasks:
+            batch.delete(subtask.reference)
+            deleted_subtasks += 1
+        batch.delete(story_ref)
+        batch.commit()
+
         return ResponseModel(
             success=True,
             message="User story deleted successfully",
-            data=None
+            data={"deleted_subtasks": deleted_subtasks}
         )
     except Exception as e:
         logging.error(f"Error deleting user story {story_id}: {e}")

@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
-from src.services.azure_services import AzureChatService
+from src.intelligence.runtime import AgentName, run_agent
 from src.services.setup.firebase_setup import FIREBASE, FIRESTORE_CLIENT
 from src.utils.ai.fsd_sections import FSD_SECTION_TITLES, dedupe_user_roles_personas_section
 
@@ -79,8 +79,7 @@ Context:
 {context}
 """.strip()
 
-    azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-    return await azure.simple_completion(prompt, model_tier="gpt")
+    return await run_agent(AgentName.SPECIFICATION, prompt, user_data, model_tier="gpt")
 
 
 def _render_pdf_bytes(title: str, body: str) -> bytes:

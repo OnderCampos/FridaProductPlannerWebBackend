@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, Optional, Sequence
 import requests
 
 from src.services.setup.variables_setup import (
+    DISABLE_EMAIL_NOTIFICATIONS,
     FRONTEND_BASE_URL,
     NOTIFICATION_API_URL,
     NOTIFICATION_SENDER_EMAIL,
@@ -89,6 +90,7 @@ class NotificationService:
         self.sender_name = (sender_name or NOTIFICATION_SENDER_NAME or "").strip()
         self.frontend_base_url = (frontend_base_url or FRONTEND_BASE_URL or "").rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.notifications_disabled = bool(DISABLE_EMAIL_NOTIFICATIONS)
         self._validate_sender(self.sender_mail)
 
     @staticmethod
@@ -119,6 +121,18 @@ class NotificationService:
         Raises:
             NotificationServiceError: If the notification provider returns an error status code or if the API URL is not configured.
         """
+        if self.notifications_disabled:
+            logger.info(
+                "Email notifications are disabled via DISABLE_EMAIL_NOTIFICATIONS; skipping subject '%s'",
+                message.subject,
+            )
+            return {
+                "sent": False,
+                "status": "disabled",
+                "reason": "notifications_disabled",
+                "message": "Email notifications are disabled by environment configuration.",
+            }
+
         if not self.api_url:
             raise NotificationServiceError("NOTIFICATION_API_URL is not configured")
 

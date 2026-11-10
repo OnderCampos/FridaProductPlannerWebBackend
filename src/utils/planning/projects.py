@@ -43,6 +43,21 @@ def _sanitize_github_config(project_data: Dict[str, Any]) -> Dict[str, Any]:
     return project_data
 
 
+def _sanitize_jira_config(project_data: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(project_data, dict):
+        return project_data
+    jira_config = project_data.get("jira_config")
+    if not isinstance(jira_config, dict):
+        return project_data
+    project_data["jira_config"] = {
+        "cloud_id": jira_config.get("cloud_id"),
+        "project_key": jira_config.get("project_key"),
+        "site_name": jira_config.get("site_name"),
+        "account_email": jira_config.get("account_email"),
+    }
+    return project_data
+
+
 def get_project_for_user(project_id: str, user_id: str) -> ResponseModel:
     """
     Retrieves a project and verifies ownership without loading related data.
@@ -112,7 +127,7 @@ def get_all_projects_for_user(
             if include_team_members:
                 team_members = get_team_members(doc.id)
                 project_data["teamMembers"] = team_members
-            project_data = _sanitize_github_config(project_data)
+            project_data = _sanitize_jira_config(_sanitize_github_config(project_data))
 
             all_projects.append(project_data)
 
@@ -135,7 +150,7 @@ def get_all_projects_for_user(
                 if include_team_members:
                     team_members = get_team_members(project_id)
                     project_data["teamMembers"] = team_members
-                project_data = _sanitize_github_config(project_data)
+                project_data = _sanitize_jira_config(_sanitize_github_config(project_data))
 
                 all_projects.append(project_data)
 
@@ -168,7 +183,7 @@ def get_all_projects_for_user(
                 if include_team_members:
                     team_members = get_team_members(project_id)
                     project_data["teamMembers"] = team_members
-                project_data = _sanitize_github_config(project_data)
+                project_data = _sanitize_jira_config(_sanitize_github_config(project_data))
 
                 all_projects.append(project_data)
 
@@ -223,7 +238,7 @@ def get_project_by_id(
         # Include team members
         members = get_team_members(project_id)
         project_data["teamMembers"] = format_team_members_response(members)
-        project_data = _sanitize_github_config(project_data)
+        project_data = _sanitize_jira_config(_sanitize_github_config(project_data))
         
         return ResponseModel(
             success=True,
@@ -386,7 +401,7 @@ def update_project(project_id: str, user_id: str, name: Optional[str] = None,
         updated_doc = project_ref.get()
         updated_data = updated_doc.to_dict()
         updated_data["id"] = project_id
-        updated_data = _sanitize_github_config(updated_data)
+        updated_data = _sanitize_jira_config(_sanitize_github_config(updated_data))
         
         return ResponseModel(
             success=True,

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from src.routes import auth, project, templates, user_stories, epics, members, invitations, sprints, backlog, assistant, tasks
+from src.routes import auth, project, templates, user_stories, epics, members, invitations, sprints, backlog, assistant, tasks, jira_mcp
 from fastapi.middleware.cors import CORSMiddleware
 from src.services.setup.language_setup import reset_request_llm_language, set_request_llm_language
 
@@ -42,6 +42,8 @@ app.include_router(members.router, prefix="/members", tags=["members"])
 app.include_router(invitations.router, prefix="/invitations", tags=["invitations"])
 app.include_router(backlog.router, tags=["backlog"])
 app.include_router(assistant.router, prefix="/assistant", tags=["assistant"])
+app.include_router(jira_mcp.router, prefix="/projects", tags=["jira"])
+app.include_router(jira_mcp.callback_router, tags=["jira"])
 
 
 

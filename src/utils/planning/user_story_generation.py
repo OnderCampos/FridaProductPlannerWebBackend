@@ -4,15 +4,12 @@ import logging
 
 from src.intelligence.agents.json_executor import parse_json_response
 from src.intelligence.graphs.user_story_graph import run_user_story_generation_graph
-from src.intelligence.agents.user_story_generation.analysis_agent import (
-    USER_STORY_ANALYSIS_AGENT,
-)
 from src.schemas.response import ResponseModel
 from src.schemas.user_data import UserData
-from src.services.azure_services import AzureChatService
+from src.intelligence.runtime import AgentName, run_agent
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
-from src.utils.planning.user_story_dependencies import generate_and_persist_user_story_dependencies
+from src.utils.planning.story_estimation import resolve_story_estimation
 from src.utils.planning.user_stories import create_multiple_user_stories, _current_timestamp_iso
 
 
@@ -45,6 +42,8 @@ def transform_user_story_to_structured_format(story_data: Dict[str, Any], templa
         "updated_at",
         "order",
         "dependencies",
+        "tshirt_size",
+        "tshirtSize",
         "effortHours",
         "effort_hours",
         "fields",
@@ -64,6 +63,8 @@ def transform_user_story_to_structured_format(story_data: Dict[str, Any], templa
         "user_story_id": story_data.get("user_story_id", ""),
         "order": story_data.get("order", 0),
         "dependencies": story_data.get("dependencies", []),
+        "tshirt_size": story_data.get("tshirt_size", story_data.get("tshirtSize", "")),
+        "tshirtSize": story_data.get("tshirt_size", story_data.get("tshirtSize", "")),
         "effortHours": story_data.get("effortHours", story_data.get("effort_hours", 0)),
         "acceptanceCriteria": story_data.get("acceptanceCriteria", []),
         "outOfScope": story_data.get("outOfScope", []),
@@ -186,8 +187,7 @@ Return ONLY valid JSON with EXACTLY {len(payload)} items in the same order:
 
     parsed: Any = None
     try:
-        azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-        raw = await azure.simple_completion(prompt, model_tier="gpt")
+        raw = await run_agent(AgentName.USER_STORY_GENERATION, prompt, user_data, model_tier="mini")
         parsed = parse_json_response(raw)
     except Exception as exc:
         logging.warning("Failed to enrich acceptanceCriteria/outOfScope: %s", exc)
@@ -244,8 +244,8 @@ async def enrich_user_story_details(
                 "user_story_id": str(story.get("user_story_id") or "").strip(),
                 "user_story": str(story.get("user_story") or "").strip(),
                 "description": str(story.get("description") or "").strip(),
+                "existing_tshirt_size": str(story.get("tshirt_size") or story.get("tshirtSize") or "").strip(),
                 "existing_effort_hours": str(story.get("effortHours") or story.get("effort_hours") or "").strip(),
-                "existing_story_points": str(story.get("storyPoints") or story.get("story_points") or "").strip(),
             }
         )
 
@@ -258,8 +258,8 @@ You are a senior product owner and QA analyst.
 For EACH user story below, generate detailed requirement content that can be stored directly in a planning tool.
 
 Return for every item:
-- effortHours: a positive numeric effort estimate in hours when one is missing or zero
-- storyPoints: a positive integer story point estimate when one is missing or zero
+- tshirt_size: one of XS, S, M, L, XL
+- effortHours: a positive numeric effort estimate in hours that stays inside the chosen tshirt_size range
 - acceptanceCriteria: 3-6 short, testable bullet points
 - outOfScope: 1-4 bullet points (use ["N/A"] if truly none)
 - document: an object with these exact string keys:
@@ -283,6 +283,12 @@ Rules:
 - Use concise bullet-style text where it helps readability.
 - If a detail is unknown, use "N/A".
 - If an existing estimate is already provided and greater than zero, preserve it unless it is clearly inconsistent.
+- Use these exact complexity ranges:
+  - XS: 2-4 hours
+  - S: 4-8 hours
+  - M: 8-16 hours
+  - L: 16-32 hours
+  - XL: 32-60 hours
 - acceptance_criteria in the document must align with acceptanceCriteria.
 - out_of_scope in the document must align with outOfScope.
 - test_scenarios should cover happy path, edge cases, and failure/validation cases when relevant.
@@ -302,8 +308,8 @@ Expected JSON format:
 {{
   "items": [
     {{
+      "tshirt_size": "M",
       "effortHours": 6,
-      "storyPoints": 3,
       "acceptanceCriteria": ["..."],
       "outOfScope": ["..."],
       "document": {{
@@ -328,8 +334,7 @@ Expected JSON format:
 
     parsed: Any = None
     try:
-        azure = AzureChatService(api_key=None, user_data=user_data, knowledge_base_id=None)
-        raw = await azure.simple_completion(prompt, model_tier="gpt")
+        raw = await run_agent(AgentName.USER_STORY_GENERATION, prompt, user_data, model_tier="mini")
         parsed = parse_json_response(raw)
     except Exception as exc:
         logging.warning("Failed to enrich user story details: %s", exc)
@@ -351,17 +356,10 @@ Expected JSON format:
             enriched.append(next_story)
             continue
 
-        effort_hours = _normalize_positive_float(extra.get("effortHours"))
-        if effort_hours <= 0:
-            effort_hours = _normalize_positive_float(
-                next_story.get("effortHours", next_story.get("effort_hours"))
-            )
-
-        story_points = _normalize_story_points(extra.get("storyPoints"))
-        if story_points <= 0:
-            story_points = _normalize_story_points(
-                next_story.get("storyPoints", next_story.get("story_points"))
-            )
+        tshirt_size, effort_hours = resolve_story_estimation(
+            extra.get("tshirt_size", extra.get("tshirtSize", next_story.get("tshirt_size", next_story.get("tshirtSize")))),
+            extra.get("effortHours", next_story.get("effortHours", next_story.get("effort_hours"))),
+        )
 
         acceptance = _normalize_string_list(extra.get("acceptanceCriteria"))
         if not acceptance:
@@ -390,10 +388,9 @@ Expected JSON format:
             "estimation_dev": str(document.get("estimation_dev") or "N/A").strip(),
         }
 
+        next_story["tshirt_size"] = tshirt_size
+        next_story["tshirtSize"] = tshirt_size
         next_story["effortHours"] = effort_hours
-        if story_points > 0:
-            next_story["story_points"] = story_points
-            next_story["storyPoints"] = story_points
         next_story["acceptanceCriteria"] = acceptance
         next_story["outOfScope"] = out_scope
         next_story["document"] = normalized_document
@@ -440,35 +437,30 @@ async def generate_analysis(
         
         project = project_response.data
 
-        response = USER_STORY_ANALYSIS_AGENT.bind_context({"user_data": user_data}).execute(
-            epic=epic,
-            project_description=project["description"],
+        role_values = epic.get("roles") or project.get("roles") or []
+        users = []
+        if isinstance(role_values, list):
+            for role in role_values:
+                role_name = str(role or "").strip()
+                if not role_name:
+                    continue
+                users.append(
+                    {
+                        "role": role_name,
+                        "permissions": "",
+                        "interactions": "",
+                        "needs": "",
+                    }
+                )
+
+        return ResponseModel(
+            success=True,
+            message="Epic analysis compatibility response generated successfully",
+            data={
+                "users": users,
+                "functionalities": [],
+            },
         )
-
-        analysis = parse_json_response(response)
-        if isinstance(analysis, dict):
-            users = analysis.get("epic_analysis", {}).get("users", [])
-            functionalities = analysis.get("epic_analysis", {}).get(
-                "functionalities", []
-            )
-
-            # Return the populated values
-            return ResponseModel(
-                success=True,
-                message="Successfully identified users and functionalities",
-                data={
-                    "users": users,
-                    "functionalities": functionalities,
-                },
-            )
-        else:
-            # Handle case where analysis failed to parse
-            print("Warning: Could not parse user analysis as JSON, using empty lists")
-            return ResponseModel(
-                success=True,
-                message="Analysis completed but could not parse structured data",
-                data={"users": [], "functionalities": [], "raw_response": response},
-            )
 
     except Exception as e:
         logging.error(f"Error in generate_analysis: {e}")
@@ -502,6 +494,27 @@ async def generate_user_stories(
         ResponseModel: Generated user stories
     """
     try:
+        # Generation can be retried by the project-creation UI when a request is
+        # interrupted.  Keep that retry idempotent so a successful first write is
+        # not duplicated if its response never reached the browser.
+        existing_response = get_user_stories_by_epic(epic_id, user_data.get_user_id())
+        existing_stories = (
+            existing_response.data
+            if existing_response.success and isinstance(existing_response.data, list)
+            else []
+        )
+        if existing_stories:
+            return ResponseModel(
+                success=True,
+                message="User stories already exist for this epic.",
+                data={
+                    "user_stories": existing_stories,
+                    "generated_count": 0,
+                    "existing_count": len(existing_stories),
+                    "skipped": True,
+                },
+            )
+
         graph_state = run_user_story_generation_graph(
             user_data=user_data,
             epic_id=epic_id,
@@ -521,16 +534,6 @@ async def generate_user_stories(
         template_data = graph_state.get("template_data") or {}
 
         if response:
-            epic = graph_state.get("epic") or {}
-            project = graph_state.get("project") or {}
-            if isinstance(epic, dict) and isinstance(project, dict):
-                response = await enrich_user_story_details(
-                    user_data=user_data,
-                    epic=epic,
-                    project=project,
-                    stories=response,
-                )
-
             print("[DEBUG] User stories generated successfully via graph")
             print(f"[DEBUG] Generated user stories response: {response}")
 
@@ -544,32 +547,13 @@ async def generate_user_stories(
 
             if save_result.success:
                 saved_stories = save_result.data if isinstance(save_result.data, list) else []
-                updated_stories = saved_stories
-
-                dependencies_result = await generate_and_persist_user_story_dependencies(
-                    user_data=user_data,
-                    epic_id=epic_id,
-                    user_stories=saved_stories,
-                )
-                if (
-                    dependencies_result.success
-                    and isinstance(dependencies_result.data, dict)
-                    and isinstance(dependencies_result.data.get("user_stories"), list)
-                ):
-                    updated_stories = dependencies_result.data.get("user_stories") or []
-                elif not dependencies_result.success:
-                    logging.warning(
-                        "Generated user stories for epic %s were saved without refreshed dependencies: %s",
-                        epic_id,
-                        dependencies_result.message,
-                    )
 
                 print("[DEBUG] User stories saved successfully")
                 return ResponseModel(
                     success=True,
                     message="User stories generated and saved successfully for functionality",
                     data={
-                        "user_stories": updated_stories,
+                        "user_stories": saved_stories,
                         "generated_count": len(response),
                     },
                 )
@@ -587,6 +571,8 @@ async def generate_user_stories(
                     "created_at": now,
                     "updated_at": now,
                     "createdDate": now,
+                    "tshirt_size": story.get("tshirt_size", story.get("tshirtSize", "")),
+                    "tshirtSize": story.get("tshirt_size", story.get("tshirtSize", "")),
                     "effortHours": story.get("effortHours", story.get("effort_hours", 0)),
                     "storyPoints": story.get("story_points", 0),
                 }

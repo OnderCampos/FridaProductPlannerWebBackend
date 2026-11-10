@@ -163,6 +163,7 @@ class CreateUserStoryManualRequest(BaseModel):
     user_story_id: Optional[str] = None
     order: Optional[int] = None
     dependencies: Optional[List[str]] = None
+    tshirt_size: Optional[str] = None
     effortHours: Optional[float] = None
     story_points: Optional[int] = None
 
