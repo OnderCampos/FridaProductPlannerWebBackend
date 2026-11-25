@@ -3185,7 +3185,14 @@ def run_project_chat_agent(
     ]
 
     tool_map = {tool.name: tool for tool in tools}
-    llm = bind_agent_tools(AgentName.PROJECT_CHAT, tools, model_tier="mini")
+    # llm = bind_agent_tools(AgentName.PROJECT_CHAT, tools, model_tier="mini")
+
+    llm = bind_agent_tools(
+        AgentName.PROJECT_CHAT,
+        tools,
+        model_tier="mini",
+        user_data=user_data,
+    )
 
     def _assistant_node(state: AgentState) -> Dict[str, List[BaseMessage]]:
         response = llm.invoke(state["messages"])

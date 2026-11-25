@@ -7,7 +7,7 @@ from typing import Any, Optional, Sequence
 
 from src.intelligence.runtime.strands_runtime import invoke_swarm_async
 from src.schemas.user_data import UserData
-from src.services.setup.variables_setup import gpt_client, gpt_mini_client
+from src.services.setup.variables_setup import GPT_DEPLOYMENT, MINI_DEPLOYMENT, build_frida_chat_client, gpt_client, gpt_mini_client
 
 
 class AgentName(str, Enum):
@@ -59,12 +59,27 @@ async def run_agent(
     return result.content
 
 
+# def bind_agent_tools(
+#     agent: AgentName,
+#     tools: Sequence[Any],
+#     *,
+#     model_tier: str = "mini",
+# ) -> Any:
+#     """Legacy LangChain tool binding kept for the project-chat orchestration loop."""
+#     client = gpt_client if str(model_tier).lower() == "gpt" else gpt_mini_client
+#     return client.bind_tools(list(tools))
+
 def bind_agent_tools(
     agent: AgentName,
     tools: Sequence[Any],
     *,
     model_tier: str = "mini",
+    user_data: Optional[UserData] = None,
 ) -> Any:
-    """Legacy LangChain tool binding kept for the project-chat orchestration loop."""
-    client = gpt_client if str(model_tier).lower() == "gpt" else gpt_mini_client
+    fallback_model = GPT_DEPLOYMENT if str(model_tier).lower() == "gpt" else MINI_DEPLOYMENT
+    client = build_frida_chat_client(
+        model_name=fallback_model,
+        user_id=user_data.get_user_id() if user_data else None,
+        email=user_data.get_email() if user_data else None,
+    )
     return client.bind_tools(list(tools))
