@@ -14,12 +14,19 @@ from src.utils.core.logging import add_request_log
 from src.utils.planning.team import get_team_name
 from src.utils.core.validation_utils import has_expected_epic_structure, get_code_block
 from src.utils.ai.llm_graph import invoke_model_with_graph
+# from src.services.setup.variables_setup import (
+#     gpt_client,
+#     gpt_mini_client,
+#     GPT_DEPLOYMENT,
+#     MINI_DEPLOYMENT,
+#     LLMOPS_API_KEY,
+# )
 from src.services.setup.variables_setup import (
-    gpt_client,
-    gpt_mini_client,
     GPT_DEPLOYMENT,
     MINI_DEPLOYMENT,
     LLMOPS_API_KEY,
+    build_frida_chat_client,
+    get_active_frida_model,
 )
 from src.services.setup.language_setup import build_llm_language_system_prompt, get_default_llm_language
 from src.utils.knowledge_bases import schemas, general
@@ -164,19 +171,34 @@ class AzureChatService:
             "image_url": {"url": image_data},
         }
 
+    # def _resolve_client(self, model_tier: str = "mini", use_images: bool = False):
+    #     normalized_tier = "gpt" if str(model_tier or "").strip().lower() == "gpt" else "mini"
+    #     logger = logging.getLogger(__name__)
+
+    #     if use_images or normalized_tier == "gpt":
+    #         if use_images:
+    #             logger.info("Using GPT deployment with image support")
+    #         else:
+    #             logger.info("Using GPT deployment")
+    #         return gpt_client, GPT_DEPLOYMENT or MINI_DEPLOYMENT
+
+    #     logger.info("Using mini deployment")
+    #     return gpt_mini_client, MINI_DEPLOYMENT or GPT_DEPLOYMENT
+
     def _resolve_client(self, model_tier: str = "mini", use_images: bool = False):
-        normalized_tier = "gpt" if str(model_tier or "").strip().lower() == "gpt" else "mini"
-        logger = logging.getLogger(__name__)
-
-        if use_images or normalized_tier == "gpt":
-            if use_images:
-                logger.info("Using GPT deployment with image support")
-            else:
-                logger.info("Using GPT deployment")
-            return gpt_client, GPT_DEPLOYMENT or MINI_DEPLOYMENT
-
-        logger.info("Using mini deployment")
-        return gpt_mini_client, MINI_DEPLOYMENT or GPT_DEPLOYMENT
+        normalized_tier = (
+            "gpt"
+            if (use_images or str(model_tier or "").strip().lower() == "gpt")
+            else "mini"
+        )
+        fallback = GPT_DEPLOYMENT if normalized_tier == "gpt" else MINI_DEPLOYMENT
+        active_model = get_active_frida_model(fallback=fallback)
+        client = build_frida_chat_client(
+            model_name=active_model,
+            user_id=self.user_id,
+            email=self.user_email,
+        )
+        return client, active_model
 
     async def call_with_retry(
         self,

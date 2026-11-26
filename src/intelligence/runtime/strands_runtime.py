@@ -7,13 +7,12 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
 from time import perf_counter_ns
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import AzureChatOpenAI
-from openai import AsyncAzureOpenAI
+from langchain_openai import ChatOpenAI
+from openai import AsyncOpenAI
 
 from src.services.setup.language_setup import (
     build_llm_language_system_prompt,
@@ -21,9 +20,13 @@ from src.services.setup.language_setup import (
     normalize_language,
 )
 from src.services.setup.variables_setup import (
+    FRIDA_API_ENDPOINT,
+    FRIDA_API_KEY,
     GPT_DEPLOYMENT,
     LLMOPS_API_KEY,
     MINI_DEPLOYMENT,
+    build_frida_chat_client,
+    get_active_frida_model,
 )
 from src.utils.ai.llm_graph import invoke_model_with_graph
 from src.utils.ai.llmops_utils import log_to_llmops
@@ -41,7 +44,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_TOOL_CALLS = 3
 
-
 @dataclass(frozen=True)
 class StrandsInvocationResult:
     content: str
@@ -54,12 +56,16 @@ def _normalize_model_tier(model_tier: str) -> str:
     return "gpt" if str(model_tier or "").strip().lower() == "gpt" else "mini"
 
 
+# def _deployment_for_tier(model_tier: str) -> str:
+#     normalized = _normalize_model_tier(model_tier)
+#     if normalized == "gpt":
+#         return GPT_DEPLOYMENT or MINI_DEPLOYMENT or ""
+#     return MINI_DEPLOYMENT or GPT_DEPLOYMENT or ""
+
 def _deployment_for_tier(model_tier: str) -> str:
     normalized = _normalize_model_tier(model_tier)
-    if normalized == "gpt":
-        return GPT_DEPLOYMENT or MINI_DEPLOYMENT or ""
-    return MINI_DEPLOYMENT or GPT_DEPLOYMENT or ""
-
+    fallback = GPT_DEPLOYMENT if normalized == "gpt" else MINI_DEPLOYMENT
+    return get_active_frida_model(fallback=fallback)
 
 def _tier_for_deployment(azure_deployment: Optional[str]) -> str:
     deployment = str(azure_deployment or "").strip()
@@ -256,61 +262,162 @@ def _build_multimodal_prompt(prompt: str, images: Sequence[str]) -> List[Dict[st
             blocks.append(block)
     return blocks
 
+# def _build_openai_client(model_tier: str):
+#     api_key = (
+#         os.getenv("AZURE_OPENAI_API_KEY")
+#         or os.getenv("OPENAI_API_KEY")
+#         or os.getenv("AZURE_API_KEY")
+#     )
+#     if not api_key:
+#         return None
 
-def _build_openai_client(model_tier: str):
-    api_key = (
-        os.getenv("AZURE_OPENAI_API_KEY")
-        or os.getenv("OPENAI_API_KEY")
-        or os.getenv("AZURE_API_KEY")
-    )
-    if not api_key:
+#     api_version = os.getenv("API_VERSION")
+#     azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("AZURE_ENDPOINT")
+#     if azure_endpoint:
+#         kwargs: Dict[str, Any] = {
+#             "api_key": api_key,
+#             "azure_endpoint": azure_endpoint,
+#         }
+#         if api_version:
+#             kwargs["api_version"] = api_version
+#         return AsyncAzureOpenAI(**kwargs)
+
+#     return None
+
+
+# @lru_cache(maxsize=4)
+# def _cached_langchain_client(model_tier: str) -> AzureChatOpenAI:
+#     deployment = _deployment_for_tier(model_tier)
+#     return AzureChatOpenAI(
+#         azure_deployment=deployment,
+#         api_version=os.getenv("API_VERSION"),
+#     )
+
+
+# def _build_strands_model(model_tier: str):
+#     if OpenAIModel is None:
+#         raise RuntimeError("Strands OpenAIModel is not available.")
+
+#     deployment = _deployment_for_tier(model_tier)
+#     client = _build_openai_client(model_tier)
+#     if client is not None:
+#         return OpenAIModel(client=client, model_id=deployment)
+
+#     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_API_KEY") or ""
+#     client_args: Dict[str, Any] = {"api_key": api_key}
+#     base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("AZURE_OPENAI_BASE_URL")
+#     if base_url:
+#         client_args["base_url"] = base_url
+#     return OpenAIModel(client_args=client_args, model_id=deployment)
+
+
+# def _build_strands_agent(*, agent_name: str, system_prompt: str, model_tier: str):
+#     if StrandsAgent is None:
+#         raise RuntimeError("Strands Agent is not available.")
+#     return StrandsAgent(
+#         model=_build_strands_model(model_tier),
+#         system_prompt=system_prompt,
+#     )
+
+
+# def _invoke_with_langchain_fallback(
+#     *,
+#     system_prompt: str,
+#     prompt: str,
+#     model_tier: str,
+#     images: Optional[Sequence[str]] = None,
+# ) -> Any:
+#     messages: List[Any] = []
+#     if system_prompt:
+#         messages.append(SystemMessage(content=system_prompt))
+
+#     if images:
+#         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+#         for image_payload in images:
+#             decoded = _decode_image_payload(str(image_payload or ""))
+#             if decoded is None:
+#                 continue
+#             image = decoded.get("image", {})
+#             content.append(
+#                 {
+#                     "type": "image_url",
+#                     "image_url": {
+#                         "url": f"data:image/{image.get('format', 'jpeg')};base64,{base64.b64encode(image['source']['bytes']).decode('ascii')}"
+#                     },
+#                 }
+#             )
+#         messages.append(HumanMessage(content=content))
+#     else:
+#         messages.append(HumanMessage(content=prompt))
+
+#     client = _cached_langchain_client(model_tier)
+#     return invoke_model_with_graph(client=client, messages=messages)
+
+def _build_frida_extra_body(
+    execution_context: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, str]]:
+    if not execution_context:
         return None
-
-    api_version = os.getenv("API_VERSION")
-    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("AZURE_ENDPOINT")
-    if azure_endpoint:
-        kwargs: Dict[str, Any] = {
-            "api_key": api_key,
-            "azure_endpoint": azure_endpoint,
-        }
-        if api_version:
-            kwargs["api_version"] = api_version
-        return AsyncAzureOpenAI(**kwargs)
-
-    return None
+    user_id, _team_id, email, _user_name = _extract_user_context(execution_context)
+    if not user_id and not email:
+        return None
+    return {
+        "email": email or "unknown_email",
+        "user_id": user_id or "unknown_user",
+    }
 
 
-@lru_cache(maxsize=4)
-def _cached_langchain_client(model_tier: str) -> AzureChatOpenAI:
-    deployment = _deployment_for_tier(model_tier)
-    return AzureChatOpenAI(
-        azure_deployment=deployment,
-        api_version=os.getenv("API_VERSION"),
+def _build_openai_client() -> Optional[AsyncOpenAI]:
+    if not FRIDA_API_KEY or not FRIDA_API_ENDPOINT:
+        return None
+    return AsyncOpenAI(
+        api_key=FRIDA_API_KEY,
+        base_url=FRIDA_API_ENDPOINT,
     )
 
 
-def _build_strands_model(model_tier: str):
+def _build_strands_model(
+    model_tier: str,
+    execution_context: Optional[Dict[str, Any]] = None,
+):
     if OpenAIModel is None:
         raise RuntimeError("Strands OpenAIModel is not available.")
 
     deployment = _deployment_for_tier(model_tier)
-    client = _build_openai_client(model_tier)
+    extra_body = _build_frida_extra_body(execution_context)
+    model_params: Optional[Dict[str, Any]] = (
+        {"extra_body": extra_body} if extra_body else None
+    )
+
+    client = _build_openai_client()
     if client is not None:
-        return OpenAIModel(client=client, model_id=deployment)
+        return OpenAIModel(
+            client=client,
+            model_id=deployment,
+            params=model_params,
+        )
 
-    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_API_KEY") or ""
-    client_args: Dict[str, Any] = {"api_key": api_key}
-    base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("AZURE_OPENAI_BASE_URL")
-    if base_url:
-        client_args["base_url"] = base_url
-    return OpenAIModel(client_args=client_args, model_id=deployment)
+    client_args: Dict[str, Any] = {"api_key": FRIDA_API_KEY or ""}
+    if FRIDA_API_ENDPOINT:
+        client_args["base_url"] = FRIDA_API_ENDPOINT
+    return OpenAIModel(
+        client_args=client_args,
+        model_id=deployment,
+        params=model_params,
+    )
 
 
-def _build_strands_agent(*, agent_name: str, system_prompt: str, model_tier: str):
+def _build_strands_agent(
+    *,
+    agent_name: str,
+    system_prompt: str,
+    model_tier: str,
+    execution_context: Optional[Dict[str, Any]] = None,
+):
     if StrandsAgent is None:
         raise RuntimeError("Strands Agent is not available.")
     return StrandsAgent(
-        model=_build_strands_model(model_tier),
+        model=_build_strands_model(model_tier, execution_context=execution_context),
         system_prompt=system_prompt,
     )
 
@@ -320,6 +427,7 @@ def _invoke_with_langchain_fallback(
     system_prompt: str,
     prompt: str,
     model_tier: str,
+    execution_context: Optional[Dict[str, Any]] = None,
     images: Optional[Sequence[str]] = None,
 ) -> Any:
     messages: List[Any] = []
@@ -345,9 +453,18 @@ def _invoke_with_langchain_fallback(
     else:
         messages.append(HumanMessage(content=prompt))
 
-    client = _cached_langchain_client(model_tier)
+    fallback_model = (
+        GPT_DEPLOYMENT if _normalize_model_tier(model_tier) == "gpt" else MINI_DEPLOYMENT
+    )
+    user_id, _team_id, email, _user_name = _extract_user_context(
+        execution_context or {}
+    )
+    client = build_frida_chat_client(
+        model_name=fallback_model,
+        user_id=user_id,
+        email=email,
+    )
     return invoke_model_with_graph(client=client, messages=messages)
-
 
 def _reviewer_system_prompt(agent_name: str) -> str:
     return (
@@ -393,12 +510,14 @@ def invoke_swarm_sync(
                 agent_name=agent_name,
                 system_prompt=system_prompt,
                 model_tier=normalized_tier,
+                execution_context=execution_context,
             )(primary_prompt)
             candidate_text = _extract_content(candidate_response)
             reviewer_response = _build_strands_agent(
                 agent_name=f"{agent_name}Reviewer",
                 system_prompt=reviewer_system_prompt,
                 model_tier=normalized_tier,
+                execution_context=execution_context,
             )(_reviewer_prompt(prompt, candidate_text))
             final_response = reviewer_response
         else:
@@ -406,12 +525,14 @@ def invoke_swarm_sync(
                 agent_name=agent_name,
                 system_prompt=system_prompt,
                 model_tier=normalized_tier,
+                execution_context=execution_context,
             )(prompt)
             candidate_text = _extract_content(primary_response)
             reviewer_agent = _build_strands_agent(
                 agent_name=f"{agent_name}Reviewer",
                 system_prompt=reviewer_system_prompt,
                 model_tier=normalized_tier,
+                execution_context=execution_context,
             )
             final_response = reviewer_agent(_reviewer_prompt(prompt, candidate_text))
     except Exception:
@@ -420,6 +541,7 @@ def invoke_swarm_sync(
             system_prompt=system_prompt,
             prompt=prompt,
             model_tier=normalized_tier,
+            execution_context=execution_context,
             images=images,
         )
 
@@ -460,10 +582,12 @@ async def invoke_swarm_async(
     start_time = datetime.now(timezone.utc)
 
     try:
+        # En invoke_swarm_async:
         primary_agent = _build_strands_agent(
             agent_name=agent_name,
             system_prompt=system_prompt,
             model_tier=normalized_tier,
+            execution_context=execution_context,
         )
         primary_prompt: Any = _build_multimodal_prompt(prompt, images) if images else prompt
         primary_response = await primary_agent.invoke_async(primary_prompt)
@@ -473,6 +597,7 @@ async def invoke_swarm_async(
             agent_name=f"{agent_name}Reviewer",
             system_prompt=reviewer_system_prompt,
             model_tier=normalized_tier,
+            execution_context=execution_context,
         )
         reviewer_response = await reviewer_agent.invoke_async(
             _reviewer_prompt(prompt, candidate_text)
@@ -484,6 +609,7 @@ async def invoke_swarm_async(
             system_prompt=system_prompt,
             prompt=prompt,
             model_tier=normalized_tier,
+            execution_context=execution_context,
             images=images,
         )
 
