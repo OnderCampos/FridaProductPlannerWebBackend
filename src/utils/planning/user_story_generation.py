@@ -10,7 +10,7 @@ from src.intelligence.runtime import AgentName, run_agent
 from src.utils.planning.epics import get_epic_by_id
 from src.utils.planning.projects import get_project_by_id
 from src.utils.planning.story_estimation import resolve_story_estimation
-from src.utils.planning.user_stories import create_multiple_user_stories, _current_timestamp_iso
+from src.utils.planning.user_stories import create_multiple_user_stories, _current_timestamp_iso, get_user_stories_by_epic
 
 
 def transform_user_story_to_structured_format(story_data: Dict[str, Any], template_data: Dict[str, Any] = None) -> Dict[str, Any]:
